@@ -17,6 +17,29 @@ outside also makes the event source swappable: a test, a dummy runtime, or
 expressed as a desired restart generation (`restarts` prop) rather than as an
 action.
 
+**Precisely.** The rule is not "the tree is stateless". State lives in three
+places, and the rule says which goes where:
+
+1. React's own record of what it last committed: the current fiber tree and
+   the host instances (`spec`, `restarts`, `created`, the `live` map). This is
+   what render diffs against, exactly as the DOM renderer diffs against its
+   memoized props and never re-reads the DOM. Policy state (self-heal
+   counters, `Ready` latches) is here too.
+2. The host's reality: containerd. React never looks at it; it assumes the
+   host is what it committed, which holds for a DOM and not for a container
+   that can die.
+3. The observation of 2: the status store. Because React has no way to
+   re-verify the host, the drift between 1 and 2 must come back as an
+   _input_, next to props, so the tree can emit a new intention that React
+   then diffs against 1.
+
+In Kubernetes terms, React is the part of a controller that compares desired
+state with its own cache, and the store is the informer. A process restart
+loses 1 entirely; the runtime's `fiber-servo.spec` labels and the watcher's
+initial `ps -a` rebuild what matters (see decision 10), and the self-heal
+counters simply start over. Two processes reconciling the same containers
+would each hold their own 1 and fight; one writer per host is assumed.
+
 ## 2. commit executes nothing
 
 **Decision.** Every hostConfig method appends an op and returns. A sink
