@@ -58,7 +58,8 @@
     "example:self-heal": "tsx examples/self-heal.tsx",
     "example:webapp": "tsx examples/webapp.tsx",
     "example:plan": "tsx src/cli.ts plan examples/app.tsx",
-    "example:containerd": "tsx examples/containerd.tsx"
+    "example:containerd": "tsx examples/containerd.tsx",
+    "spike:grpc": "tsx spikes/grpc/src/run.ts"
   },
   "peerDependencies": {
     "react": "^19.3.0"
@@ -68,6 +69,8 @@
     "tsx": "^4.23.13"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "1.14.4",
+    "@grpc/proto-loader": "0.8.1",
     "@types/node": "^22.20.2",
     "@types/react": "^19.3.0",
     "@types/react-reconciler": "^0.33.0",
