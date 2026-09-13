@@ -11,13 +11,19 @@
  *      sink; the sink is the only place a side effect may happen.
  */
 import type { HostConfig } from 'react-reconciler';
-import { DefaultEventPriority, NoEventPriority } from 'react-reconciler/constants';
+import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants';
 import { diffSpec, type ContainerSpec, type Op, type OpSink } from './ops.js';
 
 export type HostType = 'container';
 
 /** Props accepted by the `container` host element. */
 export interface ContainerHostProps extends ContainerSpec {
+  /**
+   * Desired restart generation. Not part of the spec sent with CREATE; each
+   * increment after mount becomes one START op. Written by <Container>'s
+   * self-healing logic from what it reads in the status store.
+   */
+  restarts?: number;
   children?: unknown;
 }
 
@@ -26,6 +32,8 @@ export interface Instance {
   /** Identity as seen by the runtime. Equal to `spec.name`. */
   id: string;
   spec: ContainerSpec;
+  /** Last restart generation turned into an op. */
+  restarts: number;
   children: Instance[];
   root: RootContainer;
   /** True between the CREATE and DELETE ops for this instance. */
@@ -150,7 +158,15 @@ export const hostConfig = {
       throw new Error(`react4c: unknown host element <${type}>. Only <container> is supported.`);
     }
     const spec = propsToSpec(type, props);
-    return { kind: 'container', id: spec.name, spec, children: [], root, created: false };
+    return {
+      kind: 'container',
+      id: spec.name,
+      spec,
+      restarts: props.restarts ?? 0,
+      children: [],
+      root,
+      created: false,
+    };
   },
   createTextInstance(text: string): never {
     throw new Error(
@@ -215,24 +231,38 @@ export const hostConfig = {
     const prev = instance.spec;
     const next = propsToSpec(type, nextProps);
     const changed = diffSpec(prev, next);
-    if (changed.length === 0) return;
+    const restarts = nextProps.restarts ?? 0;
 
-    instance.spec = next;
-    if (next.name !== prev.name) {
-      // `name` is identity. React kept the fiber (same key/type), but for the
-      // runtime this is a different container: tear down the old one and
-      // create the new one. Children keep their own identity.
-      if (instance.created) {
-        instance.created = false;
-        instance.root.live.delete(prev.name);
-        push(instance.root, { type: 'DELETE', kind: 'container', id: prev.name });
+    if (changed.length > 0) {
+      instance.spec = next;
+      if (next.name !== prev.name) {
+        // `name` is identity. React kept the fiber (same key/type), but for the
+        // runtime this is a different container: tear down the old one and
+        // create the new one. Children keep their own identity. A fresh
+        // container starts at the current generation; no START needed.
+        if (instance.created) {
+          instance.created = false;
+          instance.root.live.delete(prev.name);
+          push(instance.root, { type: 'DELETE', kind: 'container', id: prev.name });
+        }
+        instance.id = next.name;
+        instance.restarts = restarts;
+        mountSubtree(instance);
+        return;
       }
-      instance.id = next.name;
-      mountSubtree(instance);
-      return;
+      if (instance.created) {
+        push(instance.root, { type: 'UPDATE', kind: 'container', id: instance.id, prev, next, changed });
+      }
     }
-    if (!instance.created) return; // a subtree that was never placed cannot be updated
-    push(instance.root, { type: 'UPDATE', kind: 'container', id: instance.id, prev, next, changed });
+
+    if (restarts !== instance.restarts) {
+      instance.restarts = restarts;
+      // A subtree that was never placed cannot be started; the CREATE that
+      // eventually places it starts the container anyway.
+      if (instance.created) {
+        push(instance.root, { type: 'START', kind: 'container', id: instance.id, attempt: restarts });
+      }
+    }
   },
   commitTextUpdate(): void {
     /* unreachable: createTextInstance throws */
@@ -268,7 +298,11 @@ export const hostConfig = {
     currentUpdatePriority = priority;
   },
   resolveUpdatePriority(): number {
-    return currentUpdatePriority !== NoEventPriority ? currentUpdatePriority : DefaultEventPriority;
+    // Every update outside an explicit priority is discrete, i.e. SyncLane.
+    // A container spec has no "less urgent" changes, and sync lanes mean a
+    // store event re-renders and commits in the next microtask (or on
+    // `root.flush()`), with no Scheduler involvement.
+    return currentUpdatePriority !== NoEventPriority ? currentUpdatePriority : DiscreteEventPriority;
   },
   shouldAttemptEagerTransition(): boolean {
     return false;

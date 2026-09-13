@@ -1,8 +1,10 @@
-import type { ReactNode } from 'react';
+import { createElement, type ReactNode } from 'react';
 import Reconciler from 'react-reconciler';
 import { ConcurrentRoot } from 'react-reconciler/constants';
+import { StatusContext } from './hooks.js';
 import { createRootContainer, typedHostConfig, type RootContainer } from './hostConfig.js';
 import type { Op, OpSink } from './ops.js';
+import { createStatusStore, type StatusStore } from './status.js';
 
 const reconciler = Reconciler(typedHostConfig);
 
@@ -12,20 +14,31 @@ export interface Root {
    * When it returns, every op the commit produced has been handed to the sink.
    */
   render(element: ReactNode): void;
+  /**
+   * Flush work scheduled outside `render()`: status-store events and timers
+   * (self-healing) re-render on the next microtask by themselves; call this
+   * to have them committed right now, e.g. in tests with fake timers.
+   */
+  flush(): void;
   /** Tear the tree down: emits DELETE for every live container. */
   unmount(): void;
   /** Ids of containers that currently have a CREATE outstanding, in tree order. */
   liveIds(): string[];
+  /** The status store this tree reads from. Runtimes and tests write to it. */
+  readonly status: StatusStore;
 }
 
 export interface CreateRootOptions {
   /** Receives one batch per commit. Defaults to no-op; use `collectOps` or a runtime. */
   sink?: OpSink;
+  /** Status store to read from. A fresh one is created when omitted. */
+  status?: StatusStore;
   onUncaughtError?: (error: unknown) => void;
 }
 
 export function createRoot(options: CreateRootOptions = {}): Root {
   const sink = options.sink ?? (() => {});
+  const status = options.status ?? createStatusStore();
   const container: RootContainer = createRootContainer(sink);
 
   // React reports errors that escape every boundary through these callbacks,
@@ -51,8 +64,7 @@ export function createRoot(options: CreateRootOptions = {}): Root {
     () => {},
   );
 
-  function flush(element: ReactNode): void {
-    reconciler.updateContainerSync(element, fiberRoot, null, null);
+  function flush(): void {
     reconciler.flushSyncWork();
     // Passive effects (useEffect) may schedule further sync updates; flush them too.
     reconciler.flushPassiveEffects();
@@ -64,12 +76,20 @@ export function createRoot(options: CreateRootOptions = {}): Root {
     }
   }
 
+  function update(element: ReactNode): void {
+    const tree = element === null ? null : createElement(StatusContext, { value: status }, element);
+    reconciler.updateContainerSync(tree, fiberRoot, null, null);
+    flush();
+  }
+
   return {
+    status,
     render(element) {
-      flush(element);
+      update(element);
     },
+    flush,
     unmount() {
-      flush(null);
+      update(null);
     },
     liveIds() {
       return [...container.live.keys()];

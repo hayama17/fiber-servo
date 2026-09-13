@@ -41,7 +41,18 @@ export interface DeleteOp {
   id: string;
 }
 
-export type Op = CreateOp | UpdateOp | DeleteOp;
+/**
+ * Self-healing. Emitted when the tree's desired restart generation for a
+ * container moves past the runtime's; `attempt` is that generation (1-based).
+ */
+export interface StartOp {
+  type: 'START';
+  kind: InstanceKind;
+  id: string;
+  attempt: number;
+}
+
+export type Op = CreateOp | UpdateOp | DeleteOp | StartOp;
 
 /** A consumer of ops. Called once per React commit with the ops of that commit, in order. */
 export type OpSink = (ops: readonly Op[]) => void;
@@ -84,5 +95,7 @@ export function formatOp(op: Op): string {
       return `UPDATE ${op.kind} ${op.id} changed=[${op.changed.join(',')}]`;
     case 'DELETE':
       return `DELETE ${op.kind} ${op.id}`;
+    case 'START':
+      return `START ${op.kind} ${op.id} attempt=${op.attempt}`;
   }
 }
