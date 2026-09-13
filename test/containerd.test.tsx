@@ -45,14 +45,32 @@ function fakeNerdctl(script: Record<string, (args: string[]) => ExecResult> = {}
 
 describe('containerd runtime: ops -> nerdctl argv', () => {
   it('runArgs turns a spec into a detached run with restart handled by us', () => {
-    const spec = { name: 'web-0', image: 'nginx:1.27', env: { PORT: '80' }, labels: { tier: 'web' }, command: ['nginx', '-g', 'daemon off;'] };
+    const spec = {
+      name: 'web-0',
+      image: 'nginx:1.27',
+      env: { PORT: '80' },
+      labels: { tier: 'web' },
+      command: ['nginx', '-g', 'daemon off;'],
+    };
     expect(runArgs(spec)).toEqual([
-      'run', '-d', '--name', 'web-0', '--restart=no', '--pull=missing',
-      '--label', 'fiber-servo.managed=true',
-      '--label', `fiber-servo.spec=${specDigest(spec)}`,
-      '-e', 'PORT=80',
-      '--label', 'tier=web',
-      'nginx:1.27', 'nginx', '-g', 'daemon off;',
+      'run',
+      '-d',
+      '--name',
+      'web-0',
+      '--restart=no',
+      '--pull=missing',
+      '--label',
+      'fiber-servo.managed=true',
+      '--label',
+      `fiber-servo.spec=${specDigest(spec)}`,
+      '-e',
+      'PORT=80',
+      '--label',
+      'tier=web',
+      'nginx:1.27',
+      'nginx',
+      '-g',
+      'daemon off;',
     ]);
   });
 
@@ -70,7 +88,9 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
     });
     const index = new Map<string, string>();
     const runtime = createContainerdRuntime({ nerdctl, index });
-    runtime.sink([{ type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } }]);
+    runtime.sink([
+      { type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } },
+    ]);
     await runtime.idle();
 
     expect(calls.map((c) => c.split(' ')[0])).toEqual(['inspect', 'run']);
@@ -94,9 +114,14 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
   });
 
   it('CREATE recreates an existing container whose spec differs', async () => {
-    const { nerdctl, calls } = fakeNerdctl({ inspect: () => ok(`${HEX} true deadbeef\n`), run: () => ok(HEX) });
+    const { nerdctl, calls } = fakeNerdctl({
+      inspect: () => ok(`${HEX} true deadbeef\n`),
+      run: () => ok(HEX),
+    });
     const runtime = createContainerdRuntime({ nerdctl });
-    runtime.sink([{ type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } }]);
+    runtime.sink([
+      { type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } },
+    ]);
     await runtime.idle();
     expect(calls.map((c) => c.split(' ')[0])).toEqual(['inspect', 'rm', 'run']);
     expect(calls[1]).toBe('rm -f web-0');
@@ -146,7 +171,10 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
     ]);
     await runtime.idle();
 
-    expect(status.get('a')).toMatchObject({ state: 'dead', reason: expect.stringContaining('pull access denied') });
+    expect(status.get('a')).toMatchObject({
+      state: 'dead',
+      reason: expect.stringContaining('pull access denied'),
+    });
     expect(status.get('b').state).toBe('unknown'); // lifecycle is the watcher's job
     expect(errors.map((op) => op.id)).toEqual(['a']);
     expect(calls.filter((c) => c.startsWith('run')).length).toBe(2);
@@ -164,13 +192,21 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
       async *stream() {},
     };
     const runtime = createContainerdRuntime({ nerdctl });
-    runtime.sink([{ type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } }]);
+    runtime.sink([
+      { type: 'CREATE', kind: 'container', id: 'web-0', spec: { name: 'web-0', image: 'nginx' } },
+    ]);
     runtime.sink([{ type: 'DELETE', kind: 'container', id: 'web-0' }]);
-    runtime.sink([{ type: 'CREATE', kind: 'container', id: 'web-1', spec: { name: 'web-1', image: 'nginx' } }]);
+    runtime.sink([
+      { type: 'CREATE', kind: 'container', id: 'web-1', spec: { name: 'web-1', image: 'nginx' } },
+    ]);
     await runtime.idle();
 
     expect(order.map((c) => c.split(' ').slice(0, 2).join(' '))).toEqual([
-      'inspect --format', 'run -d', 'rm -f', 'inspect --format', 'run -d',
+      'inspect --format',
+      'run -d',
+      'rm -f',
+      'inspect --format',
+      'run -d',
     ]);
   });
 });
@@ -179,11 +215,16 @@ describe('containerd runtime: networks', () => {
   it('networkCreateArgs labels the network and passes the subnet', () => {
     const spec = { name: 'app', subnet: '10.9.0.0/24', labels: { tier: 'x' } };
     expect(networkCreateArgs(spec)).toEqual([
-      'network', 'create',
-      '--label', 'fiber-servo.managed=true',
-      '--label', `fiber-servo.spec=${specDigest(spec)}`,
-      '--subnet', '10.9.0.0/24',
-      '--label', 'tier=x',
+      'network',
+      'create',
+      '--label',
+      'fiber-servo.managed=true',
+      '--label',
+      `fiber-servo.spec=${specDigest(spec)}`,
+      '--subnet',
+      '10.9.0.0/24',
+      '--label',
+      'tier=x',
       'app',
     ]);
   });
@@ -204,7 +245,10 @@ describe('containerd runtime: networks', () => {
       return { calls: calls.map((c) => c.split(' ').slice(0, 2).join(' ')), errors };
     };
 
-    expect(await run(fail('no such network'))).toEqual({ calls: ['network inspect', 'network create'], errors: [] });
+    expect(await run(fail('no such network'))).toEqual({
+      calls: ['network inspect', 'network create'],
+      errors: [],
+    });
     expect(await run(ok(`${specDigest(spec)}\n`))).toEqual({ calls: ['network inspect'], errors: [] });
     expect(await run(ok('\n'))).toEqual({ calls: ['network inspect'], errors: [] });
     const refused = await run(ok('other-digest\n'));
@@ -217,7 +261,14 @@ describe('containerd runtime: networks', () => {
     const { nerdctl, calls } = fakeNerdctl();
     const runtime = createContainerdRuntime({ nerdctl, onError: (e) => errors.push(e.message) });
     runtime.sink([
-      { type: 'UPDATE', kind: 'network', id: 'app', prev: { name: 'app' }, next: { name: 'app', subnet: '10.0.0.0/24' }, changed: ['subnet'] },
+      {
+        type: 'UPDATE',
+        kind: 'network',
+        id: 'app',
+        prev: { name: 'app' },
+        next: { name: 'app', subnet: '10.0.0.0/24' },
+        changed: ['subnet'],
+      },
       { type: 'DELETE', kind: 'network', id: 'app' },
     ]);
     await runtime.idle();
@@ -235,7 +286,12 @@ describe('containerd runtime: events -> status store', () => {
   });
 
   it('parsePsLine only accepts managed containers', () => {
-    const managed = JSON.stringify({ ID: HEX, Names: 'web-0', Status: 'Up 1 second', Labels: 'fiber-servo.managed=true,fiber-servo.spec=abc' });
+    const managed = JSON.stringify({
+      ID: HEX,
+      Names: 'web-0',
+      Status: 'Up 1 second',
+      Labels: 'fiber-servo.managed=true,fiber-servo.spec=abc',
+    });
     const foreign = JSON.stringify({ ID: 'b'.repeat(64), Names: 'other', Status: 'Up', Labels: 'x=y' });
     expect(parsePsLine(managed)).toEqual({ kind: 'set', name: 'web-0', id: HEX, state: 'running' });
     expect(parsePsLine(foreign)).toBeNull();
@@ -244,28 +300,55 @@ describe('containerd runtime: events -> status store', () => {
 
   it('interpretEvent maps containerd topics and ignores exec exits and foreign containers', () => {
     const resolve = (id: string) => (id === HEX ? 'web-0' : undefined);
-    const row = (Topic: string, body: Record<string, unknown>) => ({ ID: HEX, Topic, Event: JSON.stringify(body) });
+    const row = (Topic: string, body: Record<string, unknown>) => ({
+      ID: HEX,
+      Topic,
+      Event: JSON.stringify(body),
+    });
 
-    expect(interpretEvent(row('/tasks/start', { container_id: HEX }), resolve)).toEqual({ kind: 'set', name: 'web-0', state: 'running' });
-    expect(interpretEvent(row('/tasks/exit', { container_id: HEX, id: HEX, exit_status: 137 }), resolve))
-      .toEqual({ kind: 'set', name: 'web-0', state: 'dead', exitCode: 137 });
-    expect(interpretEvent(row('/tasks/exit', { container_id: HEX, id: HEX }), resolve))
-      .toEqual({ kind: 'set', name: 'web-0', state: 'dead', exitCode: 0 });
-    expect(interpretEvent(row('/tasks/exit', { container_id: HEX, id: 'exec-1', exit_status: 1 }), resolve)).toBeNull();
-    expect(interpretEvent(row('/containers/delete', { id: HEX }), resolve)).toEqual({ kind: 'remove', name: 'web-0' });
+    expect(interpretEvent(row('/tasks/start', { container_id: HEX }), resolve)).toEqual({
+      kind: 'set',
+      name: 'web-0',
+      state: 'running',
+    });
+    expect(
+      interpretEvent(row('/tasks/exit', { container_id: HEX, id: HEX, exit_status: 137 }), resolve),
+    ).toEqual({ kind: 'set', name: 'web-0', state: 'dead', exitCode: 137 });
+    expect(interpretEvent(row('/tasks/exit', { container_id: HEX, id: HEX }), resolve)).toEqual({
+      kind: 'set',
+      name: 'web-0',
+      state: 'dead',
+      exitCode: 0,
+    });
+    expect(
+      interpretEvent(row('/tasks/exit', { container_id: HEX, id: 'exec-1', exit_status: 1 }), resolve),
+    ).toBeNull();
+    expect(interpretEvent(row('/containers/delete', { id: HEX }), resolve)).toEqual({
+      kind: 'remove',
+      name: 'web-0',
+    });
     expect(interpretEvent(row('/tasks/oom', { container_id: HEX }), resolve)).toBeNull();
     expect(interpretEvent({ ID: 'c'.repeat(64), Topic: '/tasks/start', Event: '{}' }, resolve)).toBeNull();
     // nerdctl may hand the body as an object instead of a string
-    expect(interpretEvent({ ID: HEX, Topic: '/tasks/start', Event: { container_id: HEX } }, resolve)).toEqual({ kind: 'set', name: 'web-0', state: 'running' });
+    expect(interpretEvent({ ID: HEX, Topic: '/tasks/start', Event: { container_id: HEX } }, resolve)).toEqual(
+      { kind: 'set', name: 'web-0', state: 'running' },
+    );
   });
 
   it('syncFromPs adopts existing managed containers into the store and the index', async () => {
     const rows = [
       { ID: HEX, Names: 'web-0', Status: 'Up 5 minutes', Labels: 'fiber-servo.managed=true' },
-      { ID: 'b'.repeat(64), Names: 'web-1', Status: 'Exited (1) 3 seconds ago', Labels: 'fiber-servo.managed=true' },
+      {
+        ID: 'b'.repeat(64),
+        Names: 'web-1',
+        Status: 'Exited (1) 3 seconds ago',
+        Labels: 'fiber-servo.managed=true',
+      },
       { ID: 'c'.repeat(64), Names: 'not-ours', Status: 'Up', Labels: '' },
     ];
-    const { nerdctl, calls } = fakeNerdctl({ ps: () => ok(rows.map((r) => JSON.stringify(r)).join('\n') + '\n') });
+    const { nerdctl, calls } = fakeNerdctl({
+      ps: () => ok(rows.map((r) => JSON.stringify(r)).join('\n') + '\n'),
+    });
     const status = createStatusStore();
     const index = new Map<string, string>();
     await syncFromPs({ nerdctl, status, index });
@@ -274,7 +357,10 @@ describe('containerd runtime: events -> status store', () => {
     expect(status.get('web-0').state).toBe('running');
     expect(status.get('web-1')).toMatchObject({ state: 'dead', exitCode: 1 });
     expect(status.get('not-ours').state).toBe('unknown');
-    expect([...index.entries()]).toEqual([[HEX, 'web-0'], ['b'.repeat(64), 'web-1']]);
+    expect([...index.entries()]).toEqual([
+      [HEX, 'web-0'],
+      ['b'.repeat(64), 'web-1'],
+    ]);
   });
 
   it('watchContainerd resolves unknown ids with inspect once and stops on abort', async () => {
@@ -283,10 +369,22 @@ describe('containerd runtime: events -> status store', () => {
       inspect: (args) => (args.at(-1) === HEX ? ok('web-0 true\n') : ok('other \n')),
     });
     lines.push(
-      JSON.stringify({ ID: HEX, Topic: '/tasks/exit', Event: JSON.stringify({ container_id: HEX, id: HEX, exit_status: 2 }) }),
+      JSON.stringify({
+        ID: HEX,
+        Topic: '/tasks/exit',
+        Event: JSON.stringify({ container_id: HEX, id: HEX, exit_status: 2 }),
+      }),
       JSON.stringify({ ID: HEX, Topic: '/tasks/start', Event: JSON.stringify({ container_id: HEX }) }),
-      JSON.stringify({ ID: 'd'.repeat(64), Topic: '/tasks/start', Event: JSON.stringify({ container_id: 'd'.repeat(64) }) }),
-      JSON.stringify({ ID: 'd'.repeat(64), Topic: '/tasks/exit', Event: JSON.stringify({ container_id: 'd'.repeat(64), id: 'd'.repeat(64) }) }),
+      JSON.stringify({
+        ID: 'd'.repeat(64),
+        Topic: '/tasks/start',
+        Event: JSON.stringify({ container_id: 'd'.repeat(64) }),
+      }),
+      JSON.stringify({
+        ID: 'd'.repeat(64),
+        Topic: '/tasks/exit',
+        Event: JSON.stringify({ container_id: 'd'.repeat(64), id: 'd'.repeat(64) }),
+      }),
       'garbage',
     );
     const status = createStatusStore();
@@ -327,12 +425,27 @@ describe('containerd runtime: end to end with a fake containerd', () => {
     expect(index.get('1'.repeat(63) + '1')).toBe('web-1');
 
     // containerd says web-1 died -> the tree asks for a START -> the executor runs `start`.
-    const dead = { ID: index.get('1'.repeat(63) + '1')!, Topic: '/tasks/exit', Event: JSON.stringify({ container_id: '1'.repeat(63) + '1', id: '1'.repeat(63) + '1', exit_status: 1 }) };
+    const dead = {
+      ID: index.get('1'.repeat(63) + '1')!,
+      Topic: '/tasks/exit',
+      Event: JSON.stringify({ container_id: '1'.repeat(63) + '1', id: '1'.repeat(63) + '1', exit_status: 1 }),
+    };
     const { lines } = { lines: [JSON.stringify(dead)] };
     const controller = new AbortController();
     // Deliver each line once; a re-delivered death would re-arm the backoff (by design).
-    const streaming: Nerdctl = { exec: nerdctl.exec, async *stream() { yield* lines.splice(0); } };
-    const done = watchContainerd({ nerdctl: streaming, status, index, signal: controller.signal, reconnectDelayMs: 1 });
+    const streaming: Nerdctl = {
+      exec: nerdctl.exec,
+      async *stream() {
+        yield* lines.splice(0);
+      },
+    };
+    const done = watchContainerd({
+      nerdctl: streaming,
+      status,
+      index,
+      signal: controller.signal,
+      reconnectDelayMs: 1,
+    });
     await new Promise((r) => setTimeout(r, 30));
     root.flush();
     await runtime.idle();

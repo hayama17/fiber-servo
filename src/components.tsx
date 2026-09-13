@@ -45,7 +45,9 @@ export function Container(props: ContainerProps): ReactElement {
   const { name, restart = 'always', ...rest } = props;
   const enclosing = useNetwork();
   if (name === undefined) {
-    throw new Error('fiber-servo: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)');
+    throw new Error(
+      'fiber-servo: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)',
+    );
   }
   const spec = { name, ...rest, network: rest.network ?? enclosing };
   return container({ ...spec, restarts: useSelfHeal(name, restart) });

@@ -53,7 +53,11 @@ describe('phase 2: networks', () => {
     expect(root.liveIds('network')).toEqual(['app']);
 
     root.unmount();
-    expect(lines(sink.ops)).toEqual(['DELETE container web-1', 'DELETE container web-0', 'DELETE network app']);
+    expect(lines(sink.ops)).toEqual([
+      'DELETE container web-1',
+      'DELETE container web-0',
+      'DELETE network app',
+    ]);
   });
 
   it('containers inside a <Network> carry it in their spec; an explicit network prop wins', () => {
@@ -64,7 +68,10 @@ describe('phase 2: networks', () => {
         <Container name="b" image="x" network="other" />
       </Network>,
     );
-    const creates = sink.ops.filter((op): op is Extract<Op, { type: 'CREATE'; kind: 'container' }> => op.type === 'CREATE' && op.kind === 'container');
+    const creates = sink.ops.filter(
+      (op): op is Extract<Op, { type: 'CREATE'; kind: 'container' }> =>
+        op.type === 'CREATE' && op.kind === 'container',
+    );
     expect(creates.map((op) => [op.id, op.spec.network])).toEqual([
       ['a', 'app'],
       ['b', 'other'],

@@ -14,7 +14,7 @@
  * network is created before the containers inside it and deleted after.
  */
 import type { HostConfig } from 'react-reconciler';
-import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants';
+import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants.js';
 import {
   SPEC_KEYS,
   diffSpec,
@@ -194,7 +194,9 @@ export const hostConfig = {
   // ---- render phase (no ops here) ----------------------------------------
   createInstance(type: string, props: HostProps[InstanceKind], root: RootContainer): Instance {
     if (!isKind(type)) {
-      throw new Error(`fiber-servo: unknown host element <${type}>. Only <container> and <network> are supported.`);
+      throw new Error(
+        `fiber-servo: unknown host element <${type}>. Only <container> and <network> are supported.`,
+      );
     }
     const base = { children: [], root, created: false };
     if (type === 'container') {
@@ -273,7 +275,8 @@ export const hostConfig = {
       if (changed.length === 0) return;
       instance.spec = next;
       if (next.name !== prev.name) return rename(instance, prev.name);
-      if (instance.created) push(instance.root, { type: 'UPDATE', kind: 'network', id: instance.id, prev, next, changed });
+      if (instance.created)
+        push(instance.root, { type: 'UPDATE', kind: 'network', id: instance.id, prev, next, changed });
       return;
     }
 

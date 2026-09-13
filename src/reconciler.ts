@@ -1,6 +1,6 @@
 import { createElement, type ReactNode } from 'react';
 import Reconciler from 'react-reconciler';
-import { ConcurrentRoot } from 'react-reconciler/constants';
+import { ConcurrentRoot } from 'react-reconciler/constants.js';
 import { StatusContext } from './hooks.js';
 import { createRootContainer, typedHostConfig, type RootContainer } from './hostConfig.js';
 import type { InstanceKind, Op, OpSink } from './ops.js';

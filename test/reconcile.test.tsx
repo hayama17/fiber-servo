@@ -257,9 +257,13 @@ describe('phase 0: invariants', () => {
 
   it('rejects text in the tree', () => {
     const { root } = setup();
-    expect(() => root.render(<Container name="x" image="nginx">hello</Container>)).toThrow(
-      /text is not allowed/,
-    );
+    expect(() =>
+      root.render(
+        <Container name="x" image="nginx">
+          hello
+        </Container>,
+      ),
+    ).toThrow(/text is not allowed/);
   });
 
   it('rejects unknown host elements', () => {
