@@ -17,6 +17,12 @@ export interface RuntimeContext {
   onError: (error: Error) => void;
 }
 
+/** What the tree declares right now, by resource kind. Everything else managed is garbage. */
+export interface PruneKeep {
+  containers: readonly string[];
+  networks: readonly string[];
+}
+
 export interface RuntimeHandle {
   /** Receives one batch per commit. */
   sink: OpSink;
@@ -24,6 +30,14 @@ export interface RuntimeHandle {
   idle?(): Promise<void>;
   /** Long-running observer that feeds the status store; runs until `signal` aborts. */
   watch?(signal: AbortSignal): Promise<void>;
+  /**
+   * Resolves once `watch()` has reflected what already exists into the status
+   * store. Pruning waits for it, because adopted containers are what open the
+   * tree's gates (decision 20).
+   */
+  synced?: Promise<void>;
+  /** Remove managed resources absent from `keep`; resolves with the names removed. */
+  prune?(keep: PruneKeep): Promise<string[]>;
 }
 
 /** Binds a runtime to a status store. `containerd()` and `dummy()` are the built-in ones. */
@@ -36,6 +50,11 @@ export interface ServeOptions {
   onError?: (error: Error) => void;
   /** Observe each batch before the runtime gets it. */
   onOps?: (ops: readonly Op[]) => void;
+  /**
+   * Delete managed resources the tree does not declare, once the runtime has
+   * synced and the tree has settled. Default `true`.
+   */
+  prune?: boolean;
 }
 
 export interface Served {
@@ -64,10 +83,28 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
 
   root.render(element);
 
+  let stopped = false;
+  if (options.prune !== false && handle.prune) {
+    // Order matters: the watcher's first sync reports adopted containers
+    // running, settle() then lets every gate that opens declare its subtree,
+    // and only what the tree still does not name is garbage (decision 20).
+    void (async () => {
+      await handle.synced;
+      await root.settle();
+      if (stopped) return; // a stop() in between unmounted the tree: nothing is declared, prune nothing
+      const removed = await handle.prune?.({
+        containers: root.liveIds('container'),
+        networks: root.liveIds('network'),
+      });
+      if (removed?.length) log(`pruned ${removed.join(' ')}`);
+    })().catch(onError);
+  }
+
   return {
     root,
     status,
     async stop() {
+      stopped = true;
       root.unmount();
       await handle.idle?.();
       stop.abort();

@@ -23,9 +23,11 @@ const USAGE = `usage:
   fiber-servo plan <app.tsx>                       print the ops, execute nothing
   fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
                              [--namespace n] [--address sock] [--quiet]
+                             [--no-prune]
 
 <app.tsx> must default-export a React element or a component.
---watch re-evaluates the file on save and reconciles the difference.`;
+--watch re-evaluates the file on save and reconciles the difference.
+--no-prune keeps managed containers the file no longer declares.`;
 
 interface Args {
   command: string | undefined;
@@ -139,6 +141,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (command === 'up') {
     const served = serve(element, {
       runtime: pickRuntime(flags, quiet ? () => {} : stamp),
+      prune: flags['no-prune'] !== true,
       log: quiet ? () => {} : stamp,
       onError: (e) => stamp(`!! ${e.message}`),
       onOps: (ops) => {
