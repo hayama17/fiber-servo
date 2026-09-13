@@ -35,6 +35,7 @@ export type {
   DaemonOptions,
 } from './daemon/server.js';
 export { sendRequest } from './daemon/client.js';
+export { loadElement, watchFile } from './load.js';
 export type { ClientOptions } from './daemon/client.js';
 export { createStatusStore, UNKNOWN_STATUS } from './status.js';
 export type { StatusStore, ContainerStatus, ContainerState, StatusDetail } from './status.js';

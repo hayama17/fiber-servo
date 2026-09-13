@@ -14,11 +14,10 @@
  * state to apply into a store: the program is what is sent, and what it
  * evaluates to is what runs (see docs/decisions.md 18 and 21).
  */
-import { watch } from 'node:fs';
-import { basename, dirname, extname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createElement, isValidElement, type ReactNode } from 'react';
 import { sendRequest } from './daemon/client.js';
+import { loadElement, watchFile } from './load.js';
 import type { DaemonRequest, DaemonResponse, DoneResponse } from './daemon/protocol.js';
 import { runDaemon } from './daemon/server.js';
 import { formatOp } from './ops.js';
@@ -71,50 +70,6 @@ export function parseArgs(argv: readonly string[]): Args {
     } else positional.push(arg);
   }
   return { command: positional[0], file: positional[1], flags };
-}
-
-let tsxRegistered = false;
-// Two reloads inside the same millisecond must not share a cache entry, which
-// a timestamp alone cannot promise; a daemon reloads far more often than `up`.
-let loads = 0;
-
-/**
- * Import the app file and return its element. `fresh` bypasses the module
- * cache for the entry file so `--watch` sees the saved version; modules it
- * imports stay cached, which is why an app is best kept in one file.
- */
-export async function loadElement(file: string, fresh = false): Promise<ReactNode> {
-  if (!tsxRegistered && /^\.[cm]?tsx?$/.test(extname(file))) {
-    try {
-      const { register } = await import('tsx/esm/api');
-      register();
-      tsxRegistered = true;
-    } catch {
-      throw new Error('fiber-servo: loading TypeScript needs the "tsx" package (npm install tsx)');
-    }
-  }
-  const url = pathToFileURL(resolve(file)).href + (fresh ? `?t=${Date.now()}-${++loads}` : '');
-  const mod = (await import(url)) as { default?: unknown };
-  const exported = mod.default;
-  if (isValidElement(exported)) return exported;
-  if (typeof exported === 'function') return createElement(exported as () => ReactNode);
-  throw new Error(`fiber-servo: ${file} must default-export a React element or a component`);
-}
-
-/** Call `onChange` after the file is saved (debounced; survives editors that save by rename). */
-export function watchFile(file: string, onChange: () => void, debounceMs = 100): () => void {
-  const abs = resolve(file);
-  const name = basename(abs);
-  let timer: NodeJS.Timeout | undefined;
-  const watcher = watch(dirname(abs), (_event, changed) => {
-    if (changed !== null && changed !== name) return;
-    clearTimeout(timer);
-    timer = setTimeout(onChange, debounceMs);
-  });
-  return () => {
-    clearTimeout(timer);
-    watcher.close();
-  };
 }
 
 function statusPrinter(log: (line: string) => void): (entries: ReadonlyMap<string, ContainerStatus>) => void {

@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { connect, createServer, type Server, type Socket } from 'node:net';
 import { resolve } from 'node:path';
-import { loadElement, watchFile } from '../cli.js';
+import { loadElement, watchFile } from '../load.js';
 import { formatOp } from '../ops.js';
 import { createRoot, type Root } from '../reconciler.js';
 import type { Runtime } from '../serve.js';
