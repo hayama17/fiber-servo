@@ -90,11 +90,27 @@ report another event.
 
 ### Dependency ordering
 
-`useReady('db')` calls React's `use` on a thenable cached per store and id.
-The thenable settles the first time the store reports `db` running. Until
-then the component suspends and its `<Suspense>` boundary (wrapped by
-`<Ready>`) shows nothing: no `CREATE` for the gated subtree. Once settled it
-stays settled: ordering is a startup concern, liveness is self-healing's.
+`useReady('db')` calls React's `use` on a thenable cached per store, id and
+condition. The thenable settles the first time the store reports `db`
+running (or `ready`, when the dependent asks for it). Until then the
+component suspends and its `<Suspense>` boundary (wrapped by `<Ready>`)
+shows nothing: no `CREATE` for the gated subtree. Once settled it stays
+settled: ordering is a startup concern, liveness is self-healing's.
+
+`<Container>` applies this to its own children: they are rendered inside a
+`<Ready on={name}>` ahead of the host element, so the tree shape expresses
+the dependency, dependents mount after the container is up, and React
+deletes them before it on unmount. A container with a `readiness` probe
+gates on `ready`; the containerd runtime's prober runs the probe with
+`nerdctl exec` and `mark()`s the store.
+
+### Entry point
+
+`serve(element, { runtime })` binds a runtime to a fresh status store,
+starts its watcher, renders, and gives back `stop()`. The `fiber-servo` CLI
+is two commands over it: `plan` uses the dummy runtime, which reports every
+`CREATE` as running and ready, so the full expansion prints without a
+runtime; `up` uses containerd.
 
 ## Scheduling
 

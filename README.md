@@ -10,33 +10,37 @@ reconciliation turns changes into a list of operations; containerd runs them.
 [日本語](README.ja.md)
 
 ```tsx
-import { Container, Deployment, Network, Ready } from 'fiber-servo';
+// app.tsx
+import { Container, Deployment, Network } from 'fiber-servo';
 
-function WebApp({ replicas, image }) {
+export default function App() {
   return (
     <Network name="app">
-      <Container name="db" image="postgres:16" />
-      <Ready on="db">
-        <Deployment name="web" replicas={replicas}>
-          <Container image={image} env={{ DATABASE_HOST: 'db' }} />
+      <Container name="db" image="postgres:16" readiness={{ exec: ['pg_isready'] }}>
+        <Deployment name="web" replicas={2} service={{ port: 80, publish: 8080 }}>
+          <Container image="nginx:alpine" env={{ DATABASE_HOST: 'db' }} />
         </Deployment>
-      </Ready>
+      </Container>
     </Network>
   );
 }
 ```
 
-Render it, and the tree produces:
+The tree shape is the topology: inside `<Network>` means membership, inside
+`<Container>` means dependency. `fiber-servo plan app.tsx` shows what it
+expands to without running anything:
 
 ```
 CREATE network app
 CREATE container db image=postgres:16 network=app
-                                        (db reported running)
-CREATE container web-0 image=nginx network=app
-CREATE container web-1 image=nginx network=app
+                                        (db reported ready)
+CREATE container web-0 image=nginx:alpine network=app
+CREATE container web-1 image=nginx:alpine network=app
+CREATE container web image=docker.io/library/caddy:2-alpine network=app
 ```
 
-Change `replicas` from 2 to 5 and exactly three `CREATE`s follow. Change
+`fiber-servo up app.tsx` runs it on containerd. Change `replicas` from 2 to
+5 and exactly three `CREATE`s follow, plus an `UPDATE` of the proxy. Change
 `image` and each replica gets one `UPDATE`. Kill `web-1` and, after a backoff,
 `START container web-1 attempt=1`. Everything you know about React state,
 composition and hooks applies to infrastructure.
@@ -96,27 +100,25 @@ root.status.set('web-1', 'dead'); // what a runtime's event stream would do
 
 ## Quick start on containerd
 
-```tsx
-import {
-  createContainerdRuntime,
-  createNerdctl,
-  createRoot,
-  createStatusStore,
-  watchContainerd,
-} from 'fiber-servo';
+With the CLI, an app file is the whole program:
 
-const nerdctl = createNerdctl({ namespace: 'default' });
-const status = createStatusStore();
-const index = new Map<string, string>();
-
-const runtime = createContainerdRuntime({ nerdctl, status, index });
-const root = createRoot({ status, sink: runtime.sink });
-void watchContainerd({ nerdctl, status, index, signal: new AbortController().signal });
-
-root.render(<WebApp replicas={2} image="nginx:alpine" />);
+```sh
+npx fiber-servo plan app.tsx        # print the ops, execute nothing
+sudo npx fiber-servo up app.tsx     # run on containerd until Ctrl-C
 ```
 
-`examples/containerd.tsx` is a complete program. See
+From code, `serve()` is the same thing in one call:
+
+```tsx
+import { containerd, serve } from 'fiber-servo';
+
+const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) });
+process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
+```
+
+The pieces behind it (`createRoot`, `createContainerdRuntime`,
+`watchContainerd`) are exported for anything `serve()` does not cover;
+`examples/containerd.tsx` uses them directly. See
 [docs/containerd.md](docs/containerd.md) for what the runtime does with each
 op and what it assumes about nerdctl.
 
@@ -146,12 +148,20 @@ renders `restarts={n + 1}`; the reconciler emits `START`. Restart count,
 **Networks** are the second host element. Containers inside a `<Network>`
 attach to it and resolve each other by name. Tree nesting gives ordering.
 
-**Dependency ordering** is `<Ready on="db">`: nothing inside emits a
-`CREATE` until `db` has been reported running once. Under the hood it is
-`use()` on a thenable that settles from the status store, inside a
-`<Suspense>` boundary.
+**Dependency ordering** is nesting. Children of a `<Container>` emit no
+`CREATE` until it has been reported running, or `ready` when it declares a
+`readiness={{ exec }}` probe that the runtime runs inside it. `<Ready
+on="db">` does the same for dependencies that are not the parent. Under the
+hood it is `use()` on a thenable that settles from the status store, inside
+a `<Suspense>` boundary.
 
-**Composition** is a function. `<WebApp/>` is a component like any other.
+**Services** are composition. `<Service name="web" port={80} targets={[…]}>`
+renders a caddy reverse proxy in front of its targets;
+`<Deployment service={{ port, publish }}>` renders one for its replicas and
+keeps its command in step with scaling. Host ports are published on the
+proxy, so replicas never collide.
+
+**Composition** is a function. `<App/>` is a component like any other.
 
 More in [docs/architecture.md](docs/architecture.md) and
 [docs/decisions.md](docs/decisions.md).
@@ -160,15 +170,16 @@ More in [docs/architecture.md](docs/architecture.md) and
 
 See [docs/api.md](docs/api.md). The short version:
 
-| Export                                                        | Role                                                        |
-| ------------------------------------------------------------- | ----------------------------------------------------------- |
-| `createRoot({ sink, status })`                                | `render`, `flush`, `settle`, `unmount`, `liveIds`           |
-| `Container`, `Deployment`, `Network`, `Ready`                 | The components                                              |
-| `useContainerStatus`, `useReady`, `useSelfHeal`               | The hooks behind them                                       |
-| `createStatusStore`                                           | The external store                                          |
-| `createDummyRuntime`                                          | Prints ops; optionally plays a runtime that always succeeds |
-| `createNerdctl`, `createContainerdRuntime`, `watchContainerd` | containerd                                                  |
-| `collectOps`, `formatOp`                                      | Testing helpers                                             |
+| Export                                                        | Role                                              |
+| ------------------------------------------------------------- | ------------------------------------------------- |
+| `serve(element, { runtime })`                                 | The one-call entry point; `stop()` tears down     |
+| `containerd(options)`, `dummy(options)`                       | Runtimes for `serve()`                            |
+| `Container`, `Deployment`, `Network`, `Service`, `Ready`      | The components                                    |
+| `useContainerStatus`, `useReady`, `useSelfHeal`               | The hooks behind them                             |
+| `createRoot({ sink, status })`                                | `render`, `flush`, `settle`, `unmount`, `liveIds` |
+| `createStatusStore`                                           | The external store                                |
+| `createNerdctl`, `createContainerdRuntime`, `watchContainerd` | containerd, piece by piece                        |
+| `collectOps`, `formatOp`, `createDummyRuntime`                | Testing helpers                                   |
 
 ## Development
 
@@ -181,17 +192,15 @@ npm run check              # everything CI runs
 npm run example            # scale / update / teardown
 npm run example:self-heal  # death -> START with backoff
 npm run example:webapp     # network + gated deployment
+npx tsx src/cli.ts plan examples/app.tsx   # the CLI against the full example
 sudo npm run example:containerd  # real containerd; kill a replica and watch it return
 ```
 
 ## Roadmap
 
-- `<Service>`: publish a deployment under one name. A caddy
-  `reverse-proxy --to web-0 --to web-1` container built by composition is the
-  shortest path.
-- Readiness probes feeding a `ready` state into the store, so `<Ready>` can
-  wait for "accepting connections" rather than "process started".
-- Port publishing, once a Service decides what it means.
+- HTTP and TCP readiness probes, once there is a network path from the host
+  into the CNI network.
+- Volumes and resource limits as spec fields.
 - A direct containerd gRPC client behind the same `Nerdctl` interface.
 
 ## Contributing

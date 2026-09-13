@@ -5,33 +5,34 @@
 [English](README.md)
 
 ```tsx
-import { Container, Deployment, Network, Ready } from 'fiber-servo';
+// app.tsx
+import { Container, Deployment, Network } from 'fiber-servo';
 
-function WebApp({ replicas, image }) {
+export default function App() {
   return (
     <Network name="app">
-      <Container name="db" image="postgres:16" />
-      <Ready on="db">
-        <Deployment name="web" replicas={replicas}>
-          <Container image={image} env={{ DATABASE_HOST: 'db' }} />
+      <Container name="db" image="postgres:16" readiness={{ exec: ['pg_isready'] }}>
+        <Deployment name="web" replicas={2} service={{ port: 80, publish: 8080 }}>
+          <Container image="nginx:alpine" env={{ DATABASE_HOST: 'db' }} />
         </Deployment>
-      </Ready>
+      </Container>
     </Network>
   );
 }
 ```
 
-これを render すると、ツリーは次の ops を出します。
+ツリーの形がそのままトポロジです。`<Network>` の中は所属、`<Container>` の中は依存。`fiber-servo plan app.tsx` で、何も実行せずに展開結果を見られます。
 
 ```
 CREATE network app
 CREATE container db image=postgres:16 network=app
-                                        (db が running と報告される)
-CREATE container web-0 image=nginx network=app
-CREATE container web-1 image=nginx network=app
+                                        (db が ready と報告される)
+CREATE container web-0 image=nginx:alpine network=app
+CREATE container web-1 image=nginx:alpine network=app
+CREATE container web image=docker.io/library/caddy:2-alpine network=app
 ```
 
-`replicas` を 2 から 5 にすると CREATE がちょうど 3 つ、`image` を変えると各 replica に UPDATE が 1 つ、`web-1` を kill するとバックオフの後に `START container web-1 attempt=1` が出ます。React の state・合成・hooks の知識がそのままインフラに使えます。
+`fiber-servo up app.tsx` で containerd 上に実体化します。`replicas` を 2 から 5 にすると CREATE がちょうど 3 つとプロキシの UPDATE が 1 つ、`image` を変えると各 replica に UPDATE が 1 つ、`web-1` を kill するとバックオフの後に `START container web-1 attempt=1` が出ます。React の state・合成・hooks の知識がそのままインフラに使えます。
 
 > **ステータス: 実験段階です。** reconciler はランタイムに触れないテストで固定されています。containerd ランタイムは実機で動作確認していますが、まだ利用者が少ない段階です。1.0 までは API が変わることがあります。
 
@@ -56,7 +57,9 @@ Node 20 以上。実際に動かすには containerd と [nerdctl](https://githu
 
 **ネットワーク**は 2 つ目の host element です。`<Network>` の中のコンテナはそこに接続され、名前で互いを解決できます。ツリーのネストが作成・削除の順序を保証します。
 
-**依存順序**は `<Ready on="db">` です。`db` が一度 running と報告されるまで、中のものは `CREATE` を出しません。内部では status store から解決される thenable を `use()` し、`<Suspense>` で包んでいます。
+**依存順序**はネストです。`<Container>` の子は、その container が running（`readiness={{ exec }}` の probe があれば ready）と報告されるまで `CREATE` を出しません。親以外への依存は `<Ready on="db">` で書けます。内部では status store から解決される thenable を `use()` し、`<Suspense>` で包んでいます。
+
+**Service**は合成です。`<Service name="web" port={80} targets={[…]}>` は caddy の reverse proxy コンテナを描画し、`<Deployment service={{ port, publish }}>` は replica の前にそれを置いて、scale に合わせてコマンドを更新します。ホストポートはプロキシ側で公開するので replica 同士が衝突しません。
 
 **合成**はただの関数です。
 
@@ -64,27 +67,23 @@ Node 20 以上。実際に動かすには containerd と [nerdctl](https://githu
 
 ## containerd で動かす
 
-```tsx
-import {
-  createContainerdRuntime,
-  createNerdctl,
-  createRoot,
-  createStatusStore,
-  watchContainerd,
-} from 'fiber-servo';
+CLI なら app ファイルがプログラムそのものです。
 
-const nerdctl = createNerdctl({ namespace: 'default' });
-const status = createStatusStore();
-const index = new Map<string, string>();
-
-const runtime = createContainerdRuntime({ nerdctl, status, index });
-const root = createRoot({ status, sink: runtime.sink });
-void watchContainerd({ nerdctl, status, index, signal: new AbortController().signal });
-
-root.render(<WebApp replicas={2} image="nginx:alpine" />);
+```sh
+npx fiber-servo plan app.tsx        # ops を表示するだけ。何も実行しない
+sudo npx fiber-servo up app.tsx     # containerd 上で Ctrl-C まで動かす
 ```
 
-完全なプログラムは `examples/containerd.tsx` にあります。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
+コードからは `serve()` の 1 行です。
+
+```tsx
+import { containerd, serve } from 'fiber-servo';
+
+const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) });
+process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
+```
+
+その裏にある部品（`createRoot`、`createContainerdRuntime`、`watchContainerd`）も export しています。`examples/containerd.tsx` はそれらを直接使う例です。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
 
 ## 開発
 
@@ -102,9 +101,8 @@ sudo npm run example:containerd  # 実機。replica を kill すると戻って�
 
 ## ロードマップ
 
-- `<Service>`: deployment を 1 つの名前で公開する。caddy の `reverse-proxy --to web-0 --to web-1` コンテナを合成で作るのが最短です。
-- readiness probe を store の `ready` 状態として流し、`<Ready>` が「プロセス起動」ではなく「接続を受け付ける」を待てるようにする。
-- ポート公開（Service の意味が決まってから）。
+- HTTP / TCP の readiness probe（ホストから CNI ネットワークへの経路ができてから）。
+- Volume とリソース制限を spec のフィールドとして追加する。
 - 同じ `Nerdctl` インターフェースの裏に containerd gRPC クライアントを置く。
 
 ## コントリビュート

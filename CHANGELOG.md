@@ -7,6 +7,28 @@ change public APIs.
 
 ## [Unreleased]
 
+### Added
+
+- Nesting is dependency: children of a `<Container>` mount once it is
+  running (or `ready`, when it has a `readiness` probe) and unmount before it.
+- `serve(element, { runtime })`, the one-call entry point, with `dummy()` and
+  `containerd()` runtimes.
+- `fiber-servo` CLI: `plan <app.tsx>` prints every op without executing,
+  `up <app.tsx>` runs the tree on containerd until Ctrl-C.
+- `<Service>`: a caddy reverse proxy in front of named targets, built by
+  composition; `<Deployment service={{ port, publish }}>` renders one for its
+  replicas.
+- `publish` on containers (`-p host:container[/udp]`).
+- `readiness={{ exec }}` probes: the containerd runtime runs them with
+  `nerdctl exec` and marks the store `ready`; `<Ready until="ready">`;
+  `status.mark()`.
+
+### Changed
+
+- A `<Container>` inside another no longer produces a nested host instance;
+  it is a dependent.
+- `tsx` is a runtime dependency (the CLI loads TypeScript app files with it).
+
 ## [0.1.0] - 2026-09-13
 
 First public release.
