@@ -57,6 +57,7 @@
     "example": "tsx examples/basic.tsx",
     "example:self-heal": "tsx examples/self-heal.tsx",
     "example:webapp": "tsx examples/webapp.tsx",
+    "example:plan": "tsx src/cli.ts plan examples/app.tsx",
     "example:containerd": "tsx examples/containerd.tsx"
   },
   "peerDependencies": {

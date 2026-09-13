@@ -41,7 +41,10 @@ await runtime.idle();
 stop.abort();
 ```
 
-`examples/containerd.tsx` is a complete version of this with logging.
+`serve(<App />, { runtime: containerd() })` does all of this in one call;
+`examples/containerd.tsx` is that with logging, and `fiber-servo up` is the
+same from the command line. The pieces above are for anything `serve()`
+does not cover.
 
 ## What the executor does
 

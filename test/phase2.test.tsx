@@ -54,8 +54,8 @@ describe('phase 2: networks', () => {
 
     root.unmount();
     expect(lines(sink.ops)).toEqual([
-      'DELETE container web-1',
       'DELETE container web-0',
+      'DELETE container web-1',
       'DELETE network app',
     ]);
   });

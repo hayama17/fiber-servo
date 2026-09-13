@@ -120,6 +120,33 @@ describe('nesting is dependency', () => {
   });
 });
 
+describe('teardown order follows the tree', () => {
+  it('a network unmounts its dependents before their dependency, even when they were inserted later', async () => {
+    const { root, sink } = setup();
+    root.render(
+      <Network name="app">
+        <Container name="db" image="postgres">
+          <Deployment name="web" replicas={2} service={{ port: 80 }}>
+            <Container image="nginx" />
+          </Deployment>
+        </Container>
+      </Network>,
+    );
+    root.status.set('db', 'running');
+    await root.settle();
+    sink.take();
+
+    root.unmount();
+    expect(lines(sink.ops)).toEqual([
+      'DELETE container web-0',
+      'DELETE container web-1',
+      'DELETE container web',
+      'DELETE container db',
+      'DELETE network app',
+    ]);
+  });
+});
+
 describe('status.mark', () => {
   it('amends the snapshot without changing state or time, bumps seq, and ignores unknown ids', () => {
     const store = createStatusStore(() => 7);

@@ -116,11 +116,11 @@ const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) })
 process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
 ```
 
-The pieces behind it (`createRoot`, `createContainerdRuntime`,
-`watchContainerd`) are exported for anything `serve()` does not cover;
-`examples/containerd.tsx` uses them directly. See
-[docs/containerd.md](docs/containerd.md) for what the runtime does with each
-op and what it assumes about nerdctl.
+`examples/containerd.tsx` is this with logging; `examples/app.tsx` is the
+tree it serves. The pieces behind `serve()` (`createRoot`,
+`createContainerdRuntime`, `watchContainerd`) are exported for anything it
+does not cover. See [docs/containerd.md](docs/containerd.md) for what the
+runtime does with each op and what it assumes about nerdctl.
 
 ## Concepts
 

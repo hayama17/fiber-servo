@@ -83,7 +83,7 @@ const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) })
 process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
 ```
 
-その裏にある部品（`createRoot`、`createContainerdRuntime`、`watchContainerd`）も export しています。`examples/containerd.tsx` はそれらを直接使う例です。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
+`examples/containerd.tsx` はこれにログを足したもので、`examples/app.tsx` がそこで serve されるツリーです。`serve()` の裏にある部品（`createRoot`、`createContainerdRuntime`、`watchContainerd`）も export しています。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
 
 ## 開発
 

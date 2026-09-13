@@ -129,9 +129,13 @@ function mountSubtree(instance: Instance): void {
   for (const child of instance.children) mountSubtree(child);
 }
 
-/** Emit DELETE for the whole subtree, children first (reverse of creation). */
+/**
+ * Emit DELETE for the whole subtree: children in tree order, then the parent.
+ * Tree order matters because <Container> renders its dependents ahead of
+ * itself, so a later-inserted dependent still goes before what it depends on.
+ */
 function unmountSubtree(instance: Instance): void {
-  for (let i = instance.children.length - 1; i >= 0; i--) unmountSubtree(instance.children[i]!);
+  for (const child of instance.children) unmountSubtree(child);
   if (instance.created) {
     instance.created = false;
     instance.root.live.delete(liveKey(instance.kind, instance.id));
@@ -235,7 +239,7 @@ export const hostConfig = {
     root.sink(batch);
   },
   clearContainer(root: RootContainer): void {
-    for (let i = root.children.length - 1; i >= 0; i--) unmountSubtree(root.children[i]!);
+    for (const child of root.children) unmountSubtree(child);
     root.children = [];
   },
   appendChild(parent: Instance, child: Instance): void {
