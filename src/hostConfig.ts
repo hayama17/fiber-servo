@@ -5,16 +5,28 @@
  *
  *   1. spec = fiber tree. Host instances *are* the desired state. Runtime
  *      status (is the container alive?) lives outside the tree and is read
- *      with useSyncExternalStore (phase 1).
+ *      with useSyncExternalStore.
  *   2. commit executes nothing. Every host method is synchronous and only
  *      appends to `root.pending`. `resetAfterCommit` hands the batch to the
  *      sink; the sink is the only place a side effect may happen.
+ *
+ * Host elements: `container` and `network`. Nesting gives ordering: a
+ * network is created before the containers inside it and deleted after.
  */
 import type { HostConfig } from 'react-reconciler';
 import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants';
-import { diffSpec, type ContainerSpec, type Op, type OpSink } from './ops.js';
+import {
+  SPEC_KEYS,
+  diffSpec,
+  type ContainerSpec,
+  type InstanceKind,
+  type NetworkSpec,
+  type Op,
+  type OpSink,
+  type Specs,
+} from './ops.js';
 
-export type HostType = 'container';
+export type HostType = InstanceKind;
 
 /** Props accepted by the `container` host element. */
 export interface ContainerHostProps extends ContainerSpec {
@@ -27,65 +39,92 @@ export interface ContainerHostProps extends ContainerSpec {
   children?: unknown;
 }
 
-export interface Instance {
-  kind: 'container';
-  /** Identity as seen by the runtime. Equal to `spec.name`. */
-  id: string;
-  spec: ContainerSpec;
-  /** Last restart generation turned into an op. */
-  restarts: number;
-  children: Instance[];
-  root: RootContainer;
-  /** True between the CREATE and DELETE ops for this instance. */
-  created: boolean;
+export interface NetworkHostProps extends NetworkSpec {
+  children?: unknown;
 }
+
+export type HostProps = { container: ContainerHostProps; network: NetworkHostProps };
+
+export type Instance = {
+  [K in InstanceKind]: {
+    kind: K;
+    /** Identity as seen by the runtime. Equal to `spec.name`. */
+    id: string;
+    spec: Specs[K];
+    /** Last restart generation turned into an op (containers only). */
+    restarts: number;
+    children: Instance[];
+    root: RootContainer;
+    /** True between the CREATE and DELETE ops for this instance. */
+    created: boolean;
+  };
+}[InstanceKind];
 
 export interface RootContainer {
   kind: 'root';
   children: Instance[];
   /** Ops of the commit in flight. Flushed to `sink` in `resetAfterCommit`. */
   pending: Op[];
-  /** Instances that currently have an outstanding CREATE. */
+  /** Instances that currently have an outstanding CREATE, keyed by `kind:id`. */
   live: Map<string, Instance>;
+  /** Number of commits so far, including ones that produced no ops. */
+  commits: number;
   sink: OpSink;
 }
 
 type HostContext = Record<never, never>;
 
-export function createRootContainer(sink: OpSink): RootContainer {
-  return { kind: 'root', children: [], pending: [], live: new Map(), sink };
+/** What `scheduleTimeout` hands back; see its comment. */
+export interface TimeoutHandle {
+  cancelled: boolean;
 }
 
-const SPEC_KEYS = ['name', 'image', 'command', 'env', 'ports', 'labels'] as const;
+export function createRootContainer(sink: OpSink): RootContainer {
+  return { kind: 'root', children: [], pending: [], live: new Map(), commits: 0, sink };
+}
 
-function propsToSpec(type: string, props: ContainerHostProps): ContainerSpec {
-  if (typeof props.name !== 'string' || props.name.length === 0) {
-    throw new Error(`react4c: <${type}> requires a non-empty string "name"`);
+export const liveKey = (kind: InstanceKind, id: string): string => `${kind}:${id}`;
+
+function isKind(type: string): type is InstanceKind {
+  return type in SPEC_KEYS;
+}
+
+function propsToSpec<K extends InstanceKind>(kind: K, props: HostProps[K]): Specs[K] {
+  const p = props as unknown as Record<string, unknown>;
+  if (typeof p['name'] !== 'string' || p['name'].length === 0) {
+    throw new Error(`react4c: <${kind}> requires a non-empty string "name"`);
   }
-  if (typeof props.image !== 'string' || props.image.length === 0) {
-    throw new Error(`react4c: <${type} name="${props.name}"> requires a non-empty string "image"`);
+  if (kind === 'container' && (typeof p['image'] !== 'string' || p['image'].length === 0)) {
+    throw new Error(`react4c: <container name="${p['name']}"> requires a non-empty string "image"`);
   }
   const spec: Record<string, unknown> = {};
-  for (const key of SPEC_KEYS) {
-    if (props[key] !== undefined) spec[key] = props[key];
+  for (const key of SPEC_KEYS[kind] as readonly string[]) {
+    if (p[key] !== undefined) spec[key] = p[key];
   }
-  return spec as unknown as ContainerSpec;
+  return spec as unknown as Specs[K];
 }
 
 function push(root: RootContainer, op: Op): void {
   root.pending.push(op);
 }
 
+function createOp(instance: Instance): Op {
+  return instance.kind === 'container'
+    ? { type: 'CREATE', kind: 'container', id: instance.id, spec: instance.spec }
+    : { type: 'CREATE', kind: 'network', id: instance.id, spec: instance.spec };
+}
+
 /** Emit CREATE for every not-yet-created instance in the subtree, parents first. */
 function mountSubtree(instance: Instance): void {
   const root = instance.root;
   if (!instance.created) {
-    if (root.live.has(instance.id)) {
-      throw new Error(`react4c: duplicate container name "${instance.id}"`);
+    const key = liveKey(instance.kind, instance.id);
+    if (root.live.has(key)) {
+      throw new Error(`react4c: duplicate ${instance.kind} name "${instance.id}"`);
     }
     instance.created = true;
-    root.live.set(instance.id, instance);
-    push(root, { type: 'CREATE', kind: 'container', id: instance.id, spec: instance.spec });
+    root.live.set(key, instance);
+    push(root, createOp(instance));
   }
   for (const child of instance.children) mountSubtree(child);
 }
@@ -95,8 +134,8 @@ function unmountSubtree(instance: Instance): void {
   for (let i = instance.children.length - 1; i >= 0; i--) unmountSubtree(instance.children[i]!);
   if (instance.created) {
     instance.created = false;
-    instance.root.live.delete(instance.id);
-    push(instance.root, { type: 'DELETE', kind: 'container', id: instance.id });
+    instance.root.live.delete(liveKey(instance.kind, instance.id));
+    push(instance.root, { type: 'DELETE', kind: instance.kind, id: instance.id });
   }
 }
 
@@ -153,20 +192,18 @@ export const hostConfig = {
   },
 
   // ---- render phase (no ops here) ----------------------------------------
-  createInstance(type: string, props: ContainerHostProps, root: RootContainer): Instance {
-    if (type !== 'container') {
-      throw new Error(`react4c: unknown host element <${type}>. Only <container> is supported.`);
+  createInstance(type: string, props: HostProps[InstanceKind], root: RootContainer): Instance {
+    if (!isKind(type)) {
+      throw new Error(`react4c: unknown host element <${type}>. Only <container> and <network> are supported.`);
     }
-    const spec = propsToSpec(type, props);
-    return {
-      kind: 'container',
-      id: spec.name,
-      spec,
-      restarts: props.restarts ?? 0,
-      children: [],
-      root,
-      created: false,
-    };
+    const base = { children: [], root, created: false };
+    if (type === 'container') {
+      const p = props as ContainerHostProps;
+      const spec = propsToSpec('container', p);
+      return { kind: 'container', id: spec.name, spec, restarts: p.restarts ?? 0, ...base };
+    }
+    const spec = propsToSpec('network', props as NetworkHostProps);
+    return { kind: 'network', id: spec.name, spec, restarts: 0, ...base };
   },
   createTextInstance(text: string): never {
     throw new Error(
@@ -189,6 +226,7 @@ export const hostConfig = {
     return null;
   },
   resetAfterCommit(root: RootContainer): void {
+    root.commits += 1;
     if (root.pending.length === 0) return;
     const batch = root.pending;
     root.pending = [];
@@ -224,31 +262,33 @@ export const hostConfig = {
   },
   commitUpdate(
     instance: Instance,
-    type: string,
-    _prevProps: ContainerHostProps,
-    nextProps: ContainerHostProps,
+    _type: string,
+    _prevProps: HostProps[InstanceKind],
+    nextProps: HostProps[InstanceKind],
   ): void {
+    if (instance.kind === 'network') {
+      const prev = instance.spec;
+      const next = propsToSpec('network', nextProps as NetworkHostProps);
+      const changed = diffSpec('network', prev, next);
+      if (changed.length === 0) return;
+      instance.spec = next;
+      if (next.name !== prev.name) return rename(instance, prev.name);
+      if (instance.created) push(instance.root, { type: 'UPDATE', kind: 'network', id: instance.id, prev, next, changed });
+      return;
+    }
+
+    const props = nextProps as ContainerHostProps;
     const prev = instance.spec;
-    const next = propsToSpec(type, nextProps);
-    const changed = diffSpec(prev, next);
-    const restarts = nextProps.restarts ?? 0;
+    const next = propsToSpec('container', props);
+    const changed = diffSpec('container', prev, next);
+    const restarts = props.restarts ?? 0;
 
     if (changed.length > 0) {
       instance.spec = next;
       if (next.name !== prev.name) {
-        // `name` is identity. React kept the fiber (same key/type), but for the
-        // runtime this is a different container: tear down the old one and
-        // create the new one. Children keep their own identity. A fresh
-        // container starts at the current generation; no START needed.
-        if (instance.created) {
-          instance.created = false;
-          instance.root.live.delete(prev.name);
-          push(instance.root, { type: 'DELETE', kind: 'container', id: prev.name });
-        }
-        instance.id = next.name;
+        // A fresh container starts at the current generation; no START needed.
         instance.restarts = restarts;
-        mountSubtree(instance);
-        return;
+        return rename(instance, prev.name);
       }
       if (instance.created) {
         push(instance.root, { type: 'UPDATE', kind: 'container', id: instance.id, prev, next, changed });
@@ -270,8 +310,9 @@ export const hostConfig = {
   commitMount(): void {},
   resetTextContent(): void {},
   hideInstance(): void {
-    // Suspense/Activity hiding is a phase-2 concern (dependency ordering).
-    // Until then a hidden container keeps running.
+    // Called when an already-mounted subtree re-suspends. useReady latches,
+    // so this only happens for user-thrown promises; a hidden container
+    // keeps running. Stopping dependents is a policy for conditional render.
   },
   unhideInstance(): void {},
   hideTextInstance(): void {},
@@ -287,8 +328,23 @@ export const hostConfig = {
   },
 
   // ---- scheduling ---------------------------------------------------------
-  scheduleTimeout: setTimeout,
-  cancelTimeout: clearTimeout,
+  /**
+   * React's only use of this in concurrent mode is to throttle the commit
+   * that replaces a Suspense fallback (about 300ms after the fallback was
+   * shown, to avoid flashing). There is no UI to flash: a container gated by
+   * <Ready> should be created the moment its dependency is up. So "later"
+   * means the next microtask, still cancellable.
+   */
+  scheduleTimeout(fn: () => void, _ms: number): TimeoutHandle {
+    const handle: TimeoutHandle = { cancelled: false };
+    queueMicrotask(() => {
+      if (!handle.cancelled) fn();
+    });
+    return handle;
+  },
+  cancelTimeout(handle: TimeoutHandle): void {
+    handle.cancelled = true;
+  },
   noTimeout: -1 as const,
   scheduleMicrotask: queueMicrotask,
   getCurrentUpdatePriority(): number {
@@ -301,7 +357,8 @@ export const hostConfig = {
     // Every update outside an explicit priority is discrete, i.e. SyncLane.
     // A container spec has no "less urgent" changes, and sync lanes mean a
     // store event re-renders and commits in the next microtask (or on
-    // `root.flush()`), with no Scheduler involvement.
+    // `root.flush()`), with no Scheduler involvement. Suspense retries are
+    // the exception: React picks a retry lane and goes through the Scheduler.
     return currentUpdatePriority !== NoEventPriority ? currentUpdatePriority : DiscreteEventPriority;
   },
   shouldAttemptEagerTransition(): boolean {
@@ -316,7 +373,7 @@ export const hostConfig = {
   },
   requestPostPaintCallback(): void {},
 
-  // ---- suspending commits (unused until phase 2) -------------------------
+  // ---- suspending commits (unused) -----------------------------------------
   maySuspendCommit(): boolean {
     return false;
   },
@@ -349,12 +406,27 @@ export const hostConfig = {
 };
 
 /**
+ * `name` is identity. React kept the fiber (same key/type), but for the
+ * runtime this is a different resource: tear down the old one and create
+ * the new one. Children keep their own identity.
+ */
+function rename(instance: Instance, previousName: string): void {
+  if (instance.created) {
+    instance.created = false;
+    instance.root.live.delete(liveKey(instance.kind, previousName));
+    push(instance.root, { type: 'DELETE', kind: instance.kind, id: previousName });
+  }
+  instance.id = instance.spec.name;
+  mountSubtree(instance);
+}
+
+/**
  * @types/react-reconciler lags the runtime (0.33 types vs 0.34 runtime), so
  * the config is authored as a plain object and cast once, here.
  */
 export const typedHostConfig = hostConfig as unknown as HostConfig<
   HostType,
-  ContainerHostProps,
+  HostProps[InstanceKind],
   RootContainer,
   Instance,
   never,
@@ -364,7 +436,7 @@ export const typedHostConfig = hostConfig as unknown as HostConfig<
   HostContext,
   null,
   never,
-  ReturnType<typeof setTimeout>,
+  TimeoutHandle,
   -1,
   null
 >;
