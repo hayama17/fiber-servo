@@ -38,6 +38,33 @@ only place a side effect may happen.
 - Reconciliation is verified in tests by asserting op sequences.
 - Swapping runtimes means writing a new sink, nothing else.
 
+### Where state lives
+
+The fiber tree does hold state: the state it last committed. Render compares
+the new desired tree with that record and emits the difference. This is how
+React works for the DOM too: it never reads the DOM back, it diffs against
+its own memoized props and assumes the DOM is what it wrote.
+
+The part that plays the real DOM here is containerd. The difference is that
+a DOM only changes when React changes it, while a container can die on its
+own. React has no mechanism to re-verify its host, so containerd's actual
+state is tracked separately, in the status store, and fed back into the tree
+as an input next to props. The tree turns that observation into a new
+intention (`restarts={n + 1}`), and React diffs the intention against its
+record as usual.
+
+| Place                         | Holds                                                                          | Who reads it                           |
+| ----------------------------- | ------------------------------------------------------------------------------ | -------------------------------------- |
+| Fiber tree and host instances | What was last committed, plus policy state (restart counters, `Ready` latches) | Render, to diff                        |
+| containerd                    | What actually exists                                                           | Nobody in the tree                     |
+| Status store                  | The observation of containerd                                                  | Components, via `useSyncExternalStore` |
+
+A process restart loses the first row. The runtime's `fiber-servo.spec`
+labels let `CREATE` adopt what exists, the watcher's initial `ps -a` refills
+the store, and the restart counters start over. One fiber-servo process per
+set of containers is assumed; two would each keep their own record and
+fight.
+
 ## Layers
 
 | Layer      | Files                                                  | Knows about             |
