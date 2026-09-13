@@ -10,6 +10,72 @@ a list of operations for a container runtime.
    └────────── useSyncExternalStore ◀── StatusStore ◀── events ───┘
 ```
 
+## What we are reusing from React
+
+It is tempting to describe React's value here as "the Virtual DOM diff, but for
+containers." That is how the current renderer happens to reach the runtime,
+but it is not the architectural idea we want to preserve.
+
+The DOM renderer needs an incremental diff because DOM mutation is the way its
+external world is updated. That requirement is important to React's origin, but
+it is not the most useful abstraction for fiber-servo. A container runtime, and
+especially Compose, already has its own rules for turning a desired application
+model into concrete runtime changes.
+
+The part we want from React is the live, stateful, declarative tree:
+
+```text
+state + props + observed state
+            ↓
+      React component tree
+            ↓
+     desired resource tree
+            ↓
+       materialization
+            ↓
+       external system
+```
+
+Fiber gives that tree component identity, hooks, state, lifecycle, composition,
+Suspense, and repeated evaluation as inputs change. Those properties remain
+useful even when React is not the component that computes the final runtime
+diff.
+
+In other words, fiber-servo does not require this invariant:
+
+```text
+Fiber diff = runtime diff
+```
+
+A backend such as Compose may own the final application diff instead:
+
+```text
+observations / state
+        ↓
+React reconciliation
+        ↓
+live control-plane tree
+        ↓
+desired Compose application
+        ↓
+Compose reconciliation
+        ↓
+runtime
+```
+
+React reconciliation still matters: it preserves the continuity and state of
+the control-plane program. What we are willing to give up is using React's host
+mutation diff as an optimization for the runtime itself.
+
+A useful way to think about the experiment is therefore not "Virtual DOM for
+containers", but "virtual desired-state tree". The DOM was React's original
+external system; it does not have to be ours.
+
+The current op-based renderer predates this distinction and may evolve toward a
+Compose-backed materialization model. The important property to preserve is the
+live React control plane, not a particular mapping from host commits to runtime
+commands.
+
 ## The two rules
 
 Everything in the codebase follows from two decisions.
