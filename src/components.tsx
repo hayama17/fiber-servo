@@ -13,6 +13,7 @@ import {
   type ReactNode,
 } from 'react';
 import type { ContainerHostProps } from './hostConfig.js';
+import { type RestartMode, useSelfHeal } from './hooks.js';
 import type { ContainerSpec } from './ops.js';
 
 export interface ContainerProps extends Omit<ContainerSpec, 'name'> {
@@ -21,6 +22,12 @@ export interface ContainerProps extends Omit<ContainerSpec, 'name'> {
    * <Deployment> fills it in for replicas.
    */
   name?: string;
+  /**
+   * What to do when the status store reports the container dead.
+   * `'always'` (default) restarts with exponential backoff, `'never'` leaves
+   * it, an object tunes the backoff. See `RestartPolicy`.
+   */
+  restart?: RestartMode;
   children?: ReactNode;
 }
 
@@ -30,11 +37,11 @@ function container(props: ContainerHostProps): ReactElement {
 }
 
 export function Container(props: ContainerProps): ReactElement {
-  const { name, ...rest } = props;
+  const { name, restart = 'always', ...rest } = props;
   if (name === undefined) {
     throw new Error('react4c: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)');
   }
-  return container({ name, ...rest });
+  return container({ name, ...rest, restarts: useSelfHeal(name, restart) });
 }
 
 export interface DeploymentProps {
