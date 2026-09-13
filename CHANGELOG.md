@@ -22,6 +22,19 @@ change public APIs.
   `containerd()` runtimes.
 - `fiber-servo` CLI: `plan <app.tsx>` prints every op without executing,
   `up <app.tsx>` runs the tree on containerd until Ctrl-C.
+- A daemon and two clients: `fiber-servo daemon` starts with no app and
+  listens on one unix socket; `apply <app.tsx>` mounts it the first time and
+  reconciles only the difference after that; `delete <app.tsx>` unmounts just
+  that app. `apply --watch` has the daemon re-evaluate the file on save, and
+  `list` / `ping` inspect it. One process holds one runtime, one status store,
+  one executor queue, one event watcher and one readiness prober, with a React
+  root per app; the prune keep set is the union over all of them.
+- The daemon stores no desired state: `apply` sends the path of a program and
+  the daemon evaluates it, which is what keeps self-healing and `<Ready>`
+  gating alive (decision 21). `up` is unchanged.
+- Daemon exports: `startDaemon`, `runDaemon`, `createAppRegistry`,
+  `sendRequest`, `encodeMessage`, `createMessageDecoder`, `parseRequest`,
+  `defaultSocketPath`, `claimSocketPath`, `isListening`.
 - `<Service>`: a caddy reverse proxy in front of named targets, built by
   composition; `<Deployment service={{ port, publish }}>` renders one for its
   replicas.

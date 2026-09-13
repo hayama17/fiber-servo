@@ -11,6 +11,31 @@ export { createRoot, collectOps } from './reconciler.js';
 export type { Root, CreateRootOptions } from './reconciler.js';
 export { serve } from './serve.js';
 export type { Runtime, RuntimeContext, RuntimeHandle, PruneKeep, ServeOptions, Served } from './serve.js';
+export { encodeMessage, createMessageDecoder, parseRequest, defaultSocketPath } from './daemon/protocol.js';
+export type {
+  DaemonRequest,
+  DaemonResponse,
+  ApplyRequest,
+  DeleteRequest,
+  ListRequest,
+  PingRequest,
+  LogResponse,
+  OpResponse,
+  StatusResponse,
+  ErrorResponse,
+  DoneResponse,
+  AppInfo,
+} from './daemon/protocol.js';
+export { createAppRegistry, startDaemon, runDaemon, claimSocketPath, isListening } from './daemon/server.js';
+export type {
+  AppRegistry,
+  AppRegistryOptions,
+  ApplyOptions,
+  Daemon,
+  DaemonOptions,
+} from './daemon/server.js';
+export { sendRequest } from './daemon/client.js';
+export type { ClientOptions } from './daemon/client.js';
 export { createStatusStore, UNKNOWN_STATUS } from './status.js';
 export type { StatusStore, ContainerStatus, ContainerState, StatusDetail } from './status.js';
 export {

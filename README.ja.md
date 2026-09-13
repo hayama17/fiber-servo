@@ -75,7 +75,7 @@ sudo npx fiber-servo up app.tsx           # containerd 上で Ctrl-C まで動�
 sudo npx fiber-servo up app.tsx --watch   # 保存のたびに差分だけ反映する
 ```
 
-apply 先のサーバはありません。ファイルが正で、動いている `up` はその評価です。保存すると変わった分だけがリコンサイルされ、名前と spec が同じコンテナには触れません。理由は [docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth) にあります。
+apply 先のサーバはありません。`app.tsx` は**プログラム**であり、実際に動くのはそれを**評価して得られる element ツリー**です。同じファイルでも観測が変われば別のツリーになります。`replicas={useSyncExternalStore(metrics)}` が意味を持つのはそのためです。関数はストアに apply できず、実行することしかできません。動いている `up` はその評価そのもので、保存すれば再評価され、変わった分だけがリコンサイルされます。名前と spec が同じコンテナには触れません。
 
 コードからは `serve()` の 1 行です。
 
@@ -87,6 +87,22 @@ process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
 ```
 
 `examples/containerd.tsx` はこれにログを足したもので、`examples/app.tsx` がそこで serve されるツリーです。`serve()` の裏にある部品（`createRoot`、`createContainerdRuntime`、`watchContainerd`）も export しています。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
+
+## daemon と 2 つのクライアント
+
+`up` は 1 プロセスで 1 アプリです。1 台のホストで複数のアプリを動かすには、daemon を起動してプログラムを送ります。
+
+```sh
+sudo npx fiber-servo daemon              # アプリなしで起動し、unix socket 1 本で待ち受ける
+npx fiber-servo apply  app.tsx           # 初回は mount、以降は差分だけを適用する
+npx fiber-servo apply  app.tsx --watch   # さらに保存のたびに daemon 側で再評価する
+npx fiber-servo delete app.tsx           # そのアプリだけを unmount する
+npx fiber-servo list                     # 適用されているアプリを見る
+```
+
+`apply` が送るのは**パス**であって、ツリーではありません。daemon 自身がファイルを import して評価し、生きた component ツリーを保持します。新しい観測から新しい意図を生めるのはそのためで、自己修復も `<Ready>` のゲートもそこで初めて成り立ちます。シリアライズしたツリーは「凍結された 1 回の評価」で、component の代わりにレンダリング済みの HTML を送るようなものです。それ以降は何も観測に応答できません。**daemon は評価をホストするだけで、望ましい状態を保存しません。** spec もファイルも、同期し続けるべき 2 つ目の正も持ちません。
+
+daemon 1 つが nerdctl・status store・executor キュー・イベント watcher・readiness prober を 1 組だけ持ち、すべてのアプリで共有します。コンテナ名がホスト全体で一意だからです。アプリごとに React root が 1 つあり、その id はファイルの絶対パスです。すでに適用済みのファイルへの `apply` は再 render になり、React が差分だけをリコンサイルします。socket は `$FIBER_SERVO_SOCK`、なければ `$XDG_RUNTIME_DIR/fiber-servo.sock`、それもなければ `/run/fiber-servo.sock` で、`--socket` で上書きできます。`up` はこれまでどおりで、socket も要りません。設計の理由は [docs/decisions.md](docs/decisions.md#21-the-daemon-hosts-evaluations-it-stores-no-desired-state)（英語）にあります。
 
 ## 開発
 
