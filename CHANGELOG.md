@@ -9,6 +9,12 @@ change public APIs.
 
 ### Added
 
+- `fiber-servo apply <app.tsx>`: explicitly re-evaluate a live local session,
+  with serialized apply/watch requests, operation/error responses, and shutdown
+  draining. `up` keeps edits pending unless `--watch` is selected.
+- Reload local imports through a fresh esbuild bundle while sharing package
+  dependencies. `serve().idle()` exposes the runtime queue drain.
+
 - Nesting is dependency: children of a `<Container>` mount once it is
   running (or `ready`, when it has a `readiness` probe) and unmount before it.
 - `serve(element, { runtime })`, the one-call entry point, with `dummy()` and

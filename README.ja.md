@@ -72,10 +72,19 @@ CLI なら app ファイルがプログラムそのものです。
 ```sh
 npx fiber-servo plan app.tsx              # ops を表示するだけ。何も実行しない
 sudo npx fiber-servo up app.tsx           # containerd 上で Ctrl-C まで動かす
-sudo npx fiber-servo up app.tsx --watch   # 保存のたびに差分だけ反映する
+sudo npx fiber-servo apply app.tsx        # 別の端末から、編集した構成を明示的に反映する
+sudo npx fiber-servo up app.tsx --watch   # 必要なら保存のたびに自動反映する
 ```
 
-apply 先のサーバはありません。ファイルが正で、動いている `up` はその評価です。保存すると変わった分だけがリコンサイルされ、名前と spec が同じコンテナには触れません。理由は [docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth) にあります。
+`up` がセッションと React ツリーを保持します。通常はファイルを編集するだけでは反映されず、
+`apply` が実行中のセッションに再評価を要求します。ローカルの import 先も読み直し、
+名前と spec が同じコンテナは維持します。`--watch` は同じ反映処理を自動で呼ぶオプションです。
+
+`up` と `apply` は同じ OS ユーザー・同じエントリーファイル・同じ一時ディレクトリ設定で実行します。
+通信はローカルの Unix ソケット（Windows は名前付きパイプ）だけで、別の構成 DB は持ちません。
+apply は今回キューに入った操作の実行結果を返します。全コンテナの readiness 完了は待ちません。
+読み込み失敗時は前のツリーを維持しますが、レンダーや実行中の失敗にはロールバックがありません。
+詳しくは [CLI](docs/api.md#cli) と [設計判断](docs/decisions.md#20-explicit-apply-controls-evaluation) を参照してください。
 
 コードからは `serve()` の 1 行です。
 

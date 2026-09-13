@@ -188,6 +188,7 @@ See [containerd.md](containerd.md) for how the runtime behaves.
 
 ```
 fiber-servo plan <app.tsx>                       print the ops, execute nothing
+fiber-servo apply <app.tsx>                      re-evaluate the running session
 fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
                            [--namespace n] [--address sock] [--quiet]
 ```
@@ -196,7 +197,30 @@ fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
 tree against `dummy()` and prints every commit, gated subtrees included.
 `up` runs it against `containerd()` (or `dummy()` with `--runtime dummy`),
 prints ops and status changes, and tears everything down on Ctrl-C.
-`--watch` re-imports the file whenever it is saved and renders the result;
-React diffs it against the running tree, so only what changed produces ops.
-Only the entry file is watched; modules it imports stay cached. TypeScript
-files are loaded through `tsx`.
+`apply` contacts the running `up` for the same canonical entry file and OS user.
+It prints the operations and errors, exits 0 on success or 1 on failure, and
+fails if no session exists. The runtime/namespace/address are those selected
+by `up`; do not pass them to `apply`. Use the same temporary-directory settings
+and user in both terminals (including `sudo` when used for `up`).
+
+Without `--watch`, saving files does nothing until apply. With `--watch`, saving
+the entry file calls the same serialized operation. Only the entry file is
+watched; editing an imported module requires explicit apply or saving the entry.
+Each evaluation bundles statically reachable local imports afresh with esbuild;
+installed packages stay cached. ESM/TS/TSX app modules are supported. Bundling
+does not provide arbitrary runtime-computed import paths, per-module asset
+copying, or original `import.meta.url` locations. Apps should keep resource
+declarations in render and use effects with cleanup for subscriptions.
+
+A uniquely named temporary `.mjs` is written next to the entry and removed
+after import; that directory must be writable. Module instances remain in Node's
+ESM cache for the session lifetime, so very long edit sessions may need restarting.
+
+Apply drains currently queued runtime operations, not readiness. Gated children
+and later restarts can produce more ops after success. Load errors keep the old
+tree; render errors and runtime failures are not rolled back. A timeout (120s)
+or disconnect does not cancel accepted work: inspect the `up` log before retrying.
+Shutdown rejects new applies, finishes accepted ones, and tears down resources.
+After an unclean exit, Unix may retain a socket. The startup error prints its
+path; remove it only after verifying there is no live owner. Automatic crash
+cleanup and resource isolation between different entry files are not provided.

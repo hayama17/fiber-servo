@@ -41,6 +41,8 @@ export interface ServeOptions {
 export interface Served {
   root: Root;
   status: StatusStore;
+  /** Wait for already queued runtime operations; does not wait for readiness. */
+  idle(): Promise<void>;
   /** Unmount (DELETE everything), let the runtime finish, stop watching. */
   stop(): Promise<void>;
 }
@@ -67,6 +69,9 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   return {
     root,
     status,
+    async idle() {
+      await handle.idle?.();
+    },
     async stop() {
       root.unmount();
       await handle.idle?.();
