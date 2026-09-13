@@ -105,14 +105,23 @@ With the CLI, an app file is the whole program:
 ```sh
 npx fiber-servo plan app.tsx              # print the ops, execute nothing
 sudo npx fiber-servo up app.tsx           # run on containerd until Ctrl-C
-sudo npx fiber-servo up app.tsx --watch   # ...and apply every save as a diff
+sudo npx fiber-servo apply app.tsx        # in another terminal, reflect edits explicitly
+sudo npx fiber-servo up app.tsx --watch   # optional: reflect each save instead
 ```
 
-There is no server to apply to: the file is the source of truth, and a
-running `up` is its evaluation. Save the file and only what changed is
-reconciled; containers that kept their name and spec are untouched. See
-[docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth)
-for why.
+`up` owns a live session; editing files alone does not change its environment.
+`apply` asks that session to re-evaluate the app and its local imports, then
+prints the operations and errors. Containers that kept their name and spec
+are untouched. `--watch` is an optional automatic trigger for the same operation.
+Run `up` and `apply` as the same OS user, with the same entry file and temporary
+directory environment. Control stays local (Unix socket / Windows named pipe);
+there is no separate desired-state database or daemon to install.
+
+An apply succeeds after the current evaluation's queued operations complete;
+readiness-gated children and later self-healing can still produce operations.
+Load errors keep the previous tree. Render/runtime errors return failure, but
+do not roll back changes. See [CLI details](docs/api.md#cli) and
+[the design decision](docs/decisions.md#20-explicit-apply-controls-evaluation).
 
 From code, `serve()` is the same thing in one call:
 

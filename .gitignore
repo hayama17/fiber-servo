@@ -2,3 +2,5 @@ node_modules/
 dist/
 coverage/
 test/tmp-watch/
+test/tmp-apply-*/
+.fiber-servo-*.mjs

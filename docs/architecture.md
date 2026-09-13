@@ -134,11 +134,52 @@ gates on `ready`; the containerd runtime's prober runs the probe with
 ### Entry point
 
 `serve(element, { runtime })` binds a runtime to a fresh status store,
-starts its watcher, renders, and gives back `stop()`. The `fiber-servo` CLI
-is two commands over it: `plan` uses the dummy runtime, which reports every
-`CREATE` as running and ready, so the full expansion prints without a
-runtime; `up` uses containerd. There is no API server: the app file is the
-source of truth and `up --watch` re-evaluates it on save (decision 18).
+starts its watcher, renders, and gives back `idle()` and `stop()`.
+`plan` evaluates against the dummy runtime, so gated subtrees expand without
+containerd. `up` owns a session and its live React tree until shutdown.
+`apply` requests a fresh evaluation through local IPC. `up --watch` triggers
+that same operation when the entry file is saved (decision 20).
+
+```text
+app.tsx + local imports ──load──▶ React tree ──commit──▶ ops ──▶ runtime
+                            ▲                                  │
+apply CLI ──local IPC──▶ session queue                           │
+watch save ───────────▶ same queue       status store ◀──────────┘
+```
+
+`src/control.ts` handles bounded local requests and responses. Session identity
+is the canonical entry path and OS user; Unix sockets live in a private 0700
+directory, and Windows uses named pipes. No client-supplied program is executed:
+the request is just `apply`, and the owner reloads its own entry file. There is
+no network listener, desired-state database, or detached daemon. One session
+per file is enforced before mounting resources; different files must still
+use disjoint resource names/namespaces.
+
+`src/session.ts` serializes initial evaluation, explicit applies, and watch
+reloads. Shutdown refuses new requests, drains accepted evaluations, unmounts,
+drains runtime operations, and stops observers. `src/load.ts` bundles local
+modules afresh with esbuild; package dependencies remain shared to preserve
+React and context identity. The temporary module is removed after import.
+
+Editing changes the source for the next evaluation; the running tree remains
+the last evaluated version until apply (or watch). This is an explicit timing
+boundary, not a second independently editable desired-state store.
+
+### Apply acknowledgement and failure
+
+The session records ops and errors while evaluating, flushes currently available
+React work, and drains queued runtime operations before replying. Exit code 0
+means this evaluation reported no errors; it is not a readiness or future-health
+guarantee. Suspended dependencies may become ready later, and hooks continue
+running after the response. Background errors observed during apply are included
+conservatively; operations are not tagged with distributed transaction IDs.
+
+Build/import errors occur before render and leave the previous tree intact.
+Render errors may unmount the tree, and runtime failures may leave partial changes;
+both return failure without rollback. A disconnected/timed-out client does not
+cancel an accepted apply. Source edits during evaluation are not an atomic file
+snapshot: finish the edit before applying. Loaded programs are trusted code;
+module top-level side effects cannot be rolled back either.
 
 A reloaded file exports a new component function, so React remounts the
 subtree: DELETE then CREATE for every name in it. `resetAfterCommit` reduces

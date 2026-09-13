@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { buildCli, projectRoot, cliWrapper } from './cli-helper.js';
 import {
   Container,
   Deployment,
@@ -402,6 +403,7 @@ describe('containerd readiness prober', () => {
 });
 
 describe('cli', () => {
+  beforeAll(buildCli);
   it('parseArgs separates command, file and flags', () => {
     expect(parseArgs(['up', 'app.tsx', '--namespace', 'dev', '--quiet', '--address=/run/c.sock'])).toEqual({
       command: 'up',
@@ -411,10 +413,14 @@ describe('cli', () => {
   });
 
   it('`plan` prints every op the tree would produce, including gated subtrees, and executes nothing', async () => {
-    const { stdout } = await promisify(execFile)('npx', ['tsx', 'src/cli.ts', 'plan', 'examples/app.tsx'], {
-      cwd: new URL('..', import.meta.url).pathname,
-      timeout: 60_000,
-    });
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ['dist/cli.js', 'plan', 'examples/app.tsx'],
+      {
+        cwd: projectRoot,
+        timeout: 60_000,
+      },
+    );
     const ops = stdout
       .split('\n')
       .filter((l) => /^\s+(CREATE|UPDATE|DELETE|START)/.test(l))
@@ -430,15 +436,16 @@ describe('cli', () => {
 });
 
 describe('cli --watch', () => {
+  beforeAll(buildCli);
   it('re-evaluates the file on save and reconciles only the difference', async () => {
     const { mkdir, writeFile, rm } = await import('node:fs/promises');
     const { spawn } = await import('node:child_process');
-    const root = new URL('..', import.meta.url).pathname;
+    const root = projectRoot;
     // Not a dot-directory: tsconfig `include` skips those, and tsx would then compile the JSX classically.
     const dir = `${root}test/tmp-watch`;
     const file = `${dir}/app.tsx`;
     const app = (replicas: number) => `
-      import { Container, Deployment } from '../../src/index.js';
+      import { Container, Deployment } from 'fiber-servo';
       export default () => (
         <Deployment name="web" replicas={${replicas}}>
           <Container image="nginx" />
@@ -449,16 +456,16 @@ describe('cli --watch', () => {
     await writeFile(file, app(1));
 
     const child = spawn(
-      `${root}node_modules/.bin/tsx`,
-      ['src/cli.ts', 'up', '--watch', '--runtime', 'dummy', file],
+      process.execPath,
+      ['--input-type=module', '-e', cliWrapper, 'up', '--watch', '--runtime', 'dummy', file],
       {
         cwd: root,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       },
     );
     let out = '';
-    child.stdout.on('data', (d: Buffer) => (out += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (out += d.toString()));
+    child.stdout!.on('data', (d: Buffer) => (out += d.toString()));
+    child.stderr!.on('data', (d: Buffer) => (out += d.toString()));
     const until = (pattern: string, ms = 30_000) =>
       new Promise<void>((resolve, reject) => {
         const start = Date.now();
@@ -478,7 +485,7 @@ describe('cli --watch', () => {
       // web-0 untouched by the reload: one op line at mount, none after (the dummy runtime echoes ops too).
       expect(out.match(/op CREATE container web-0/g)).toHaveLength(1);
       expect(out).not.toContain('op DELETE container web-0');
-      child.kill('SIGINT');
+      child.send('stop');
       await new Promise((r) => child.once('exit', r));
       expect(out).toContain('DELETE container web-1');
       expect(out).toContain('DELETE container web-0');

@@ -219,6 +219,9 @@ executing anything.
 
 ## 18. No API server: the file is the source of truth
 
+**Historical decision, superseded in part by decision 20.** The file remains
+the source, but explicit local apply now controls when it is evaluated.
+
 **Decision.** There is no server to `apply` a desired state to. The desired
 state is a program, `app.tsx`. A running `up` process evaluates it and
 reconciles containerd to the result; `--watch` re-evaluates it on save.
@@ -272,3 +275,35 @@ where identity for the runtime is decided anyway.
 latches) does reset on a remount, because it belongs to the fiber; the
 containers do not. A remount is therefore a cheap, observable no-op at the
 runtime, and "force a recreate" needs a spec change, not a key change.
+
+## 20. Explicit apply controls evaluation
+
+**Decision.** `up` retains the live tree and exposes a local control endpoint.
+`apply <app.tsx>` asks the owner of that canonical file to load and render it
+again. `--watch` calls the same serialized operation automatically on entry-file
+saves. The client sends no desired-state object and never evaluates the app.
+
+**Why.** Saving source and changing the running environment are separate user
+decisions. Explicit apply allows several edits to be completed before evaluation,
+including changes made by an AI agent. React's functional composition and diffing
+do not depend on whether a save or an explicit command triggered evaluation.
+Decision 18 conflated an evaluation request with an independent state store;
+the local endpoint adds the former without introducing the latter.
+
+**Consequences.** The source file is the next program to evaluate; the running
+tree represents its last evaluation plus ongoing hook state. Every load rebuilds
+local imports; installed packages remain cached. Reloading remounts component
+state, while decision 19 preserves same-name/spec runtime resources within a
+commit. This is not Fast Refresh or an atomic deployment transaction.
+
+Only one `up` owns an entry file. Apply/watch requests are serialized; shutdown
+rejects new requests and drains accepted work before teardown. Success reports
+queued execution, not readiness. Load failure preserves the old tree; render or
+runtime failure can leave partial changes and is reported without rollback.
+The default client timeout is two minutes and does not cancel accepted work.
+Normal shutdown releases the endpoint. Forced termination may leave resources
+and, on Unix, a stale socket; never unlink another live owner's endpoint.
+
+**Scope.** This is a local trusted-user control channel, not a remote multi-user
+API, durable scheduler, or security sandbox. No automatic adoption of another
+session or replacement of a live listener is attempted.
