@@ -4,6 +4,7 @@
  * `useContainerStatus` is a plain `useSyncExternalStore` read. `useSelfHeal`
  * turns observed deaths into a desired restart generation, which is the only
  * thing the tree can say about status: "I want attempt n of this container".
+ * `useReady` suspends until a dependency has come up.
  */
 import { createContext, use, useContext, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { type ContainerStatus, type StatusStore, createStatusStore } from './status.js';
@@ -23,6 +24,16 @@ export function useNetwork(): string | undefined {
 
 // ---- dependency ordering ---------------------------------------------------
 
+/**
+ * What a dependent waits for. `running` is the runtime's process start;
+ * `ready` additionally needs the container's readiness probe to have passed.
+ */
+export type ReadyCondition = 'running' | 'ready';
+
+export function isReady(status: ContainerStatus, until: ReadyCondition): boolean {
+  return status.state === 'running' && (until === 'running' || status.ready === true);
+}
+
 interface ReadyThenable {
   status: 'pending' | 'fulfilled';
   value?: ContainerStatus;
@@ -32,15 +43,20 @@ interface ReadyThenable {
 const readyCache = new WeakMap<StatusStore, Map<string, ReadyThenable>>();
 
 /**
- * A thenable that settles the first time `id` is reported `running`, and
- * stays settled: dependency ordering is about startup, not liveness. React's
- * `use` reads `status` synchronously, so a container that is already
- * running never suspends.
+ * A thenable that settles the first time `id` satisfies `until`, and stays
+ * settled: dependency ordering is about startup, not liveness. React's
+ * `use` reads `status` synchronously, so a container that is already up
+ * never suspends.
  */
-export function readyThenable(store: StatusStore, id: string): ReadyThenable {
+export function readyThenable(
+  store: StatusStore,
+  id: string,
+  until: ReadyCondition = 'running',
+): ReadyThenable {
   let perStore = readyCache.get(store);
   if (!perStore) readyCache.set(store, (perStore = new Map()));
-  const cached = perStore.get(id);
+  const key = `${until}:${id}`;
+  const cached = perStore.get(key);
   if (cached) return cached;
 
   const listeners: ((value: ContainerStatus) => void)[] = [];
@@ -57,28 +73,28 @@ export function readyThenable(store: StatusStore, id: string): ReadyThenable {
     for (const l of listeners.splice(0)) l(status);
   };
   const now = store.get(id);
-  if (now.state === 'running') settle(now);
+  if (isReady(now, until)) settle(now);
   else {
     const off = store.subscribe(() => {
       const s = store.get(id);
-      if (s.state !== 'running') return;
+      if (!isReady(s, until)) return;
       off();
       settle(s);
     });
   }
-  perStore.set(id, thenable);
+  perStore.set(key, thenable);
   return thenable;
 }
 
 /**
- * Suspend until every listed container has been reported `running` once.
+ * Suspend until every listed container satisfies `until` once.
  * Needs a <Suspense> boundary above; <Ready> provides one.
  */
-export function useReady(ids: string | readonly string[]): void {
+export function useReady(ids: string | readonly string[], until: ReadyCondition = 'running'): void {
   const store = useStatusStore();
   for (const id of typeof ids === 'string' ? [ids] : ids) {
     // React's Usable type wants a Promise shape; a status-tracked thenable is what `use` actually reads.
-    use(readyThenable(store, id) as unknown as Promise<ContainerStatus>);
+    use(readyThenable(store, id, until) as unknown as Promise<ContainerStatus>);
   }
 }
 
@@ -86,6 +102,8 @@ export function useContainerStatus(id: string): ContainerStatus {
   const store = useStatusStore();
   return useSyncExternalStore(store.subscribe, () => store.get(id));
 }
+
+// ---- self-healing ----------------------------------------------------------
 
 export interface RestartPolicy {
   /** Delay before the first restart. Default 1000. */
@@ -164,12 +182,14 @@ export function useSelfHeal(id: string, mode: RestartMode = 'always'): number {
     return () => clearTimeout(timer);
   }, [policy, status, state.consecutive, state.handledSeq]);
 
-  // Running for long enough -> forget the crash history.
+  // Running for long enough -> forget the crash history. A readiness mark
+  // amends the snapshot without restarting the clock.
+  const runningSince = status.state === 'running' ? status.at : -1;
   useEffect(() => {
-    if (policy === null || status.state !== 'running' || state.consecutive === 0) return;
+    if (policy === null || runningSince < 0 || state.consecutive === 0) return;
     const timer = setTimeout(() => setState((s) => ({ ...s, consecutive: 0 })), policy.resetAfterMs);
     return () => clearTimeout(timer);
-  }, [policy, status, state.consecutive]);
+  }, [policy, runningSince, state.consecutive]);
 
   return state.generation;
 }

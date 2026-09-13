@@ -25,12 +25,20 @@ export interface ContainerdRuntimeOptions {
   index?: Map<string, string>;
   log?: (line: string) => void;
   onError?: (error: Error, op: Op) => void;
+  /** How often `probe()` looks for containers due for a readiness check. Default 250. */
+  probeTickMs?: number;
 }
 
 export interface ContainerdRuntime {
   sink: OpSink;
   /** Resolves once every batch received so far has been executed. */
   idle(): Promise<void>;
+  /**
+   * Readiness prober: runs each container's `readiness.exec` inside it
+   * (`nerdctl exec`) while it is running and not yet ready, and marks the
+   * store `ready` on exit 0. Runs until `signal` aborts.
+   */
+  probe(signal: AbortSignal): Promise<void>;
 }
 
 /** Stable digest of a spec; stored as a label so CREATE can recognise a resource it already made. */
@@ -68,6 +76,9 @@ export function runArgs(spec: ContainerSpec): string[] {
     `${SPEC_LABEL}=${specDigest(spec)}`,
   ];
   if (spec.network) args.push('--network', spec.network);
+  for (const p of spec.publish ?? []) {
+    args.push('-p', `${p.host}:${p.container}${p.protocol && p.protocol !== 'tcp' ? `/${p.protocol}` : ''}`);
+  }
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push('-e', `${k}=${v}`);
   for (const [k, v] of Object.entries(spec.labels ?? {})) args.push('--label', `${k}=${v}`);
   args.push(spec.image, ...(spec.command ?? []));
@@ -97,7 +108,14 @@ interface Inspected {
 }
 
 export function createContainerdRuntime(options: ContainerdRuntimeOptions): ContainerdRuntime {
-  const { nerdctl, status, index, log = () => {}, onError = (e) => console.error(e) } = options;
+  const {
+    nerdctl,
+    status,
+    index,
+    log = () => {},
+    onError = (e) => console.error(e),
+    probeTickMs = 250,
+  } = options;
   /** Last spec we were asked to realise per name, so START can recreate a vanished container. */
   const specs = new Map<string, ContainerSpec>();
   let queue: Promise<void> = Promise.resolve();
@@ -235,6 +253,30 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
     }
   }
 
+  // ---- readiness ----------------------------------------------------------
+
+  async function probe(signal: AbortSignal): Promise<void> {
+    const lastAttempt = new Map<string, number>();
+    while (!signal.aborted) {
+      const now = Date.now();
+      for (const [name, spec] of specs) {
+        const readiness = spec.readiness;
+        if (!readiness || !status) continue;
+        const current = status.get(name);
+        if (current.state !== 'running' || current.ready === true) continue;
+        if (now - (lastAttempt.get(name) ?? 0) < (readiness.intervalMs ?? 2000)) continue;
+        lastAttempt.set(name, now);
+        const res = await nerdctl.exec(['exec', name, ...readiness.exec]);
+        // Only mark the snapshot the probe was run against; a death in between wins.
+        if (res.code === 0 && status.get(name) === current) {
+          log(`ready ${name}`);
+          status.mark(name, { ready: true });
+        }
+      }
+      await sleep(probeTickMs, signal);
+    }
+  }
+
   return {
     sink(ops) {
       const batch = [...ops];
@@ -243,5 +285,19 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
     idle() {
       return queue;
     },
+    probe,
   };
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+  });
 }

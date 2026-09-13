@@ -62,7 +62,7 @@ Batches run strictly in order, one at a time.
 ```
 run -d --name <name> --restart=no --pull=missing \
   --label fiber-servo.managed=true --label fiber-servo.spec=<digest> \
-  [--network <net>] [-e K=V]... [--label k=v]... <image> [command...]
+  [--network <net>] [-p host:container[/udp]]... [-e K=V]... [--label k=v]... <image> [command...]
 ```
 
 Restart policy is `no` on purpose: restarts are the tree's decision.
@@ -91,6 +91,22 @@ watcher.
 If the stream ends (containerd restarted), the watcher waits
 `reconnectDelayMs` and starts again from step 1.
 
+## What the prober does
+
+Containers whose spec has `readiness={{ exec, intervalMs? }}` are probed
+while they are `running` and not yet `ready`:
+
+```
+nerdctl exec <name> <exec...>
+```
+
+Exit 0 marks the store `ready: true` for the snapshot the probe ran against;
+a death in between wins. The next lifecycle event (a restart, say) clears the
+mark, so a container that comes back is probed again. `probeTickMs` (default 250) is how often the prober looks for containers due; `intervalMs` (default 2000) is the spacing per container.
+
+`serve()` with `containerd()` runs the watcher and the prober together;
+with the pieces, call `runtime.probe(signal)` next to `watchContainerd`.
+
 ## Assumptions about nerdctl's output
 
 These were confirmed on a real host with nerdctl 2.x, but they are the first
@@ -108,8 +124,10 @@ place to look if something differs on yours:
 
 ## Known limitations
 
-- `ports` are not published. Replicas of the same deployment would collide on
-  host ports; publishing belongs to a Service (see the roadmap).
+- `ports` are documentation; only `publish` binds host ports. Publish on a
+  `<Service>` rather than on replicas, which would collide.
+- Readiness probes are exec-only. HTTP and TCP probes would need a network
+  path from the host into the CNI network.
 - Networks are immutable after creation.
 - An `UPDATE` recreates the container, so its exit event arrives during the
   recreate. The tree arms a restart for it, which the following `/tasks/start`

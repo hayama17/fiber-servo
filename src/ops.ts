@@ -6,16 +6,38 @@
  * separate runtime (containerd, or a printer) consumes it later.
  */
 
+/** A host port bound to a container port. */
+export interface PortMapping {
+  host: number;
+  container: number;
+  protocol?: 'tcp' | 'udp';
+}
+
+/**
+ * How a runtime decides a running container is ready to be depended on.
+ * `exec` runs inside the container; exit 0 means ready.
+ */
+export interface ReadinessProbe {
+  exec: readonly string[];
+  /** Time between attempts. Default 2000. */
+  intervalMs?: number;
+}
+
 /** Everything a runtime needs to bring a container up. `name` is the identity. */
 export interface ContainerSpec {
   name: string;
   image: string;
   command?: readonly string[];
   env?: Readonly<Record<string, string>>;
+  /** Container-side ports, as documentation for other resources. Not published. */
   ports?: readonly number[];
+  /** Host ports to bind. */
+  publish?: readonly PortMapping[];
   labels?: Readonly<Record<string, string>>;
   /** Network to attach to. Containers on the same network resolve each other by name. */
   network?: string;
+  /** With a probe, dependents wait for `ready`, not just `running`. */
+  readiness?: ReadinessProbe;
 }
 
 /** A user-defined network. `name` is the identity; other fields are immutable after creation. */
@@ -71,7 +93,7 @@ export type Op = CreateOp | UpdateOp | DeleteOp | StartOp;
 export type OpSink = (ops: readonly Op[]) => void;
 
 export const SPEC_KEYS: { [K in InstanceKind]: readonly (keyof Specs[K])[] } = {
-  container: ['name', 'image', 'command', 'env', 'ports', 'labels', 'network'],
+  container: ['name', 'image', 'command', 'env', 'ports', 'publish', 'labels', 'network', 'readiness'],
   network: ['name', 'subnet', 'labels'],
 };
 

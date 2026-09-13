@@ -1,15 +1,14 @@
 /**
- * Phase-0/1 runtime: prints ops and does nothing else.
+ * A runtime that prints ops and does nothing else.
  *
  * With a `status` store it also plays a runtime that always succeeds:
- * CREATE and START report `running`, DELETE forgets the container. That is
- * enough to exercise the self-healing loop end to end without docker.
- *
- * A real runtime (docker, containerd) replaces this file with one that
- * executes each op and one that feeds runtime events into the store. The
- * reconciler never knows the difference.
+ * CREATE and START report `running` (and `ready`, for containers with a
+ * probe), DELETE forgets the container. That is enough to exercise every
+ * loop end to end without containerd, and it is what `fiber-servo plan`
+ * uses to expand gated subtrees.
  */
-import { formatOp, type OpSink } from '../ops.js';
+import { formatOp, type ContainerSpec, type OpSink } from '../ops.js';
+import type { Runtime } from '../serve.js';
 import type { StatusStore } from '../status.js';
 
 export interface DummyRuntimeOptions {
@@ -20,25 +19,39 @@ export interface DummyRuntimeOptions {
 
 export function createDummyRuntime(options: DummyRuntimeOptions | ((line: string) => void) = {}): OpSink {
   const { log = console.log, status } = typeof options === 'function' ? { log: options } : options;
+  const specs = new Map<string, ContainerSpec>();
   let commit = 0;
+  const up = (id: string): void => {
+    status?.set(id, 'running');
+    if (specs.get(id)?.readiness) status?.mark(id, { ready: true });
+  };
   return (ops) => {
     commit += 1;
     log(`-- commit #${commit} (${ops.length} op${ops.length === 1 ? '' : 's'})`);
     for (const op of ops) log(`   ${formatOp(op)}`);
-    if (!status) return;
     for (const op of ops) {
       if (op.kind !== 'container') continue; // networks have no status
       switch (op.type) {
         case 'CREATE':
-        case 'START':
-          status.set(op.id, 'running');
-          break;
-        case 'DELETE':
-          status.remove(op.id);
+          specs.set(op.id, op.spec);
+          up(op.id);
           break;
         case 'UPDATE':
+          specs.set(op.id, op.next);
+          break;
+        case 'START':
+          up(op.id);
+          break;
+        case 'DELETE':
+          specs.delete(op.id);
+          status?.remove(op.id);
           break;
       }
     }
   };
+}
+
+/** The dummy runtime as a `Runtime` for `serve()`. */
+export function dummy(options: Pick<DummyRuntimeOptions, 'log'> = {}): Runtime {
+  return (ctx) => ({ sink: createDummyRuntime({ log: options.log ?? ctx.log, status: ctx.status }) });
 }

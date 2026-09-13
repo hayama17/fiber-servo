@@ -191,17 +191,18 @@ describe('phase 0: ops from the fiber tree, nothing executed', () => {
     expect(sink.ops.every((op) => op.type === 'CREATE')).toBe(true);
   });
 
-  it('nested containers are created parents-first and deleted children-first', () => {
+  it('a container nested in another is a dependent: created once the parent runs, deleted before it', async () => {
     const { root, sink } = setup();
     root.render(
       <Container name="outer" image="pause">
         <Container name="inner" image="app" />
       </Container>,
     );
-    expect(lines(sink.take())).toEqual([
-      'CREATE container outer image=pause',
-      'CREATE container inner image=app',
-    ]);
+    expect(lines(sink.take())).toEqual(['CREATE container outer image=pause']);
+
+    root.status.set('outer', 'running');
+    await root.settle();
+    expect(lines(sink.take())).toEqual(['CREATE container inner image=app']);
 
     root.unmount();
     expect(lines(sink.ops)).toEqual(['DELETE container inner', 'DELETE container outer']);
@@ -255,15 +256,16 @@ describe('phase 0: invariants', () => {
     ]);
   });
 
-  it('rejects text in the tree', () => {
+  it('rejects text in the tree', async () => {
     const { root } = setup();
-    expect(() =>
-      root.render(
-        <Container name="x" image="nginx">
-          hello
-        </Container>,
-      ),
-    ).toThrow(/text is not allowed/);
+    // Children of a container are gated on it running, so the text only reaches the host then.
+    root.render(
+      <Container name="x" image="nginx">
+        hello
+      </Container>,
+    );
+    root.status.set('x', 'running');
+    await expect(root.settle()).rejects.toThrow(/text is not allowed/);
   });
 
   it('rejects unknown host elements', () => {

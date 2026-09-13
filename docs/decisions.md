@@ -17,6 +17,29 @@ outside also makes the event source swappable: a test, a dummy runtime, or
 expressed as a desired restart generation (`restarts` prop) rather than as an
 action.
 
+**Precisely.** The rule is not "the tree is stateless". State lives in three
+places, and the rule says which goes where:
+
+1. React's own record of what it last committed: the current fiber tree and
+   the host instances (`spec`, `restarts`, `created`, the `live` map). This is
+   what render diffs against, exactly as the DOM renderer diffs against its
+   memoized props and never re-reads the DOM. Policy state (self-heal
+   counters, `Ready` latches) is here too.
+2. The host's reality: containerd. React never looks at it; it assumes the
+   host is what it committed, which holds for a DOM and not for a container
+   that can die.
+3. The observation of 2: the status store. Because React has no way to
+   re-verify the host, the drift between 1 and 2 must come back as an
+   _input_, next to props, so the tree can emit a new intention that React
+   then diffs against 1.
+
+In Kubernetes terms, React is the part of a controller that compares desired
+state with its own cache, and the store is the informer. A process restart
+loses 1 entirely; the runtime's `fiber-servo.spec` labels and the watcher's
+initial `ps -a` rebuild what matters (see decision 10), and the self-heal
+counters simply start over. Two processes reconciling the same containers
+would each hold their own 1 and fight; one writer per host is assumed.
+
 ## 2. commit executes nothing
 
 **Decision.** Every hostConfig method appends an op and returns. A sink
@@ -131,3 +154,65 @@ conditionally.
 300ms to avoid flashing. There is no UI; a gated container should be created
 the moment its dependency is up. In concurrent mode that throttle is React's
 only use of `scheduleTimeout`.
+
+## 14. Nesting is dependency
+
+**Decision.** Children of a `<Container>` mount once it is running (or
+`ready`, when it has a probe) and unmount before it. At the host level they
+are siblings; `<Container>` wraps them in `<Ready>` itself.
+
+**Why.** The tree shape should carry the topology: inside `<Network>` means
+membership, inside `<Container>` means dependency. String references
+(`<Ready on="db">`) stay available for dependencies that are not the parent,
+but a typo in them is only found at runtime; nesting cannot be misspelled.
+Nested host instances had no meaning on containerd, so nothing was lost.
+
+**Consequence.** Dependents render before the container in tree order, so
+React deletes them first on unmount. Dependents inside a `<Deployment>`
+template are cloned per replica, like everything else in the template.
+
+## 15. Readiness is a probe the runtime runs, marked into the store
+
+**Decision.** `readiness={{ exec }}` is part of the spec. The containerd
+runtime runs it with `nerdctl exec` while the container is running and not
+yet ready, and `status.mark()`s `ready: true` on exit 0. The next lifecycle
+event clears the mark. A dependent chooses what it waits for
+(`until: 'running' | 'ready'`); a `<Container>` with a probe gates its
+children on `ready` automatically.
+
+**Why.** "Process started" is not "accepting connections". An exec probe
+needs no network path from the host to the container and matches what most
+images already ship (`pg_isready`, `redis-cli ping`). Making the condition
+the dependent's choice avoids a registry of which containers have probes and
+the race it would create between the watcher's `running` and the prober's
+first result.
+
+**Consequence.** The prober is a third status writer, next to the watcher
+(lifecycle) and the executor (its own failures). It only amends a snapshot
+it probed against, so a death during a probe wins.
+
+## 16. Service is a proxy container built by composition
+
+**Decision.** `<Service>` renders a `<Container>` running caddy with
+`reverse-proxy --from :port --to target:port ...`. `<Deployment service>`
+renders one for its replicas and updates its command when they change.
+
+**Why.** It needs no new op, no new runtime code, and no config file; caddy's
+`reverse-proxy` subcommand balances across several `--to` on its own. Scaling
+becomes an `UPDATE` of the proxy's command, which the runtime already knows
+how to apply. A DNS-based service would need a resolver the runtime does not
+provide.
+
+**Consequence.** Publishing a host port is a property of the proxy, not the
+replicas, so replicas never collide on host ports.
+
+## 17. One entry point, and a CLI over it
+
+**Decision.** `serve(element, { runtime })` does the wiring that
+`createRoot` leaves to the caller; `fiber-servo plan` and `fiber-servo up`
+are thin commands over it.
+
+**Why.** The JSX was declarative; the eight lines around it were not. `plan`
+falls out of design rule #2: the dummy runtime plays a runtime that always
+succeeds, so the full expansion (gated subtrees included) prints without
+executing anything.
