@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 test/tmp-watch/
+test/tmp-daemon/
 
 # Scratch worktrees for background agents
 .claude/worktrees/

@@ -67,12 +67,13 @@ fight.
 
 ## Layers
 
-| Layer      | Files                                                  | Knows about             |
-| ---------- | ------------------------------------------------------ | ----------------------- |
-| Components | `src/components.tsx`, `src/hooks.ts`                   | React, the status store |
-| Reconciler | `src/hostConfig.ts`, `src/reconciler.ts`, `src/ops.ts` | Props and ops           |
-| Status     | `src/status.ts`                                        | Nothing else            |
-| Runtime    | `src/runtime/containerd/*`, `src/runtime/dummy.ts`     | Ops, the store, nerdctl |
+| Layer      | Files                                                  | Knows about               |
+| ---------- | ------------------------------------------------------ | ------------------------- |
+| Components | `src/components.tsx`, `src/hooks.ts`                   | React, the status store   |
+| Reconciler | `src/hostConfig.ts`, `src/reconciler.ts`, `src/ops.ts` | Props and ops             |
+| Status     | `src/status.ts`                                        | Nothing else              |
+| Runtime    | `src/runtime/containerd/*`, `src/runtime/dummy.ts`     | Ops, the store, nerdctl   |
+| Hosting    | `src/serve.ts`, `src/daemon/*`, `src/cli.ts`           | Roots, runtimes, a socket |
 
 The reconciler layer has no import from the runtime layer, and the runtime
 layer has no import from the components layer.
@@ -137,14 +138,49 @@ gates on `ready`; the containerd runtime's prober runs the probe with
 starts its watcher, renders, and gives back `stop()`. The `fiber-servo` CLI
 is two commands over it: `plan` uses the dummy runtime, which reports every
 `CREATE` as running and ready, so the full expansion prints without a
-runtime; `up` uses containerd. There is no API server: the app file is the
-source of truth and `up --watch` re-evaluates it on save (decision 18).
+runtime; `up` uses containerd. There is no API server, because there is no
+desired state to store: `app.tsx` is a program and what runs is the tree it
+evaluates to. `up --watch` re-evaluates it on save (decisions 18 and 21).
 
 A reloaded file exports a new component function, so React remounts the
 subtree: DELETE then CREATE for every name in it. `resetAfterCommit` reduces
 each commit to its net effect per `kind:name` before handing it to the sink
 (`normalizeBatch`), so the runtime sees an `UPDATE` where the spec changed
 and nothing where it did not (decision 19).
+
+### Daemon
+
+`serve()` is one evaluation of one program. `fiber-servo daemon` hosts
+several: one runtime, one status store, one executor queue, one event watcher
+and one readiness prober, and one React root per applied app. The pieces are
+shared because container names are global on the host; the roots are separate
+because each app is its own tree.
+
+```
+  apply app.tsx ──path──▶ daemon ──import──▶ element tree ──render──▶ root_n ──▶ ops
+  delete app.tsx ────────▶          one runtime, one store, N roots        ──▶ runtime
+```
+
+What crosses the socket is a path, never a tree. The daemon keeps the
+_evaluation_, which is what the status store feeds: a death has to become
+`restarts={n + 1}`, and that is a render, so it needs a live component tree.
+A serialized tree would be one frozen evaluation and nothing downstream of it
+could respond to an observation (decision 21).
+
+| Layer    | File                     | Holds                                       |
+| -------- | ------------------------ | ------------------------------------------- |
+| Protocol | `src/daemon/protocol.ts` | NDJSON framing, request and response types  |
+| Server   | `src/daemon/server.ts`   | App registry, socket handling, shutdown     |
+| Client   | `src/daemon/client.ts`   | Connect, send one request, stream the reply |
+
+An app's id is the resolved absolute path of its file, so `apply` on a known
+id is a re-render (React diffs; only the difference reaches the runtime) and
+`delete` unmounts one root. Every mutation runs on one queue: applies share
+the store, the executor and the prune keep set, which is the union of every
+root's `liveIds` (decision 20). `apply --watch` moves the watching into the
+daemon, so a client attaches only for the first reconcile. On shutdown the
+daemon unmounts every app, drains the runtime, stops the watcher and unlinks
+the socket.
 
 ## Scheduling
 

@@ -108,11 +108,13 @@ sudo npx fiber-servo up app.tsx           # run on containerd until Ctrl-C
 sudo npx fiber-servo up app.tsx --watch   # ...and apply every save as a diff
 ```
 
-There is no server to apply to: the file is the source of truth, and a
-running `up` is its evaluation. Save the file and only what changed is
-reconciled; containers that kept their name and spec are untouched. See
-[docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth)
-for why.
+There is no desired state to apply into a server. `app.tsx` is a _program_,
+and what runs is the element tree it evaluates to — the same file yields a
+different tree as observations change, which is what makes
+`replicas={useSyncExternalStore(metrics)}` mean anything. You cannot apply a
+function into a store; you can only run it. So a running `up` is that
+evaluation, and saving the file re-runs it: only what changed is reconciled,
+and containers that kept their name and spec are untouched.
 
 From code, `serve()` is the same thing in one call:
 
@@ -128,6 +130,38 @@ tree it serves. The pieces behind `serve()` (`createRoot`,
 `createContainerdRuntime`, `watchContainerd`) are exported for anything it
 does not cover. See [docs/containerd.md](docs/containerd.md) for what the
 runtime does with each op and what it assumes about nerdctl.
+
+## A daemon and two clients
+
+`up` is one process for one app. To run several apps on one host, start a
+daemon and send it programs:
+
+```sh
+sudo npx fiber-servo daemon              # no app yet; listens on one unix socket
+npx fiber-servo apply  app.tsx           # first time mounts, later applies the difference
+npx fiber-servo apply  app.tsx --watch   # ...and the daemon re-evaluates it on save
+npx fiber-servo delete app.tsx           # unmount just that app
+npx fiber-servo list                     # what is applied
+```
+
+`apply` sends the **path**, never a tree. The daemon imports the file and
+evaluates it itself, and keeps the live component tree — that is what lets a
+new observation produce a new intention, so self-healing and `<Ready>` gating
+keep working. A serialized tree would be one frozen evaluation, like shipping
+rendered HTML instead of the component; nothing downstream of it could
+respond to anything. **The daemon hosts evaluations and stores no desired
+state**: no specs, no files, no second copy to keep in sync.
+
+One daemon holds one nerdctl, one status store, one executor queue, one event
+watcher and one readiness prober, shared by every app, because container names
+are global on the host. Each app gets its own React root, identified by the
+resolved absolute path of its file, so `apply` on a file already applied is a
+re-render and React reconciles only the difference. The socket is
+`$FIBER_SERVO_SOCK`, else `$XDG_RUNTIME_DIR/fiber-servo.sock`, else
+`/run/fiber-servo.sock`; `--socket` overrides it. `up` is unchanged and still
+needs no socket. See
+[docs/decisions.md](docs/decisions.md#21-the-daemon-hosts-evaluations-it-stores-no-desired-state)
+for why it is built this way.
 
 ## Concepts
 
@@ -180,6 +214,8 @@ See [docs/api.md](docs/api.md). The short version:
 | Export                                                        | Role                                              |
 | ------------------------------------------------------------- | ------------------------------------------------- |
 | `serve(element, { runtime })`                                 | The one-call entry point; `stop()` tears down     |
+| `startDaemon`, `runDaemon`, `createAppRegistry`               | The daemon: N roots on one runtime                |
+| `sendRequest`, `encodeMessage`, `createMessageDecoder`        | Its socket protocol                               |
 | `containerd(options)`, `dummy(options)`                       | Runtimes for `serve()`                            |
 | `Container`, `Deployment`, `Network`, `Service`, `Ready`      | The components                                    |
 | `useContainerStatus`, `useReady`, `useSelfHeal`               | The hooks behind them                             |

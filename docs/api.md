@@ -207,13 +207,92 @@ one nerdctl. The pieces are also exported:
 
 See [containerd.md](containerd.md) for how the runtime behaves.
 
+## Daemon
+
+`fiber-servo daemon` is one process hosting N evaluations: one runtime, one
+status store, one executor queue, one event watcher, one readiness prober, and
+one React root per applied app. It stores no desired state — `apply` sends a
+path and the daemon evaluates the program itself (decision 21).
+
+### `startDaemon(options): Promise<Daemon>`
+
+| Option       | Type              | Meaning                                                          |
+| ------------ | ----------------- | ---------------------------------------------------------------- |
+| `runtime`    | `Runtime`         | The single runtime every app shares                              |
+| `socketPath` | `string`          | Default: `$FIBER_SERVO_SOCK`, `$XDG_RUNTIME_DIR/...`, `/run/...` |
+| `log`        | `(line) => void`  | The daemon's own log                                             |
+| `onError`    | `(error) => void` | Runtime and reload errors                                        |
+| `prune`      | `boolean`         | Reap orphans against the union of all apps. Default on           |
+
+`Daemon` has `socketPath`, `registry`, and `close()`: unmount every app, drain
+the runtime, stop the watcher, unlink the socket. It refuses to start when a
+live daemon already holds the path, and removes the path when nothing is
+listening on it (`claimSocketPath`, `isListening`).
+
+`runDaemon(options)` is `startDaemon` plus SIGINT/SIGTERM handling, which is
+what the CLI runs.
+
+### `createAppRegistry(options): AppRegistry`
+
+The daemon without the socket. Same options minus `socketPath`.
+
+- `apply(file, { watch?, emit? }): Promise<AppInfo>`: import and evaluate
+  `file`, rendering into the root that already holds it or into a new one.
+  Resolves once the reconcile has settled and the runtime is idle.
+- `remove(file, { emit? }): Promise<AppInfo>`: unmount that root, stop watching
+  it, and resolve with what it was holding.
+- `list(): AppInfo[]`, `status`, `close()`.
+
+`AppInfo` is `{ id, watching, containers, networks }`, where `id` is the
+resolved absolute path of the file. `emit` receives the reply stream for the
+duration of the call. Applies are serialized: two of them share the store, the
+executor queue and the prune keep set.
+
+### Protocol
+
+Newline-delimited JSON, one object per line, in both directions. A request is
+one line; the reply is a stream of lines ending in `done`, after which the
+daemon closes the connection.
+
+```ts
+type DaemonRequest =
+  | { cmd: 'apply'; file: string; watch?: boolean }
+  | { cmd: 'delete'; file: string }
+  | { cmd: 'list' }
+  | { cmd: 'ping' };
+
+type DaemonResponse =
+  | { type: 'log'; line: string }
+  | { type: 'op'; line: string; app?: string }
+  | { type: 'status'; id; state; ready?; exitCode?; reason? }
+  | { type: 'error'; message: string }
+  | { type: 'done'; ok: boolean; id?; apps?: AppInfo[]; pid?; message? };
+```
+
+`file` must be absolute: the client resolves it, because the daemon's cwd is
+its own. `watch: true` has the daemon watch the file and re-render on save; it
+is idempotent, and only `delete` disarms it.
+
+- `encodeMessage(message): string` — one frame.
+- `createMessageDecoder<T>(): (chunk) => T[]` — stateful; holds a line split
+  across chunks and returns all of several messages delivered in one.
+- `parseRequest(value): DaemonRequest` — validates a decoded request.
+- `defaultSocketPath(env?): string`.
+- `sendRequest(request, { socketPath?, onMessage? }): Promise<DoneResponse>` —
+  the client: connect, send one request, stream the reply, resolve with `done`.
+
 ## CLI
 
 ```
-fiber-servo plan <app.tsx>                       print the ops, execute nothing
-fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
-                           [--namespace n] [--address sock] [--quiet]
-                           [--no-prune]
+fiber-servo plan   <app.tsx>                     print the ops, execute nothing
+fiber-servo up     <app.tsx> [--watch] [--runtime containerd|dummy]
+                             [--namespace n] [--address sock] [--quiet]
+                             [--no-prune]
+fiber-servo daemon [--socket path] [--runtime containerd|dummy]
+                   [--namespace n] [--address sock] [--quiet] [--no-prune]
+fiber-servo apply  <app.tsx> [--watch] [--socket path]
+fiber-servo delete <app.tsx> [--socket path]
+fiber-servo list | ping      [--socket path]
 ```
 
 `app.tsx` default-exports a React element or a component. `plan` runs the
@@ -228,3 +307,12 @@ files are loaded through `tsx`.
 `up` also reaps once at startup: managed containers and networks the file no
 longer declares are deleted after the runtime has synced and the tree has
 settled. `--no-prune` leaves them alone.
+
+`daemon` starts with no app and listens on one socket. `apply` sends the path
+of a program: the first time it mounts, later it re-renders that root so React
+reconciles only the difference. `apply --watch` moves the watching into the
+daemon, so the client returns as soon as the first reconcile settles instead of
+staying attached; `delete` unmounts that one app and stops watching it. A
+client prints the daemon's stream and exits 0 when `done.ok` is true. The
+daemon reaps against the union of every applied app, because one app's
+containers would otherwise be another's orphans.

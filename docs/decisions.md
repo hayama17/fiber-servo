@@ -316,3 +316,76 @@ re-creates the container, it does not race a reaper.
 gates exactly as above, on every commit, forever. A state file listing what we
 made would drift from containerd and is the state the labels already carry
 (decision 10).
+
+## 21. The daemon hosts evaluations; it stores no desired state
+
+**Decision.** `fiber-servo daemon` is a long-lived process that listens on one
+unix socket and holds N React roots, one per applied app. `apply` sends the
+_path_ of a program; the daemon imports it, evaluates it, and keeps the
+resulting live component tree. `delete` unmounts one root. The daemon stores
+neither specs nor files: what it holds is running evaluations.
+
+**Why the truth is not the file.** Decision 18 said "the file is the source of
+truth". That is wrong in the same way "App.jsx is what is on screen" is wrong.
+The truth is the element tree produced by _evaluating_ the program. The file
+only defines the program. The same file yields a different tree as state and
+observations change — `replicas={useSyncExternalStore(metrics)}` is the whole
+point — so the file cannot be the truth on its own; the evaluation is.
+
+That is also the sharper reason there is no API server. You cannot apply a
+function into a store, you can only run it, and the running has to live
+somewhere it can be re-run against new observations. Kubernetes stores a YAML
+manifest in etcd, which is a _frozen evaluation_: someone ran a generator once
+and kept the result. fiber-servo never stores the result. It keeps the
+generator and re-evaluates it.
+
+**Why not send a serialized element tree.** It was the obvious alternative:
+the client evaluates `app.tsx` and posts the tree, and the daemon needs no
+loader. It is the wrong object. A serialized tree is one frozen evaluation —
+shipping rendered HTML instead of the component — and it cannot be
+re-evaluated. Nothing downstream of it can respond to an observation, so:
+
+- Self-healing dies. A death arrives at the status store and has to become
+  `restarts={n + 1}`, which is a _render_. With no component tree there is
+  nothing to render.
+- `<Ready>` gating dies. A gated subtree is not in the tree until its
+  dependency is reported running; a tree serialized before that moment is
+  missing the subtree permanently, and one serialized after it has baked in a
+  condition that may no longer hold.
+- Hooks, `useSyncExternalStore` and composition all stop at the client.
+
+So `apply` sends a path because a path is a reference to the program, and the
+daemon is the place the program runs.
+
+**Why a daemon at all, when `up` exists.** `up` is one process per app, and
+the pieces that must be shared are per-process: container names are global on
+the host, so two `up`s reconciling adjacent apps hold two records of what they
+committed and fight over the same names (decision 1), and pruning cannot tell
+one's containers from the other's garbage (decision 20). The daemon keeps one
+nerdctl, one status store, one executor queue, one event watcher, one readiness
+prober, and gives each app its own root. `up` stays as it is: the single-app
+path, and the one that needs no socket.
+
+**Identity is the resolved absolute path.** `apply` on a known id re-renders
+that root, so React diffs and only the difference is reconciled; on a new id it
+creates one. The client resolves the path, because its cwd is not the daemon's.
+Two names for one file would be two apps fighting over the same containers.
+
+**Transport.** Newline-delimited JSON over a unix socket: one JSON request per
+line, a stream of `log` / `op` / `status` / `error` lines back, and a final
+`done`, then the socket closes. No dependency, no length framing, readable with
+`nc`. The command set stays at `apply`, `delete`, `list`, `ping` — anything
+richer would be an API, and an API would start to look like a store.
+
+**Consequences.** Restarting the daemon loses every evaluation and its policy
+state (self-heal counters, `Ready` latches), exactly as restarting `up` does;
+adoption by spec digest and the watcher's `ps -a` rebuild the rest (decisions
+10 and 1). `apply --watch` moves the watching into the daemon, so the client
+returns as soon as the first reconcile settles instead of staying attached.
+Pruning runs after each apply, delete and reload rather than once at startup,
+because a daemon has no app at startup and the set of declared resources
+changes with every request; the keep set is the union over every applied root,
+because the host's namespace is shared, and the ordering guard of decision 20
+still holds (after `handle.synced`, after every root has settled). There is
+still no remote control, no RBAC and no audit log: the socket is local, and it
+carries paths, not specs.
