@@ -65,6 +65,39 @@ Every `status.set` is one event (its `seq` advances even for `dead` after
 waits for the store to report again. Everything updates on `SyncLane`, so a
 store event commits in the next microtask, or immediately on `root.flush()`.
 
+## Runtime: containerd
+
+The reconciler talks to containerd through nerdctl, a thin CLI over
+containerd's gRPC API that also brings CNI networking and port publishing
+for phase 2. Two files connect it, and neither is known to the reconciler:
+
+- `src/runtime/containerd/execute.ts` is the sink. Batches run strictly in
+  order. `CREATE` inspects first: a container made from the same spec (a
+  `react4c.spec` digest label) is adopted, a different one is recreated.
+  `UPDATE` is `rm -f` + `run`. `START` is `nerdctl start`, or a fresh `run`
+  if the container vanished. The executor writes only its own failures to
+  the store: a refused `run` or `start` becomes `dead` with the reason, so the
+  tree retries with backoff.
+- `src/runtime/containerd/events.ts` is the event source. It reads `ps -a`
+  at startup (and on every reconnect) to adopt existing containers, then
+  follows `nerdctl events`: `/tasks/start` -> `running`, `/tasks/exit` of the
+  init process -> `dead` with the exit code, `/containers/delete` -> forget.
+  Only containers carrying the `react4c.managed` label are reported.
+
+```tsx
+const nerdctl = createNerdctl({ namespace: 'default' });
+const status = createStatusStore();
+const index = new Map<string, string>(); // containerd id -> name, shared by both files
+const runtime = createContainerdRuntime({ nerdctl, status, index });
+const root = createRoot({ status, sink: runtime.sink });
+watchContainerd({ nerdctl, status, index, signal });
+```
+
+Restart policy is ours (`--restart=no`). `ports` are not published yet;
+that is a networking decision for phase 2. Swapping nerdctl for a direct
+gRPC client means replacing `nerdctl.ts`; the executor and watcher only see
+`exec` and `stream`, which is also how the tests drive them.
+
 ## Layout
 
 | Path | Role |
@@ -76,10 +109,15 @@ store event commits in the next microtask, or immediately on `root.flush()`.
 | `src/reconciler.ts` | `createRoot({ sink, status })` with synchronous `render()` / `flush()` / `unmount()`; `collectOps()` sink for tests |
 | `src/components.tsx` | `Container` (renders the host element) and `Deployment` (stamps out keyed replicas named `${name}-${i}`) |
 | `src/runtime/dummy.ts` | Prints ops; with a store, reports CREATE / START as `running` and forgets on DELETE |
+| `src/runtime/containerd/nerdctl.ts` | The only process spawner: `exec` and `stream` over `nerdctl` |
+| `src/runtime/containerd/execute.ts` | Ops -> nerdctl argv, serialized; failures -> `dead` |
+| `src/runtime/containerd/events.ts` | `ps -a` + `nerdctl events` -> status store |
+| `test/containerd.test.tsx` | argv per op, adoption / recreate, ordering, event and `ps` parsing, end-to-end loop with a fake nerdctl |
 | `test/reconcile.test.tsx` | Phase 0: op sequences for scale-up, scale-down, image change, rename, unmount, and the invariants |
 | `test/self-heal.test.tsx` | Phase 1: `dead` -> `START`, backoff growth and cap, `never`, `maxRestarts`, reset, unmount cancels, store-driven re-render |
 | `test/status-store.test.ts` | Store semantics |
 | `examples/basic.tsx`, `examples/self-heal.tsx` | `npm run example`, `npm run example:self-heal` |
+| `examples/containerd.tsx` | `npm run example:containerd` (needs containerd + nerdctl; not exercised in CI) |
 
 ## Semantics fixed by tests
 
@@ -96,7 +134,7 @@ store event commits in the next microtask, or immediately on `root.flush()`.
 
 - **Phase 0**: hostConfig + dummy runtime, reconciliation verified without a runtime. Done.
 - **Phase 1**: status store + `useSyncExternalStore`; self-healing with restart count and backoff, events injected from tests. Done.
-- **Runtime selection**: docker or containerd. Two files: one that executes ops, one that feeds events into the store.
+- **Runtime selection**: containerd, via nerdctl. Two files: one that executes ops, one that feeds events into the store. Done, verified against a fake nerdctl only; real-host verification is the next thing to run.
 - **Phase 2+**: composition (`<WebApp/>`), networking, dependency ordering with Suspense.
 
 ## Development
@@ -107,4 +145,5 @@ npm test                   # vitest
 npm run typecheck          # tsc --noEmit
 npm run example            # phase 0: scale / update / teardown
 npm run example:self-heal  # phase 1: death -> START with backoff
+sudo npm run example:containerd  # real containerd via nerdctl; kill a replica and watch it return
 ```

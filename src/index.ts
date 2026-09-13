@@ -8,5 +8,6 @@ export { useContainerStatus, useStatusStore, useSelfHeal, backoffDelay, DEFAULT_
 export type { RestartPolicy, RestartMode } from './hooks.js';
 export { createDummyRuntime } from './runtime/dummy.js';
 export type { DummyRuntimeOptions } from './runtime/dummy.js';
+export * from './runtime/containerd/index.js';
 export { diffSpec, formatOp } from './ops.js';
 export type { ContainerSpec, Op, CreateOp, UpdateOp, DeleteOp, StartOp, OpSink } from './ops.js';
