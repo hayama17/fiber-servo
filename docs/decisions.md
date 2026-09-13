@@ -272,3 +272,47 @@ where identity for the runtime is decided anyway.
 latches) does reset on a remount, because it belongs to the fiber; the
 containers do not. A remount is therefore a cheap, observable no-op at the
 runtime, and "force a recreate" needs a spec change, not a key change.
+
+## 20. Orphans are reaped once, after the first sync and the first settle
+
+**Decision.** On startup `serve()` prunes: it lists what carries the
+`fiber-servo.managed` label and deletes everything the tree does not declare
+(containers, then networks). It does this exactly once, and only after
+`handle.synced` (the watcher's first `ps -a`) and `root.settle()` have both
+completed. `serve(..., { prune: false })` and `up --no-prune` opt out.
+
+**Why it is needed.** Every other path looks up a resource the tree names:
+`CREATE` inspects one container, `DELETE` removes one container. A container
+the tree stops naming while no process is running is named by nobody
+afterwards, so nothing ever removes it (issue #9). Reconciling only what the
+desired state mentions is half a reconciler; the other half has to enumerate
+the world. The labels carry the name and the spec digest already, so that
+enumeration needs no state file.
+
+**Why the ordering.** What the tree declares is not the whole tree: subtrees
+behind a gate (`<Ready>`, the children of a `<Container>`) are not declared
+until their dependency is reported running, and on an adopted set of
+containers the thing that reports them running is the watcher's first `ps -a`.
+So:
+
+- Prune before the sync and nothing is running yet, no gate has opened, and
+  `liveIds()` is missing every gated container: they get deleted and
+  immediately recreated. Worst case that is the whole dependent half of the
+  app, destroyed on startup.
+- Prune after the sync but before settle and the gates have opened but React
+  has not committed their subtrees yet — the same deletion, a narrower window.
+- Prune after both and `liveIds()` is everything the tree declares given what
+  is actually running. Only then is "not in the tree" the same as "garbage".
+
+**Consequence, stated plainly.** A container whose gate never opens — its
+dependency is down and stays down — is not declared at settle time, so it is
+pruned. That is accepted: the tree does not want it while its dependency is
+missing, it holds ports and memory for nothing, and when the dependency comes
+back the gate opens and `CREATE` makes it again. Pruning once rather than
+continuously is what keeps this bounded: a gate that opens a second later
+re-creates the container, it does not race a reaper.
+
+**Alternatives.** A continuous reaper (prune on every commit) would fight the
+gates exactly as above, on every commit, forever. A state file listing what we
+made would drift from containerd and is the state the labels already carry
+(decision 10).

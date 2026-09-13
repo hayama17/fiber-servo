@@ -21,6 +21,11 @@ export interface WatchOptions {
   signal?: AbortSignal;
   /** Wait before re-attaching after the event stream ends. Default 1000. */
   reconnectDelayMs?: number;
+  /**
+   * Called after every successful `ps -a` sync, reconnects included. The first
+   * call is what tells a caller that adopted containers are in the store.
+   */
+  onSynced?: () => void;
   log?: (line: string) => void;
   onError?: (error: Error) => void;
 }
@@ -137,6 +142,7 @@ export async function watchContainerd(options: WatchOptions): Promise<void> {
     reconnectDelayMs = 1000,
     log = () => {},
     onError = (e) => console.error(e),
+    onSynced = () => {},
   } = options;
   const index = options.index ?? new Map<string, string>();
   const notOurs = new Set<string>();
@@ -163,6 +169,7 @@ export async function watchContainerd(options: WatchOptions): Promise<void> {
   while (!signal?.aborted) {
     try {
       await syncFromPs({ nerdctl, status, index });
+      onSynced();
       log('watching containerd events');
       for await (const line of nerdctl.stream(['events', '--format', '{{json .}}'], signal)) {
         const row = parseJson<EventRow>(line);

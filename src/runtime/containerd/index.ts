@@ -38,12 +38,26 @@ export function containerd(options: ContainerdOptions = {}): Runtime {
       onError: (error) => ctx.onError(error),
       probeTickMs: options.probeTickMs,
     });
+    // Resolved by the watcher's first `ps -a`; stays pending if that never
+    // succeeds, which is what keeps a prune from running half-informed.
+    let markSynced = (): void => {};
+    const synced = new Promise<void>((resolve) => (markSynced = resolve));
     return {
       sink: runtime.sink,
       idle: runtime.idle,
+      prune: runtime.prune,
+      synced,
       async watch(signal) {
         await Promise.all([
-          watchContainerd({ nerdctl, status: ctx.status, index, signal, log: ctx.log, onError: ctx.onError }),
+          watchContainerd({
+            nerdctl,
+            status: ctx.status,
+            index,
+            signal,
+            log: ctx.log,
+            onError: ctx.onError,
+            onSynced: markSynced,
+          }),
           runtime.probe(signal),
         ]);
       },

@@ -10,7 +10,9 @@
  */
 import { createHash } from 'node:crypto';
 import type { ContainerSpec, NetworkSpec, Op, OpSink } from '../../ops.js';
+import type { PruneKeep } from '../../serve.js';
 import type { StatusStore } from '../../status.js';
+import { isManaged, parsePsLine } from './events.js';
 import { MANAGED_LABEL, SPEC_LABEL, type ExecResult, type Nerdctl } from './nerdctl.js';
 
 export interface ContainerdRuntimeOptions {
@@ -39,6 +41,13 @@ export interface ContainerdRuntime {
    * store `ready` on exit 0. Runs until `signal` aborts.
    */
   probe(signal: AbortSignal): Promise<void>;
+  /**
+   * Remove every managed resource the tree does not declare, and return the
+   * names removed (containers first, then networks). This is the only place
+   * that asks containerd what exists instead of looking up what the tree
+   * names; see docs/decisions.md 20 for when it is safe to call.
+   */
+  prune(keep: PruneKeep): Promise<string[]>;
 }
 
 /** Stable digest of a spec; stored as a label so CREATE can recognise a resource it already made. */
@@ -119,6 +128,20 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
   /** Last spec we were asked to realise per name, so START can recreate a vanished container. */
   const specs = new Map<string, ContainerSpec>();
   let queue: Promise<void> = Promise.resolve();
+
+  /**
+   * Everything that touches containerd goes through here, so a prune cannot
+   * interleave with a batch in flight. The queue itself never carries a
+   * rejection: the caller of `enqueue` owns the failure.
+   */
+  function enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const result = queue.then(work);
+    queue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
 
   async function call(args: string[]): Promise<ExecResult> {
     log(`$ nerdctl ${args.join(' ')}`);
@@ -253,6 +276,94 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
     }
   }
 
+  // ---- pruning ------------------------------------------------------------
+
+  /**
+   * Names of every managed container, from containerd rather than from the
+   * tree. The label filter is an optimisation; `parsePsLine` checks the label
+   * again, so a nerdctl that ignored the filter still cannot make us delete a
+   * foreign container.
+   */
+  async function managedContainers(): Promise<string[]> {
+    const res = await call([
+      'ps',
+      '-a',
+      '--no-trunc',
+      '--filter',
+      `label=${MANAGED_LABEL}=true`,
+      '--format',
+      '{{json .}}',
+    ]);
+    if (res.code !== 0) throw fail(res, 'ps -a');
+    const names: string[] = [];
+    for (const line of res.stdout.split('\n')) {
+      const row = parsePsLine(line);
+      if (row) names.push(row.name);
+    }
+    return names;
+  }
+
+  /**
+   * Names of every managed network. `network ls` grew `--filter label=` and a
+   * `Labels` column late, so rows without one are resolved with an `inspect`
+   * instead of trusting a filter the daemon may have dropped.
+   */
+  async function managedNetworks(): Promise<string[]> {
+    const res = await call(['network', 'ls', '--format', '{{json .}}']);
+    if (res.code !== 0) throw fail(res, 'network ls');
+    const names: string[] = [];
+    for (const line of res.stdout.split('\n')) {
+      const row = parseJson<{ Name?: string; Labels?: string }>(line);
+      const name = row?.Name?.trim();
+      if (!row || !name) continue;
+      const managed = row.Labels === undefined ? await networkIsManaged(name) : isManaged(row.Labels);
+      if (managed) names.push(name);
+    }
+    return names;
+  }
+
+  async function networkIsManaged(name: string): Promise<boolean> {
+    const res = await call(['network', 'inspect', '--format', `{{index .Labels "${MANAGED_LABEL}"}}`, name]);
+    return res.code === 0 && res.stdout.trim() === 'true';
+  }
+
+  async function prune(keep: PruneKeep): Promise<string[]> {
+    const removed: string[] = [];
+    // Containers before networks: a network with a container still attached
+    // cannot be removed.
+    const keptContainers = new Set(keep.containers);
+    for (const name of await managedContainers()) {
+      if (keptContainers.has(name)) continue;
+      if (await pruneOne('container', name, () => remove(name))) {
+        specs.delete(name);
+        status?.remove(name);
+        removed.push(name);
+      }
+    }
+    const keptNetworks = new Set(keep.networks);
+    for (const name of await managedNetworks()) {
+      if (keptNetworks.has(name)) continue;
+      if (await pruneOne('network', name, () => removeNetwork(name))) removed.push(name);
+    }
+    return removed;
+  }
+
+  async function pruneOne(
+    kind: 'container' | 'network',
+    id: string,
+    run: () => Promise<void>,
+  ): Promise<boolean> {
+    log(`prune ${kind} ${id}`);
+    try {
+      await run();
+      return true;
+    } catch (e) {
+      // One resource refusing to go is not a reason to leave the rest.
+      onError(e instanceof Error ? e : new Error(String(e)), { type: 'DELETE', kind, id });
+      return false;
+    }
+  }
+
   // ---- readiness ----------------------------------------------------------
 
   async function probe(signal: AbortSignal): Promise<void> {
@@ -280,13 +391,24 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
   return {
     sink(ops) {
       const batch = [...ops];
-      queue = queue.then(() => executeBatch(batch));
+      void enqueue(() => executeBatch(batch));
     },
     idle() {
       return queue;
     },
     probe,
+    prune(keep) {
+      return enqueue(() => prune(keep));
+    },
   };
+}
+
+function parseJson<T>(text: string): T | null {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

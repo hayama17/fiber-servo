@@ -110,6 +110,47 @@ mark, so a container that comes back is probed again. `probeTickMs` (default 250
 `serve()` with `containerd()` runs the watcher and the prober together;
 with the pieces, call `runtime.probe(signal)` next to `watchContainerd`.
 
+## What the pruner does
+
+Everything above looks up resources the tree names. Nothing there can find a
+container the tree has stopped naming: kill `up` without Ctrl-C, drop
+`replicas` from 3 to 1, and `web-1` and `web-2` keep running forever
+(issue #9). `runtime.prune({ containers, networks })` is the one place that
+asks containerd what exists instead:
+
+```
+ps -a --no-trunc --filter label=fiber-servo.managed=true --format '{{json .}}'
+network ls --format '{{json .}}'
+network inspect --format '{{index .Labels "fiber-servo.managed"}}' <name>   # only if `network ls` printed no Labels
+rm -f <name>                                                               # every managed container not in `containers`
+network rm <name>                                                          # every managed network not in `networks`
+```
+
+It returns the names it removed and forgets their status. Four things about
+that argv:
+
+- The `ps` filter is an optimisation. The rows are parsed by the same
+  `parsePsLine` the watcher uses, which checks the label again, so a nerdctl
+  that ignored the filter still cannot make us delete a foreign container.
+- `network ls` is unfiltered because `--filter label=` and the `Labels`
+  column arrived late in nerdctl's life. A row without a `Labels` field is
+  resolved with one `network inspect`; a row with an empty one is simply not
+  ours. Neither path can conclude "managed" from silence.
+- Containers are removed before networks: nerdctl refuses to remove a network
+  that still has a container attached.
+- It runs on the executor's queue, so it cannot interleave with a batch in
+  flight; a `CREATE` committed just before it will have finished, and its
+  container is in `keep`.
+
+**When it is safe to run is the whole design.** `serve()` waits for
+`handle.synced` (the watcher's first `ps -a`) and then `root.settle()` before
+calling it, and never calls it again. The reasoning is decision 20: gated
+subtrees are not declared until their dependency is reported running, the
+first sync is what reports adopted containers running, and settle is what
+lets the gates that opens declare their children. Pruning any earlier deletes
+containers the tree is about to ask for. `serve(..., { prune: false })` and
+`fiber-servo up --no-prune` turn it off.
+
 ## Assumptions about nerdctl's output
 
 These were confirmed on a real host with nerdctl 2.x, but they are the first
@@ -124,6 +165,10 @@ place to look if something differs on yours:
   (comma-separated `k=v`).
 - `network inspect --format '{{index .Labels "…"}}'` and
   `network create --label` work.
+- `ps --filter label=k=v` narrows the listing. If a version does not, nothing
+  breaks: the label check on each row is what decides.
+- `network ls --format '{{json .}}'` rows have `Name`, and `Labels` on recent
+  versions. A missing `Labels` costs one `network inspect` per network.
 
 ## Known limitations
 
@@ -138,4 +183,8 @@ place to look if something differs on yours:
   the tree may emit a `START` that finds the container already running; that
   is a harmless no-op.
 - Containers created under a different label prefix (an older name of this
-  project) are treated as foreign and recreated on the next `CREATE`.
+  project) are treated as foreign and recreated on the next `CREATE`. Prune
+  does not see them either, so they have to go by hand.
+- Pruning assumes one fiber-servo per namespace, which is what the rest of
+  the design assumes too (decision 1). Two apps sharing a namespace would
+  each prune the other's containers; give them separate `--namespace`s.

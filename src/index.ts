@@ -10,7 +10,7 @@ export type {
 export { createRoot, collectOps } from './reconciler.js';
 export type { Root, CreateRootOptions } from './reconciler.js';
 export { serve } from './serve.js';
-export type { Runtime, RuntimeContext, RuntimeHandle, ServeOptions, Served } from './serve.js';
+export type { Runtime, RuntimeContext, RuntimeHandle, PruneKeep, ServeOptions, Served } from './serve.js';
 export { createStatusStore, UNKNOWN_STATUS } from './status.js';
 export type { StatusStore, ContainerStatus, ContainerState, StatusDetail } from './status.js';
 export {

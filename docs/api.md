@@ -39,18 +39,34 @@ A sink for tests and dry runs: `{ ops, batches, sink, take() }`.
 The one-call entry point. Creates the store, binds the runtime, starts its
 watcher, renders.
 
-| Option    | Type              | Meaning                                                |
-| --------- | ----------------- | ------------------------------------------------------ |
-| `runtime` | `Runtime`         | `containerd(options)` or `dummy(options)`, or your own |
-| `status`  | `StatusStore`     | Default: a fresh store                                 |
-| `log`     | `(line) => void`  | Runtime logging                                        |
-| `onError` | `(error) => void` | Runtime errors. Default: `console.error`               |
-| `onOps`   | `(ops) => void`   | Observe each batch before the runtime gets it          |
+| Option    | Type              | Meaning                                                        |
+| --------- | ----------------- | -------------------------------------------------------------- |
+| `runtime` | `Runtime`         | `containerd(options)` or `dummy(options)`, or your own         |
+| `status`  | `StatusStore`     | Default: a fresh store                                         |
+| `log`     | `(line) => void`  | Runtime logging                                                |
+| `onError` | `(error) => void` | Runtime errors. Default: `console.error`                       |
+| `onOps`   | `(ops) => void`   | Observe each batch before the runtime gets it                  |
+| `prune`   | `boolean`         | Delete managed resources the tree does not declare. Default on |
 
 `Served` has `root`, `status`, and `stop()`: unmount (every `DELETE`), wait
 for the runtime to drain, stop the watcher.
 
-A `Runtime` is `(ctx: { status, log, onError }) => { sink, idle?, watch? }`.
+A `Runtime` is
+`(ctx: { status, log, onError }) => { sink, idle?, watch?, synced?, prune? }`.
+
+| Handle member   | Meaning                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
+| `sink`          | One batch per commit                                                         |
+| `idle()`        | Resolves once every batch received so far has run                            |
+| `watch(signal)` | Feeds the status store until `signal` aborts                                 |
+| `synced`        | Resolves once `watch()` has reflected what already exists into the store     |
+| `prune(keep)`   | Remove managed resources absent from `keep`; resolves with the names removed |
+
+`keep` is `PruneKeep`: `{ containers: readonly string[]; networks: readonly string[] }`.
+When both `prune` and `prune !== false` are present, `serve()` waits for
+`synced`, then `root.settle()`, then calls `prune()` once with the tree's
+`liveIds`. Waiting for both is required, not incidental: see
+[decision 20](decisions.md#20-orphans-are-reaped-once-after-the-first-sync-and-the-first-settle).
 
 ## Components
 
@@ -177,8 +193,15 @@ one nerdctl. The pieces are also exported:
 
 - `createNerdctl({ bin?, namespace?, address? }): Nerdctl`
 - `createContainerdRuntime({ nerdctl, status?, index?, log?, onError?, probeTickMs? })`
-  returns `{ sink, idle(), probe(signal) }`.
-- `watchContainerd({ nerdctl, status, index?, signal?, reconnectDelayMs?, log?, onError? }): Promise<void>`
+  returns `{ sink, idle(), probe(signal), prune(keep) }`.
+- `prune({ containers, networks })` lists managed resources
+  (`ps -a --filter label=fiber-servo.managed=true`, `network ls`), removes
+  every one not listed (`rm -f`, then `network rm`), forgets their status, and
+  resolves with the names removed. It runs on the executor's queue, so it
+  never interleaves with a batch.
+- `watchContainerd({ nerdctl, status, index?, signal?, reconnectDelayMs?, log?, onError?, onSynced? }): Promise<void>`
+  — `onSynced` fires after every successful `ps -a`, which is how
+  `containerd()` builds the handle's `synced`.
 - `syncFromPs`, `interpretEvent`, `parsePsLine`, `parsePsStatus`, `runArgs`,
   `networkCreateArgs`, `specDigest`, `MANAGED_LABEL`, `SPEC_LABEL`.
 
@@ -190,6 +213,7 @@ See [containerd.md](containerd.md) for how the runtime behaves.
 fiber-servo plan <app.tsx>                       print the ops, execute nothing
 fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
                            [--namespace n] [--address sock] [--quiet]
+                           [--no-prune]
 ```
 
 `app.tsx` default-exports a React element or a component. `plan` runs the
@@ -200,3 +224,7 @@ prints ops and status changes, and tears everything down on Ctrl-C.
 React diffs it against the running tree, so only what changed produces ops.
 Only the entry file is watched; modules it imports stay cached. TypeScript
 files are loaded through `tsx`.
+
+`up` also reaps once at startup: managed containers and networks the file no
+longer declares are deleted after the runtime has synced and the tree has
+settled. `--no-prune` leaves them alone.

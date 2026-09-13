@@ -9,6 +9,13 @@ change public APIs.
 
 ### Added
 
+- Orphan reaping ([#9](https://github.com/hayama17/fiber-servo/issues/9)): on
+  startup `serve()` lists managed containers and networks and deletes the ones
+  the tree does not declare, once the runtime has synced and the tree has
+  settled (decision 20). `ContainerdRuntime.prune()`, `RuntimeHandle.prune` /
+  `synced`, `watchContainerd({ onSynced })`, `serve(..., { prune: false })`
+  and `fiber-servo up --no-prune`.
+
 - Nesting is dependency: children of a `<Container>` mount once it is
   running (or `ready`, when it has a `readiness` probe) and unmount before it.
 - `serve(element, { runtime })`, the one-call entry point, with `dummy()` and
