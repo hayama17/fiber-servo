@@ -329,6 +329,21 @@ describe('containerd runtime: events -> status store', () => {
     });
     expect(interpretEvent(row('/tasks/oom', { container_id: HEX }), resolve)).toBeNull();
     expect(interpretEvent({ ID: 'c'.repeat(64), Topic: '/tasks/start', Event: '{}' }, resolve)).toBeNull();
+    // A raw gRPC decode fills proto3 defaults in where nerdctl's JSON omits
+    // them: the init exec is then the empty string, not a missing field.
+    expect(
+      interpretEvent(row('/tasks/exit', { container_id: HEX, id: '', exit_status: 137 }), resolve),
+    ).toEqual({ kind: 'set', name: 'web-0', state: 'dead', exitCode: 137 });
+    // /containers/delete names the container in `id`, and an envelope decoded
+    // from gRPC has no row-level ID to fall back on.
+    expect(
+      interpretEvent({ Topic: '/containers/delete', Event: JSON.stringify({ id: HEX }) }, resolve),
+    ).toEqual({
+      kind: 'remove',
+      name: 'web-0',
+    });
+    // ...but `id` on a /tasks/* event is still the process, never the container.
+    expect(interpretEvent({ Topic: '/tasks/start', Event: JSON.stringify({ id: HEX }) }, resolve)).toBeNull();
     // nerdctl may hand the body as an object instead of a string
     expect(interpretEvent({ ID: HEX, Topic: '/tasks/start', Event: { container_id: HEX } }, resolve)).toEqual(
       { kind: 'set', name: 'web-0', state: 'running' },

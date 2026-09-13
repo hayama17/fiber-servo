@@ -44,7 +44,11 @@ export interface PsRow {
 
 /** One line of `nerdctl events --format '{{json .}}'`. */
 export interface EventRow {
-  ID: string;
+  /**
+   * nerdctl repeats the container id here. A gRPC envelope has no such field,
+   * so the body is the only source there and this is optional.
+   */
+  ID?: string;
   Topic: string;
   /** JSON of the containerd event body, encoded as a string by nerdctl. */
   Event?: string | Record<string, unknown>;
@@ -81,16 +85,24 @@ export function interpretEvent(
 ): StatusEvent | null {
   const body =
     typeof row.Event === 'string' ? (parseJson<Record<string, unknown>>(row.Event) ?? {}) : (row.Event ?? {});
-  const id = String(body['container_id'] ?? row.ID ?? '');
+  // `/tasks/*` name the container in `container_id` and reserve `id` for the
+  // process; `/containers/*` carry only `id`, and there it is the container.
+  // nerdctl also repeats the container id in the row, which has been hiding
+  // that difference; a driver decoding the gRPC envelope gets no row at all.
+  const fromBody = body['container_id'] ?? (row.Topic.startsWith('/containers/') ? body['id'] : undefined);
+  const id = String(fromBody ?? row.ID ?? '');
   const name = resolve(id);
   if (!name) return null;
   switch (row.Topic) {
     case '/tasks/start':
       return { kind: 'set', name, state: 'running' };
     case '/tasks/exit': {
-      // Exec processes exit too; only the init process (id == container_id) is the container.
+      // Exec processes exit too; only the init process is the container. It is
+      // named either by repeating container_id, or by the empty string that
+      // the proto documents as "the init exec" and that a raw decode fills in
+      // where nerdctl's JSON simply omits the field.
       const pid = body['id'];
-      if (pid !== undefined && pid !== body['container_id']) return null;
+      if (pid !== undefined && pid !== '' && pid !== body['container_id']) return null;
       return { kind: 'set', name, state: 'dead', exitCode: Number(body['exit_status'] ?? 0) };
     }
     case '/containers/delete':

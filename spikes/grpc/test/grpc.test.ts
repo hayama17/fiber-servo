@@ -225,17 +225,21 @@ describe('driving a fake containerd', () => {
     expect(interpretEvent(row!, () => 'web')).toEqual({ kind: 'remove', name: 'web' });
   });
 
-  it('normalises the empty exec id on /tasks/exit, which interpretEvent would otherwise drop', () => {
+  it('decodes /tasks/exit with the empty exec id the proto documents for init', () => {
     // events/task.proto, TaskDelete: "id is the specific exec. By default if
     // omitted will be `""` thus matches the init exec". A protobuf decode
-    // with defaults gives `id: ''`, and interpretEvent compares it to
-    // container_id, so an un-normalised row is silently ignored: the
-    // container would die and the tree would never hear about it.
+    // with defaults gives `id: ''` where nerdctl's JSON omits the field, so
+    // interpretEvent has to read the empty string as the init process too.
     const raw = messageType('containerd.events.TaskExit').deserialize(
       packProto('containerd.events.TaskExit', { container_id: 'web', exit_status: 3 }).value,
     );
     expect(raw['id']).toBe('');
-    expect(interpretEvent({ ID: 'web', Topic: '/tasks/exit', Event: raw }, () => 'web')).toBeNull();
+    expect(interpretEvent({ ID: 'web', Topic: '/tasks/exit', Event: raw }, () => 'web')).toEqual({
+      kind: 'set',
+      name: 'web',
+      state: 'dead',
+      exitCode: 3,
+    });
 
     const row = envelopeToEventRow({
       topic: '/tasks/exit',
