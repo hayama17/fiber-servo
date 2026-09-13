@@ -45,7 +45,7 @@ export function Container(props: ContainerProps): ReactElement {
   const { name, restart = 'always', ...rest } = props;
   const enclosing = useNetwork();
   if (name === undefined) {
-    throw new Error('react4c: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)');
+    throw new Error('fiber-servo: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)');
   }
   const spec = { name, ...rest, network: rest.network ?? enclosing };
   return container({ ...spec, restarts: useSelfHeal(name, restart) });
@@ -67,7 +67,7 @@ export interface DeploymentProps {
  */
 export function Deployment({ name, replicas = 1, children }: DeploymentProps): ReactElement {
   if (!Number.isInteger(replicas) || replicas < 0) {
-    throw new Error(`react4c: <Deployment name="${name}"> replicas must be a non-negative integer`);
+    throw new Error(`fiber-servo: <Deployment name="${name}"> replicas must be a non-negative integer`);
   }
   const templates = Children.toArray(children).filter((c): c is ReactElement<ContainerProps> =>
     isValidElement<ContainerProps>(c),

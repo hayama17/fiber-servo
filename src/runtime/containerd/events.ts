@@ -6,7 +6,7 @@
  *     already exist are adopted with their real state;
  *   - `events` as a stream, translated per containerd topic.
  *
- * Only containers carrying the react4c label are reported. containerd
+ * Only containers carrying the fiber-servo label are reported. containerd
  * events identify containers by their 64-hex id; names come from the shared
  * index (filled by the executor and by `ps`) or, failing that, `inspect`.
  */
@@ -68,7 +68,7 @@ export function parsePsLine(line: string): (StatusEvent & { id: string }) | null
 }
 
 /**
- * Translate an event row. `resolve` maps a containerd id to a react4c name,
+ * Translate an event row. `resolve` maps a containerd id to a fiber-servo name,
  * or `undefined` for containers that are not ours.
  */
 export function interpretEvent(row: EventRow, resolve: (id: string) => string | undefined): StatusEvent | null {

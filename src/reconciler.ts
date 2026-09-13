@@ -63,7 +63,7 @@ export function createRoot(options: CreateRootOptions = {}): Root {
     null,
     false,
     null,
-    'react4c',
+    'fiber-servo',
     onError,
     onError,
     onError,

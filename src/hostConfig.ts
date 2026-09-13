@@ -1,5 +1,5 @@
 /**
- * react-reconciler hostConfig for react4c.
+ * react-reconciler hostConfig for fiber-servo.
  *
  * Two rules are fixed here and everything else is built on top of them:
  *
@@ -92,10 +92,10 @@ function isKind(type: string): type is InstanceKind {
 function propsToSpec<K extends InstanceKind>(kind: K, props: HostProps[K]): Specs[K] {
   const p = props as unknown as Record<string, unknown>;
   if (typeof p['name'] !== 'string' || p['name'].length === 0) {
-    throw new Error(`react4c: <${kind}> requires a non-empty string "name"`);
+    throw new Error(`fiber-servo: <${kind}> requires a non-empty string "name"`);
   }
   if (kind === 'container' && (typeof p['image'] !== 'string' || p['image'].length === 0)) {
-    throw new Error(`react4c: <container name="${p['name']}"> requires a non-empty string "image"`);
+    throw new Error(`fiber-servo: <container name="${p['name']}"> requires a non-empty string "image"`);
   }
   const spec: Record<string, unknown> = {};
   for (const key of SPEC_KEYS[kind] as readonly string[]) {
@@ -120,7 +120,7 @@ function mountSubtree(instance: Instance): void {
   if (!instance.created) {
     const key = liveKey(instance.kind, instance.id);
     if (root.live.has(key)) {
-      throw new Error(`react4c: duplicate ${instance.kind} name "${instance.id}"`);
+      throw new Error(`fiber-servo: duplicate ${instance.kind} name "${instance.id}"`);
     }
     instance.created = true;
     root.live.set(key, instance);
@@ -176,7 +176,7 @@ export const hostConfig = {
   supportsTestSelectors: false,
   isPrimaryRenderer: true,
   warnsIfNotActing: false,
-  rendererPackageName: 'react4c',
+  rendererPackageName: 'fiber-servo',
   rendererVersion: '0.0.1',
   extraDevToolsConfig: null,
 
@@ -194,7 +194,7 @@ export const hostConfig = {
   // ---- render phase (no ops here) ----------------------------------------
   createInstance(type: string, props: HostProps[InstanceKind], root: RootContainer): Instance {
     if (!isKind(type)) {
-      throw new Error(`react4c: unknown host element <${type}>. Only <container> and <network> are supported.`);
+      throw new Error(`fiber-servo: unknown host element <${type}>. Only <container> and <network> are supported.`);
     }
     const base = { children: [], root, created: false };
     if (type === 'container') {
@@ -207,7 +207,7 @@ export const hostConfig = {
   },
   createTextInstance(text: string): never {
     throw new Error(
-      `react4c: text is not allowed in the tree (got ${JSON.stringify(text)}). ` +
+      `fiber-servo: text is not allowed in the tree (got ${JSON.stringify(text)}). ` +
         'Wrap runtime status in a component instead.',
     );
   },

@@ -33,9 +33,9 @@ export interface NerdctlOptions {
 }
 
 /** Label that marks containers this reconciler owns. */
-export const MANAGED_LABEL = 'react4c.managed';
+export const MANAGED_LABEL = 'fiber-servo.managed';
 /** Label carrying `specDigest()` of the spec the container was created from. */
-export const SPEC_LABEL = 'react4c.spec';
+export const SPEC_LABEL = 'fiber-servo.spec';
 
 export function createNerdctl(options: NerdctlOptions = {}): Nerdctl {
   const bin = options.bin ?? 'nerdctl';

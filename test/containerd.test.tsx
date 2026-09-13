@@ -48,8 +48,8 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
     const spec = { name: 'web-0', image: 'nginx:1.27', env: { PORT: '80' }, labels: { tier: 'web' }, command: ['nginx', '-g', 'daemon off;'] };
     expect(runArgs(spec)).toEqual([
       'run', '-d', '--name', 'web-0', '--restart=no', '--pull=missing',
-      '--label', 'react4c.managed=true',
-      '--label', `react4c.spec=${specDigest(spec)}`,
+      '--label', 'fiber-servo.managed=true',
+      '--label', `fiber-servo.spec=${specDigest(spec)}`,
       '-e', 'PORT=80',
       '--label', 'tier=web',
       'nginx:1.27', 'nginx', '-g', 'daemon off;',
@@ -180,8 +180,8 @@ describe('containerd runtime: networks', () => {
     const spec = { name: 'app', subnet: '10.9.0.0/24', labels: { tier: 'x' } };
     expect(networkCreateArgs(spec)).toEqual([
       'network', 'create',
-      '--label', 'react4c.managed=true',
-      '--label', `react4c.spec=${specDigest(spec)}`,
+      '--label', 'fiber-servo.managed=true',
+      '--label', `fiber-servo.spec=${specDigest(spec)}`,
       '--subnet', '10.9.0.0/24',
       '--label', 'tier=x',
       'app',
@@ -235,7 +235,7 @@ describe('containerd runtime: events -> status store', () => {
   });
 
   it('parsePsLine only accepts managed containers', () => {
-    const managed = JSON.stringify({ ID: HEX, Names: 'web-0', Status: 'Up 1 second', Labels: 'react4c.managed=true,react4c.spec=abc' });
+    const managed = JSON.stringify({ ID: HEX, Names: 'web-0', Status: 'Up 1 second', Labels: 'fiber-servo.managed=true,fiber-servo.spec=abc' });
     const foreign = JSON.stringify({ ID: 'b'.repeat(64), Names: 'other', Status: 'Up', Labels: 'x=y' });
     expect(parsePsLine(managed)).toEqual({ kind: 'set', name: 'web-0', id: HEX, state: 'running' });
     expect(parsePsLine(foreign)).toBeNull();
@@ -261,8 +261,8 @@ describe('containerd runtime: events -> status store', () => {
 
   it('syncFromPs adopts existing managed containers into the store and the index', async () => {
     const rows = [
-      { ID: HEX, Names: 'web-0', Status: 'Up 5 minutes', Labels: 'react4c.managed=true' },
-      { ID: 'b'.repeat(64), Names: 'web-1', Status: 'Exited (1) 3 seconds ago', Labels: 'react4c.managed=true' },
+      { ID: HEX, Names: 'web-0', Status: 'Up 5 minutes', Labels: 'fiber-servo.managed=true' },
+      { ID: 'b'.repeat(64), Names: 'web-1', Status: 'Exited (1) 3 seconds ago', Labels: 'fiber-servo.managed=true' },
       { ID: 'c'.repeat(64), Names: 'not-ours', Status: 'Up', Labels: '' },
     ];
     const { nerdctl, calls } = fakeNerdctl({ ps: () => ok(rows.map((r) => JSON.stringify(r)).join('\n') + '\n') });

@@ -19,7 +19,7 @@ import {
   watchContainerd,
 } from '../src/index.js';
 
-const nerdctl = createNerdctl({ namespace: process.env['REACT4C_NAMESPACE'] ?? 'default' });
+const nerdctl = createNerdctl({ namespace: process.env['FIBER_SERVO_NAMESPACE'] ?? 'default' });
 const status = createStatusStore();
 const index = new Map<string, string>();
 const log = (line: string) => console.log(`[${new Date().toISOString()}] ${line}`);

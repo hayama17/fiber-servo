@@ -1,5 +1,5 @@
 {
-  "name": "react4c",
+  "name": "fiber-servo",
   "version": "0.0.1",
   "description": "React reconciler for containers: the fiber tree is the spec, ops are the diff.",
   "type": "module",

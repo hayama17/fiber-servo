@@ -1,10 +1,10 @@
-# react4c
+# fiber-servo
 
 React reconciler for containers. The fiber tree is the desired state; the
 reconciler's only output is a list of ops.
 
 ```tsx
-import { Container, Deployment, createDummyRuntime, createRoot } from 'react4c';
+import { Container, Deployment, createDummyRuntime, createRoot } from 'fiber-servo';
 
 const root = createRoot({ sink: createDummyRuntime() });
 
@@ -108,7 +108,7 @@ for phase 2. Two files connect it, and neither is known to the reconciler:
 
 - `src/runtime/containerd/execute.ts` is the sink. Batches run strictly in
   order. `CREATE` inspects first: a container made from the same spec (a
-  `react4c.spec` digest label) is adopted, a different one is recreated.
+  `fiber-servo.spec` digest label) is adopted, a different one is recreated.
   `UPDATE` is `rm -f` + `run`. `START` is `nerdctl start`, or a fresh `run`
   if the container vanished. The executor writes only its own failures to
   the store: a refused `run` or `start` becomes `dead` with the reason, so the
@@ -117,7 +117,7 @@ for phase 2. Two files connect it, and neither is known to the reconciler:
   at startup (and on every reconnect) to adopt existing containers, then
   follows `nerdctl events`: `/tasks/start` -> `running`, `/tasks/exit` of the
   init process -> `dead` with the exit code, `/containers/delete` -> forget.
-  Only containers carrying the `react4c.managed` label are reported.
+  Only containers carrying the `fiber-servo.managed` label are reported.
 
 ```tsx
 const nerdctl = createNerdctl({ namespace: 'default' });

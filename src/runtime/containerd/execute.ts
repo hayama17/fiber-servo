@@ -18,7 +18,7 @@ export interface ContainerdRuntimeOptions {
   /** Receives `dead` for CREATE / START failures. Optional but recommended. */
   status?: StatusStore;
   /**
-   * Maps a containerd id (64 hex) to its react4c name. Share it with the
+   * Maps a containerd id (64 hex) to its fiber-servo name. Share it with the
    * event watcher so events for containers created here resolve without an
    * extra `inspect`.
    */
