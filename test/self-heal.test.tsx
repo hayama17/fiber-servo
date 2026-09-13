@@ -92,7 +92,9 @@ describe('phase 1: status store drives self-healing through the same op path', (
 
   it('backoff grows by `factor` per consecutive restart and is capped by maxDelayMs', () => {
     const { root, sink } = setup();
-    root.render(<Container name="c" image="app" restart={{ baseDelayMs: 100, factor: 2, maxDelayMs: 350 }} />);
+    root.render(
+      <Container name="c" image="app" restart={{ baseDelayMs: 100, factor: 2, maxDelayMs: 350 }} />,
+    );
     sink.take();
 
     const delays: number[] = [];
@@ -204,7 +206,10 @@ describe('phase 1: status store drives self-healing through the same op path', (
   it('the dummy runtime closes the loop: START reports running, so the next death restarts again', () => {
     const store = createStatusStore();
     const printed: string[] = [];
-    const root = createRoot({ status: store, sink: createDummyRuntime({ log: (l) => printed.push(l), status: store }) });
+    const root = createRoot({
+      status: store,
+      sink: createDummyRuntime({ log: (l) => printed.push(l), status: store }),
+    });
 
     root.render(<Container name="c" image="app" restart={{ baseDelayMs: 10 }} />);
     expect(store.get('c').state).toBe('running');

@@ -18,7 +18,7 @@ export interface ContainerdRuntimeOptions {
   /** Receives `dead` for CREATE / START failures. Optional but recommended. */
   status?: StatusStore;
   /**
-   * Maps a containerd id (64 hex) to its react4c name. Share it with the
+   * Maps a containerd id (64 hex) to its fiber-servo name. Share it with the
    * event watcher so events for containers created here resolve without an
    * extra `inspect`.
    */
@@ -76,7 +76,14 @@ export function runArgs(spec: ContainerSpec): string[] {
 
 /** argv for `nerdctl network create` from a spec. */
 export function networkCreateArgs(spec: NetworkSpec): string[] {
-  const args = ['network', 'create', '--label', `${MANAGED_LABEL}=true`, '--label', `${SPEC_LABEL}=${specDigest(spec)}`];
+  const args = [
+    'network',
+    'create',
+    '--label',
+    `${MANAGED_LABEL}=true`,
+    '--label',
+    `${SPEC_LABEL}=${specDigest(spec)}`,
+  ];
   if (spec.subnet) args.push('--subnet', spec.subnet);
   for (const [k, v] of Object.entries(spec.labels ?? {})) args.push('--label', `${k}=${v}`);
   args.push(spec.name);
@@ -158,7 +165,13 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
   // ---- networks -----------------------------------------------------------
 
   async function createNetwork(spec: NetworkSpec): Promise<void> {
-    const existing = await call(['network', 'inspect', '--format', `{{index .Labels "${SPEC_LABEL}"}}`, spec.name]);
+    const existing = await call([
+      'network',
+      'inspect',
+      '--format',
+      `{{index .Labels "${SPEC_LABEL}"}}`,
+      spec.name,
+    ]);
     if (existing.code === 0) {
       const digest = existing.stdout.trim();
       if (digest === specDigest(spec)) return; // adopt
@@ -186,7 +199,9 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
         case 'DELETE':
           return removeNetwork(op.id);
         case 'UPDATE':
-          throw new Error(`network ${op.id}: [${op.changed.join(',')}] changed but networks are immutable; rename it`);
+          throw new Error(
+            `network ${op.id}: [${op.changed.join(',')}] changed but networks are immutable; rename it`,
+          );
       }
     }
     switch (op.type) {

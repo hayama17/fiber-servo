@@ -1,27 +1,73 @@
 {
-  "name": "react4c",
-  "version": "0.0.1",
-  "description": "React reconciler for containers: the fiber tree is the spec, ops are the diff.",
+  "name": "fiber-servo",
+  "version": "0.1.0",
+  "description": "A React reconciler for containers: the fiber tree is the desired state, ops are the diff, containerd runs them.",
+  "keywords": [
+    "react",
+    "react-reconciler",
+    "containers",
+    "containerd",
+    "nerdctl",
+    "orchestration",
+    "reconciler",
+    "declarative",
+    "jsx"
+  ],
+  "license": "MIT",
+  "author": "Kohei Hayama (https://github.com/hayama17)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hayama17/fiber-servo.git"
+  },
+  "bugs": "https://github.com/hayama17/fiber-servo/issues",
+  "homepage": "https://github.com/hayama17/fiber-servo#readme",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.ja.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm run format:check && npm test && npm run build",
+    "prepublishOnly": "npm run check",
     "example": "tsx examples/basic.tsx",
     "example:self-heal": "tsx examples/self-heal.tsx",
     "example:webapp": "tsx examples/webapp.tsx",
     "example:containerd": "tsx examples/containerd.tsx"
   },
-  "license": "MIT",
+  "peerDependencies": {
+    "react": "^19.3.0"
+  },
   "dependencies": {
-    "react": "^19.3.0",
     "react-reconciler": "^0.34.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
     "@types/react": "^19.3.0",
     "@types/react-reconciler": "^0.33.0",
+    "prettier": "^3.9.6",
+    "react": "^19.3.0",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "vitest": "^5.0.0"

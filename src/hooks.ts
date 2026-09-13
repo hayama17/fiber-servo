@@ -155,7 +155,11 @@ export function useSelfHeal(id: string, mode: RestartMode = 'always'): number {
     if (state.consecutive >= policy.maxRestarts) return;
     const delay = backoffDelay(state.consecutive, policy);
     const timer = setTimeout(() => {
-      setState((s) => ({ generation: s.generation + 1, consecutive: s.consecutive + 1, handledSeq: status.seq }));
+      setState((s) => ({
+        generation: s.generation + 1,
+        consecutive: s.consecutive + 1,
+        handledSeq: status.seq,
+      }));
     }, delay);
     return () => clearTimeout(timer);
   }, [policy, status, state.consecutive, state.handledSeq]);

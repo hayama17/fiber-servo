@@ -7,7 +7,15 @@
  * that only mounts once the database has been reported running. The dummy
  * runtime reports every CREATE as running, so the gate opens by itself.
  */
-import { Container, Deployment, Network, Ready, createDummyRuntime, createRoot, createStatusStore } from '../src/index.js';
+import {
+  Container,
+  Deployment,
+  Network,
+  Ready,
+  createDummyRuntime,
+  createRoot,
+  createStatusStore,
+} from '../src/index.js';
 
 function WebApp({ replicas, image }: { replicas: number; image: string }) {
   return (

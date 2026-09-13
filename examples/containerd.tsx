@@ -19,7 +19,7 @@ import {
   watchContainerd,
 } from '../src/index.js';
 
-const nerdctl = createNerdctl({ namespace: process.env['REACT4C_NAMESPACE'] ?? 'default' });
+const nerdctl = createNerdctl({ namespace: process.env['FIBER_SERVO_NAMESPACE'] ?? 'default' });
 const status = createStatusStore();
 const index = new Map<string, string>();
 const log = (line: string) => console.log(`[${new Date().toISOString()}] ${line}`);
@@ -42,7 +42,8 @@ const root = createRoot({
 const stop = new AbortController();
 const watching = watchContainerd({ nerdctl, status, index, signal: stop.signal, log });
 status.subscribe(() => {
-  for (const [name, s] of status.entries()) log(`status ${name} ${s.state}${s.exitCode !== undefined ? ` (exit ${s.exitCode})` : ''}`);
+  for (const [name, s] of status.entries())
+    log(`status ${name} ${s.state}${s.exitCode !== undefined ? ` (exit ${s.exitCode})` : ''}`);
 });
 
 root.render(

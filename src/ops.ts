@@ -91,7 +91,11 @@ export function specValueEquals(a: unknown, b: unknown): boolean {
 }
 
 /** Returns the spec keys that differ, so an UPDATE can carry a precise diff. */
-export function diffSpec<K extends InstanceKind>(kind: K, prev: Specs[K], next: Specs[K]): (keyof Specs[K])[] {
+export function diffSpec<K extends InstanceKind>(
+  kind: K,
+  prev: Specs[K],
+  next: Specs[K],
+): (keyof Specs[K])[] {
   return SPEC_KEYS[kind].filter((k) => !specValueEquals(prev[k], next[k]));
 }
 

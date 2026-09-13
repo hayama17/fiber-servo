@@ -6,7 +6,7 @@
  *     already exist are adopted with their real state;
  *   - `events` as a stream, translated per containerd topic.
  *
- * Only containers carrying the react4c label are reported. containerd
+ * Only containers carrying the fiber-servo label are reported. containerd
  * events identify containers by their 64-hex id; names come from the shared
  * index (filled by the executor and by `ps`) or, failing that, `inspect`.
  */
@@ -27,8 +27,7 @@ export interface WatchOptions {
 
 /** What one input line means for the store. */
 export type StatusEvent =
-  | { kind: 'set'; name: string; state: ContainerState; exitCode?: number }
-  | { kind: 'remove'; name: string };
+  { kind: 'set'; name: string; state: ContainerState; exitCode?: number } | { kind: 'remove'; name: string };
 
 /** One row of `nerdctl ps -a --format '{{json .}}'`. */
 export interface PsRow {
@@ -68,11 +67,15 @@ export function parsePsLine(line: string): (StatusEvent & { id: string }) | null
 }
 
 /**
- * Translate an event row. `resolve` maps a containerd id to a react4c name,
+ * Translate an event row. `resolve` maps a containerd id to a fiber-servo name,
  * or `undefined` for containers that are not ours.
  */
-export function interpretEvent(row: EventRow, resolve: (id: string) => string | undefined): StatusEvent | null {
-  const body = typeof row.Event === 'string' ? (parseJson<Record<string, unknown>>(row.Event) ?? {}) : (row.Event ?? {});
+export function interpretEvent(
+  row: EventRow,
+  resolve: (id: string) => string | undefined,
+): StatusEvent | null {
+  const body =
+    typeof row.Event === 'string' ? (parseJson<Record<string, unknown>>(row.Event) ?? {}) : (row.Event ?? {});
   const id = String(body['container_id'] ?? row.ID ?? '');
   const name = resolve(id);
   if (!name) return null;
@@ -102,7 +105,12 @@ function parseJson<T>(text: string): T | null {
 
 function apply(status: StatusStore, event: StatusEvent): void {
   if (event.kind === 'remove') status.remove(event.name);
-  else status.set(event.name, event.state, event.exitCode === undefined ? undefined : { exitCode: event.exitCode });
+  else
+    status.set(
+      event.name,
+      event.state,
+      event.exitCode === undefined ? undefined : { exitCode: event.exitCode },
+    );
 }
 
 /** Read `ps -a` once and reflect every managed container into the store and the index. */
@@ -122,14 +130,26 @@ export async function syncFromPs(options: Pick<WatchOptions, 'nerdctl' | 'status
  * (with a fresh sync) whenever it ends.
  */
 export async function watchContainerd(options: WatchOptions): Promise<void> {
-  const { nerdctl, status, signal, reconnectDelayMs = 1000, log = () => {}, onError = (e) => console.error(e) } = options;
+  const {
+    nerdctl,
+    status,
+    signal,
+    reconnectDelayMs = 1000,
+    log = () => {},
+    onError = (e) => console.error(e),
+  } = options;
   const index = options.index ?? new Map<string, string>();
   const notOurs = new Set<string>();
 
   async function resolve(id: string): Promise<string | undefined> {
     const known = index.get(id);
     if (known || notOurs.has(id)) return known;
-    const res = await nerdctl.exec(['inspect', '--format', `{{.Name}} {{index .Config.Labels "${MANAGED_LABEL}"}}`, id]);
+    const res = await nerdctl.exec([
+      'inspect',
+      '--format',
+      `{{.Name}} {{index .Config.Labels "${MANAGED_LABEL}"}}`,
+      id,
+    ]);
     const [name = '', managed = ''] = res.code === 0 ? res.stdout.trim().split(/\s+/) : [];
     if (managed !== 'true' || !name) {
       notOurs.add(id);
@@ -147,7 +167,10 @@ export async function watchContainerd(options: WatchOptions): Promise<void> {
       for await (const line of nerdctl.stream(['events', '--format', '{{json .}}'], signal)) {
         const row = parseJson<EventRow>(line);
         if (!row?.Topic) continue;
-        const body = typeof row.Event === 'string' ? (parseJson<Record<string, unknown>>(row.Event) ?? {}) : (row.Event ?? {});
+        const body =
+          typeof row.Event === 'string'
+            ? (parseJson<Record<string, unknown>>(row.Event) ?? {})
+            : (row.Event ?? {});
         const id = String(body['container_id'] ?? row.ID ?? '');
         const name = await resolve(id);
         const event = interpretEvent(row, () => name);
