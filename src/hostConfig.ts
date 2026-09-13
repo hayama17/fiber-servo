@@ -18,6 +18,7 @@ import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constan
 import {
   SPEC_KEYS,
   diffSpec,
+  normalizeBatch,
   type ContainerSpec,
   type InstanceKind,
   type NetworkSpec,
@@ -114,6 +115,12 @@ function createOp(instance: Instance): Op {
     : { type: 'CREATE', kind: 'network', id: instance.id, spec: instance.spec };
 }
 
+function deleteOp<K extends InstanceKind>(kind: K, id: string, spec: Specs[K]): Op {
+  return kind === 'container'
+    ? { type: 'DELETE', kind: 'container', id, spec: spec as ContainerSpec }
+    : { type: 'DELETE', kind: 'network', id, spec: spec as NetworkSpec };
+}
+
 /** Emit CREATE for every not-yet-created instance in the subtree, parents first. */
 function mountSubtree(instance: Instance): void {
   const root = instance.root;
@@ -139,7 +146,7 @@ function unmountSubtree(instance: Instance): void {
   if (instance.created) {
     instance.created = false;
     instance.root.live.delete(liveKey(instance.kind, instance.id));
-    push(instance.root, { type: 'DELETE', kind: instance.kind, id: instance.id });
+    push(instance.root, deleteOp(instance.kind, instance.id, instance.spec));
   }
 }
 
@@ -233,9 +240,9 @@ export const hostConfig = {
   },
   resetAfterCommit(root: RootContainer): void {
     root.commits += 1;
-    if (root.pending.length === 0) return;
-    const batch = root.pending;
+    const batch = normalizeBatch(root.pending);
     root.pending = [];
+    if (batch.length === 0) return;
     root.sink(batch);
   },
   clearContainer(root: RootContainer): void {
@@ -278,7 +285,7 @@ export const hostConfig = {
       const changed = diffSpec('network', prev, next);
       if (changed.length === 0) return;
       instance.spec = next;
-      if (next.name !== prev.name) return rename(instance, prev.name);
+      if (next.name !== prev.name) return rename(instance, prev);
       if (instance.created)
         push(instance.root, { type: 'UPDATE', kind: 'network', id: instance.id, prev, next, changed });
       return;
@@ -295,7 +302,7 @@ export const hostConfig = {
       if (next.name !== prev.name) {
         // A fresh container starts at the current generation; no START needed.
         instance.restarts = restarts;
-        return rename(instance, prev.name);
+        return rename(instance, prev);
       }
       if (instance.created) {
         push(instance.root, { type: 'UPDATE', kind: 'container', id: instance.id, prev, next, changed });
@@ -417,11 +424,11 @@ export const hostConfig = {
  * runtime this is a different resource: tear down the old one and create
  * the new one. Children keep their own identity.
  */
-function rename(instance: Instance, previousName: string): void {
+function rename(instance: Instance, previous: ContainerSpec | NetworkSpec): void {
   if (instance.created) {
     instance.created = false;
-    instance.root.live.delete(liveKey(instance.kind, previousName));
-    push(instance.root, { type: 'DELETE', kind: instance.kind, id: previousName });
+    instance.root.live.delete(liveKey(instance.kind, previous.name));
+    push(instance.root, deleteOp(instance.kind, previous.name, previous));
   }
   instance.id = instance.spec.name;
   mountSubtree(instance);

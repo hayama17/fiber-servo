@@ -2,25 +2,30 @@
 /**
  * fiber-servo CLI.
  *
- *   fiber-servo plan app.tsx   print the ops the tree would produce, without a runtime
- *   fiber-servo up   app.tsx   run the tree on containerd until Ctrl-C
+ *   fiber-servo plan app.tsx           print the ops the tree would produce, without a runtime
+ *   fiber-servo up   app.tsx           run the tree on containerd until Ctrl-C
+ *   fiber-servo up   app.tsx --watch   ...and re-evaluate the file whenever it is saved
  *
- * `app.tsx` default-exports an element or a component.
+ * `app.tsx` default-exports an element or a component. The file is the
+ * source of truth: there is no server to apply to (see docs/decisions.md 18).
  */
-import { extname, resolve } from 'node:path';
+import { watch } from 'node:fs';
+import { basename, dirname, extname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createElement, isValidElement, type ReactNode } from 'react';
 import { formatOp } from './ops.js';
 import { containerd } from './runtime/containerd/index.js';
 import { dummy } from './runtime/dummy.js';
-import { serve } from './serve.js';
+import { serve, type Runtime } from './serve.js';
 import type { ContainerStatus } from './status.js';
 
 const USAGE = `usage:
   fiber-servo plan <app.tsx>                       print the ops, execute nothing
-  fiber-servo up   <app.tsx> [--namespace n] [--address sock] [--quiet]
+  fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
+                             [--namespace n] [--address sock] [--quiet]
 
-<app.tsx> must default-export a React element or a component.`;
+<app.tsx> must default-export a React element or a component.
+--watch re-evaluates the file on save and reconciles the difference.`;
 
 interface Args {
   command: string | undefined;
@@ -43,20 +48,45 @@ export function parseArgs(argv: readonly string[]): Args {
   return { command: positional[0], file: positional[1], flags };
 }
 
-export async function loadElement(file: string): Promise<ReactNode> {
-  if (/^\.[cm]?tsx?$/.test(extname(file))) {
+let tsxRegistered = false;
+
+/**
+ * Import the app file and return its element. `fresh` bypasses the module
+ * cache for the entry file so `--watch` sees the saved version; modules it
+ * imports stay cached, which is why an app is best kept in one file.
+ */
+export async function loadElement(file: string, fresh = false): Promise<ReactNode> {
+  if (!tsxRegistered && /^\.[cm]?tsx?$/.test(extname(file))) {
     try {
       const { register } = await import('tsx/esm/api');
       register();
+      tsxRegistered = true;
     } catch {
       throw new Error('fiber-servo: loading TypeScript needs the "tsx" package (npm install tsx)');
     }
   }
-  const mod = (await import(pathToFileURL(resolve(file)).href)) as { default?: unknown };
+  const url = pathToFileURL(resolve(file)).href + (fresh ? `?t=${Date.now()}` : '');
+  const mod = (await import(url)) as { default?: unknown };
   const exported = mod.default;
   if (isValidElement(exported)) return exported;
   if (typeof exported === 'function') return createElement(exported as () => ReactNode);
   throw new Error(`fiber-servo: ${file} must default-export a React element or a component`);
+}
+
+/** Call `onChange` after the file is saved (debounced; survives editors that save by rename). */
+export function watchFile(file: string, onChange: () => void, debounceMs = 100): () => void {
+  const abs = resolve(file);
+  const name = basename(abs);
+  let timer: NodeJS.Timeout | undefined;
+  const watcher = watch(dirname(abs), (_event, changed) => {
+    if (changed !== null && changed !== name) return;
+    clearTimeout(timer);
+    timer = setTimeout(onChange, debounceMs);
+  });
+  return () => {
+    clearTimeout(timer);
+    watcher.close();
+  };
 }
 
 function statusPrinter(log: (line: string) => void): (entries: ReadonlyMap<string, ContainerStatus>) => void {
@@ -78,6 +108,18 @@ function statusPrinter(log: (line: string) => void): (entries: ReadonlyMap<strin
   };
 }
 
+function pickRuntime(flags: Args['flags'], log: (line: string) => void): Runtime {
+  const which = flags['runtime'] ?? 'containerd';
+  if (which === 'dummy') return dummy({ log });
+  if (which === 'containerd') {
+    return containerd({
+      namespace: typeof flags['namespace'] === 'string' ? flags['namespace'] : undefined,
+      address: typeof flags['address'] === 'string' ? flags['address'] : undefined,
+    });
+  }
+  throw new Error(`fiber-servo: unknown --runtime "${String(which)}"; use containerd or dummy`);
+}
+
 export async function main(argv: readonly string[]): Promise<number> {
   const { command, file, flags } = parseArgs(argv);
   if (!command || !file || flags['help']) {
@@ -96,10 +138,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   if (command === 'up') {
     const served = serve(element, {
-      runtime: containerd({
-        namespace: typeof flags['namespace'] === 'string' ? flags['namespace'] : undefined,
-        address: typeof flags['address'] === 'string' ? flags['address'] : undefined,
-      }),
+      runtime: pickRuntime(flags, quiet ? () => {} : stamp),
       log: quiet ? () => {} : stamp,
       onError: (e) => stamp(`!! ${e.message}`),
       onOps: (ops) => {
@@ -109,8 +148,30 @@ export async function main(argv: readonly string[]): Promise<number> {
     const printStatus = statusPrinter(stamp);
     if (!quiet) served.status.subscribe(() => printStatus(served.status.entries()));
 
+    const unwatch =
+      flags['watch'] === true
+        ? watchFile(file, () => {
+            loadElement(file, true).then(
+              (next) => {
+                stamp(`reloaded ${file}`);
+                try {
+                  served.root.render(next);
+                } catch (e) {
+                  stamp(`!! ${e instanceof Error ? e.message : String(e)}`);
+                }
+              },
+              (e: unknown) =>
+                stamp(
+                  `!! ${file}: ${e instanceof Error ? e.message : String(e)} (keeping the previous tree)`,
+                ),
+            );
+          })
+        : () => {};
+    if (flags['watch'] === true) stamp(`watching ${file}`);
+
     await new Promise<void>((done) => {
       const shutdown = () => {
+        unwatch();
         stamp('stopping');
         served.stop().then(done, (e: unknown) => {
           stamp(`!! ${String(e)}`);

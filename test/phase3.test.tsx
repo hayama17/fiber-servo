@@ -428,3 +428,107 @@ describe('cli', () => {
     ]);
   });
 });
+
+describe('cli --watch', () => {
+  it('re-evaluates the file on save and reconciles only the difference', async () => {
+    const { mkdir, writeFile, rm } = await import('node:fs/promises');
+    const { spawn } = await import('node:child_process');
+    const root = new URL('..', import.meta.url).pathname;
+    // Not a dot-directory: tsconfig `include` skips those, and tsx would then compile the JSX classically.
+    const dir = `${root}test/tmp-watch`;
+    const file = `${dir}/app.tsx`;
+    const app = (replicas: number) => `
+      import { Container, Deployment } from '../../src/index.js';
+      export default () => (
+        <Deployment name="web" replicas={${replicas}}>
+          <Container image="nginx" />
+        </Deployment>
+      );
+    `;
+    await mkdir(dir, { recursive: true });
+    await writeFile(file, app(1));
+
+    const child = spawn(
+      `${root}node_modules/.bin/tsx`,
+      ['src/cli.ts', 'up', '--watch', '--runtime', 'dummy', file],
+      {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let out = '';
+    child.stdout.on('data', (d: Buffer) => (out += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (out += d.toString()));
+    const until = (pattern: string, ms = 30_000) =>
+      new Promise<void>((resolve, reject) => {
+        const start = Date.now();
+        const tick = () => {
+          if (out.includes(pattern)) return resolve();
+          if (Date.now() - start > ms) return reject(new Error(`timed out waiting for ${pattern}\n${out}`));
+          setTimeout(tick, 50);
+        };
+        tick();
+      });
+
+    try {
+      await until('CREATE container web-0');
+      await until(`watching ${file}`);
+      await writeFile(file, app(2));
+      await until('CREATE container web-1');
+      // web-0 untouched by the reload: one op line at mount, none after (the dummy runtime echoes ops too).
+      expect(out.match(/op CREATE container web-0/g)).toHaveLength(1);
+      expect(out).not.toContain('op DELETE container web-0');
+      child.kill('SIGINT');
+      await new Promise((r) => child.once('exit', r));
+      expect(out).toContain('DELETE container web-1');
+      expect(out).toContain('DELETE container web-0');
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+describe('identity is the name, not the fiber', () => {
+  it('a remount that lands on the same names is nothing, or an UPDATE where the spec changed', () => {
+    const { root, sink } = setup();
+    const tree = (image: string) => (
+      <Deployment name="web" replicas={2}>
+        <Container image={image} />
+      </Deployment>
+    );
+    // Two different component functions (a reloaded file exports a new one).
+    const A = () => tree('nginx:1');
+    const B = () => tree('nginx:1');
+    const C = () => tree('nginx:2');
+
+    root.render(<A />);
+    sink.take();
+    sink.batches.length = 0;
+
+    root.render(<B />); // React remounts: DELETE web-0, web-1 then CREATE web-0, web-1
+    expect(sink.ops).toEqual([]);
+    expect(sink.batches).toEqual([]); // not even an empty batch
+    expect(root.liveIds()).toEqual(['web-0', 'web-1']);
+
+    root.render(<C />);
+    expect(lines(sink.ops)).toEqual([
+      'UPDATE container web-0 changed=[image]',
+      'UPDATE container web-1 changed=[image]',
+    ]);
+  });
+
+  it('a rename that frees a name another instance takes in the same commit is one UPDATE', () => {
+    const { root, sink } = setup();
+    root.render(<Container name="x" image="a" />);
+    sink.take();
+    // The first fiber is reused for "y" (DELETE x, CREATE y); a new fiber takes "x" (CREATE x).
+    root.render(
+      <>
+        <Container name="y" image="a" />
+        <Container name="x" image="b" />
+      </>,
+    );
+    expect(lines(sink.ops)).toEqual(['CREATE container y image=a', 'UPDATE container x changed=[image]']);
+  });
+});

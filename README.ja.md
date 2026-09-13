@@ -70,9 +70,12 @@ Node 20 以上。実際に動かすには containerd と [nerdctl](https://githu
 CLI なら app ファイルがプログラムそのものです。
 
 ```sh
-npx fiber-servo plan app.tsx        # ops を表示するだけ。何も実行しない
-sudo npx fiber-servo up app.tsx     # containerd 上で Ctrl-C まで動かす
+npx fiber-servo plan app.tsx              # ops を表示するだけ。何も実行しない
+sudo npx fiber-servo up app.tsx           # containerd 上で Ctrl-C まで動かす
+sudo npx fiber-servo up app.tsx --watch   # 保存のたびに差分だけ反映する
 ```
+
+apply 先のサーバはありません。ファイルが正で、動いている `up` はその評価です。保存すると変わった分だけがリコンサイルされ、名前と spec が同じコンテナには触れません。理由は [docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth) にあります。
 
 コードからは `serve()` の 1 行です。
 
