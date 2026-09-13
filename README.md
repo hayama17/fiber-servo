@@ -103,9 +103,16 @@ root.status.set('web-1', 'dead'); // what a runtime's event stream would do
 With the CLI, an app file is the whole program:
 
 ```sh
-npx fiber-servo plan app.tsx        # print the ops, execute nothing
-sudo npx fiber-servo up app.tsx     # run on containerd until Ctrl-C
+npx fiber-servo plan app.tsx              # print the ops, execute nothing
+sudo npx fiber-servo up app.tsx           # run on containerd until Ctrl-C
+sudo npx fiber-servo up app.tsx --watch   # ...and apply every save as a diff
 ```
+
+There is no server to apply to: the file is the source of truth, and a
+running `up` is its evaluation. Save the file and only what changed is
+reconciled; containers that kept their name and spec are untouched. See
+[docs/decisions.md](docs/decisions.md#18-no-api-server-the-file-is-the-source-of-truth)
+for why.
 
 From code, `serve()` is the same thing in one call:
 

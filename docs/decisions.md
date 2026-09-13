@@ -216,3 +216,59 @@ are thin commands over it.
 falls out of design rule #2: the dummy runtime plays a runtime that always
 succeeds, so the full expansion (gated subtrees included) prints without
 executing anything.
+
+## 18. No API server: the file is the source of truth
+
+**Decision.** There is no server to `apply` a desired state to. The desired
+state is a program, `app.tsx`. A running `up` process evaluates it and
+reconciles containerd to the result; `--watch` re-evaluates it on save.
+Anything dynamic belongs in the program (hooks, external stores), not in a
+remote call.
+
+**Why.** Two reasons, one practical and one about the model.
+
+- _Single node._ One host, one process, one writer. An API server earns its
+  keep when several clients and several controllers must agree on one store.
+  Here there is nothing to coordinate, and a store would be a second copy of
+  the truth to keep in sync with the file.
+- _React is functional._ Kubernetes stores desired state as data and lets
+  controllers interpret it. fiber-servo stores it as a function and lets
+  React evaluate it: `containers = f(props, observations)`. A function is not
+  something you apply into a store; you run it. So the file that defines the
+  function is the only sensible truth, and a running process is an
+  evaluation of it, not a store. This is what makes
+  `replicas={useSyncExternalStore(metrics)}` possible instead of a value
+  someone must `PATCH`.
+
+**Consequences.** `kubectl apply` becomes "save the file"; the CLI is a
+GitOps-style agent for one file rather than a client of a server. There is
+no remote control, RBAC, audit log or multi-client story, and none is
+planned. Watch covers the entry file; modules it imports stay cached, so an
+app is best kept in one file, or restarted. A multi-node fiber-servo would be
+a different project that gives every node its own file.
+
+**Alternatives.** A unix-socket `apply` into the running process was
+considered. It turns the process into a second store and reopens the
+question of which copy is true.
+
+## 19. Identity is the name, not the fiber
+
+**Decision.** `resetAfterCommit` reduces a commit's ops to their net effect
+per `kind:name`. DELETE followed by CREATE of the same name becomes an UPDATE
+when the spec changed and nothing when it did not; CREATE followed by DELETE
+is dropped. `DELETE` ops carry the last spec so the comparison is possible.
+
+**Why.** React identifies subtrees by element type and key. A reloaded app
+file (`--watch`) exports a new component function, so React unmounts the old
+subtree and mounts the new one, and every container in it would be deleted
+and recreated on every save. For the runtime that is wrong: the container
+`web-0` with the same spec is the same container. Rule 3 already says the
+name is the identity; this makes the ops honour it regardless of how React
+arrived at them. Fast Refresh would preserve fiber identity instead, but it
+needs every component registered by a compiler plugin, and the ops layer is
+where identity for the runtime is decided anyway.
+
+**Consequences.** Component-level state (self-heal counters, `Ready`
+latches) does reset on a remount, because it belongs to the fiber; the
+containers do not. A remount is therefore a cheap, observable no-op at the
+runtime, and "force a recreate" needs a spec change, not a key change.

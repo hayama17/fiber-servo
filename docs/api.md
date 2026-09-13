@@ -154,7 +154,12 @@ type Op =
 ```
 
 `OpSink = (ops: readonly Op[]) => void`. Helpers: `formatOp(op)`,
-`diffSpec(kind, prev, next)`.
+`diffSpec(kind, prev, next)`, `normalizeBatch(ops)`.
+
+`DELETE` ops carry the last spec (`spec`) when the reconciler knows it. Each
+commit's batch is already reduced to its net effect per `kind:name`: a
+subtree remount that lands on the same names arrives as `UPDATE`s or
+nothing, never as `DELETE` + `CREATE`.
 
 ## Runtimes
 
@@ -183,10 +188,15 @@ See [containerd.md](containerd.md) for how the runtime behaves.
 
 ```
 fiber-servo plan <app.tsx>                       print the ops, execute nothing
-fiber-servo up   <app.tsx> [--namespace n] [--address sock] [--quiet]
+fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
+                           [--namespace n] [--address sock] [--quiet]
 ```
 
 `app.tsx` default-exports a React element or a component. `plan` runs the
 tree against `dummy()` and prints every commit, gated subtrees included.
-`up` runs it against `containerd()`, prints ops and status changes, and
-tears everything down on Ctrl-C. TypeScript files are loaded through `tsx`.
+`up` runs it against `containerd()` (or `dummy()` with `--runtime dummy`),
+prints ops and status changes, and tears everything down on Ctrl-C.
+`--watch` re-imports the file whenever it is saved and renders the result;
+React diffs it against the running tree, so only what changed produces ops.
+Only the entry file is watched; modules it imports stay cached. TypeScript
+files are loaded through `tsx`.

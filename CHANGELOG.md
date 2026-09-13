@@ -22,6 +22,11 @@ change public APIs.
 - `readiness={{ exec }}` probes: the containerd runtime runs them with
   `nerdctl exec` and marks the store `ready`; `<Ready until="ready">`;
   `status.mark()`.
+- `fiber-servo up --watch`: re-evaluate the app file on save and reconcile
+  the difference; `--runtime dummy` to try it without containerd.
+- Ops are reduced to their net effect per resource in each commit
+  (`normalizeBatch`): a subtree remount that lands on the same names is an
+  `UPDATE` or nothing, never a recreate. `DELETE` ops carry the last spec.
 
 ### Changed
 

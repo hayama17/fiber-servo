@@ -70,11 +70,15 @@ export type UpdateOp = {
   };
 }[InstanceKind];
 
-export interface DeleteOp {
-  type: 'DELETE';
-  kind: InstanceKind;
-  id: string;
-}
+export type DeleteOp = {
+  [K in InstanceKind]: {
+    type: 'DELETE';
+    kind: K;
+    id: string;
+    /** The spec the resource was last created or updated with, when known. */
+    spec?: Specs[K];
+  };
+}[InstanceKind];
 
 /**
  * Self-healing. Emitted when the tree's desired restart generation for a
@@ -119,6 +123,55 @@ export function diffSpec<K extends InstanceKind>(
   next: Specs[K],
 ): (keyof Specs[K])[] {
   return SPEC_KEYS[kind].filter((k) => !specValueEquals(prev[k], next[k]));
+}
+
+/**
+ * Reduce a commit's ops to their net effect per resource.
+ *
+ * Identity for the runtime is `kind:name`, not the fiber. When React remounts
+ * a subtree (a reloaded app file exports a new component function, a key
+ * changed) and it lands on the same names, the commit contains DELETE then
+ * CREATE for each of them. The runtime should see an UPDATE if the spec
+ * changed and nothing if it did not, exactly as if the fiber had been kept.
+ * A CREATE followed by a DELETE in the same commit never reached the runtime
+ * and is dropped as well.
+ */
+export function normalizeBatch(ops: readonly Op[]): Op[] {
+  const out: (Op | null)[] = [...ops];
+  const pendingDelete = new Map<string, number>();
+  const pendingCreate = new Map<string, number>();
+  for (let i = 0; i < out.length; i++) {
+    const op = out[i]!;
+    const key = `${op.kind}:${op.id}`;
+    if (op.type === 'DELETE') {
+      const created = pendingCreate.get(key);
+      if (created !== undefined) {
+        out[created] = null;
+        out[i] = null;
+        pendingCreate.delete(key);
+        continue;
+      }
+      pendingDelete.set(key, i);
+      continue;
+    }
+    if (op.type === 'CREATE') {
+      const deleted = pendingDelete.get(key);
+      if (deleted === undefined) {
+        pendingCreate.set(key, i);
+        continue;
+      }
+      pendingDelete.delete(key);
+      const prev = (out[deleted] as DeleteOp).spec;
+      out[deleted] = null;
+      if (prev === undefined) continue; // nothing to compare against: keep the CREATE
+      const changed = diffSpec(op.kind, prev as never, op.spec as never);
+      out[i] =
+        changed.length === 0
+          ? null
+          : ({ type: 'UPDATE', kind: op.kind, id: op.id, prev, next: op.spec, changed } as UpdateOp);
+    }
+  }
+  return out.filter((op): op is Op => op !== null);
 }
 
 /** One-line rendering used by the dummy runtime and by test failure messages. */

@@ -137,7 +137,14 @@ gates on `ready`; the containerd runtime's prober runs the probe with
 starts its watcher, renders, and gives back `stop()`. The `fiber-servo` CLI
 is two commands over it: `plan` uses the dummy runtime, which reports every
 `CREATE` as running and ready, so the full expansion prints without a
-runtime; `up` uses containerd.
+runtime; `up` uses containerd. There is no API server: the app file is the
+source of truth and `up --watch` re-evaluates it on save (decision 18).
+
+A reloaded file exports a new component function, so React remounts the
+subtree: DELETE then CREATE for every name in it. `resetAfterCommit` reduces
+each commit to its net effect per `kind:name` before handing it to the sink
+(`normalizeBatch`), so the runtime sees an `UPDATE` where the spec changed
+and nothing where it did not (decision 19).
 
 ## Scheduling
 
