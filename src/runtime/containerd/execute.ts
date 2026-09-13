@@ -9,7 +9,7 @@
  * event watcher, not from here.
  */
 import { createHash } from 'node:crypto';
-import type { ContainerSpec, Op, OpSink } from '../../ops.js';
+import type { ContainerSpec, NetworkSpec, Op, OpSink } from '../../ops.js';
 import type { StatusStore } from '../../status.js';
 import { MANAGED_LABEL, SPEC_LABEL, type ExecResult, type Nerdctl } from './nerdctl.js';
 
@@ -33,8 +33,8 @@ export interface ContainerdRuntime {
   idle(): Promise<void>;
 }
 
-/** Stable digest of a spec; stored as a label so CREATE can recognise a container it already made. */
-export function specDigest(spec: ContainerSpec): string {
+/** Stable digest of a spec; stored as a label so CREATE can recognise a resource it already made. */
+export function specDigest(spec: ContainerSpec | NetworkSpec): string {
   return createHash('sha256').update(canonical(spec)).digest('hex').slice(0, 32);
 }
 
@@ -51,8 +51,8 @@ function canonical(value: unknown): string {
 
 /**
  * argv for `nerdctl run` from a spec. Restarts are ours, so `--restart=no`.
- * `ports` are container-side metadata until networking (phase 2) decides
- * how they are published; they still take part in the digest.
+ * `ports` are container-side metadata until a Service decides how they are
+ * published; they still take part in the digest.
  */
 export function runArgs(spec: ContainerSpec): string[] {
   const args = [
@@ -67,9 +67,19 @@ export function runArgs(spec: ContainerSpec): string[] {
     '--label',
     `${SPEC_LABEL}=${specDigest(spec)}`,
   ];
+  if (spec.network) args.push('--network', spec.network);
   for (const [k, v] of Object.entries(spec.env ?? {})) args.push('-e', `${k}=${v}`);
   for (const [k, v] of Object.entries(spec.labels ?? {})) args.push('--label', `${k}=${v}`);
   args.push(spec.image, ...(spec.command ?? []));
+  return args;
+}
+
+/** argv for `nerdctl network create` from a spec. */
+export function networkCreateArgs(spec: NetworkSpec): string[] {
+  const args = ['network', 'create', '--label', `${MANAGED_LABEL}=true`, '--label', `${SPEC_LABEL}=${specDigest(spec)}`];
+  if (spec.subnet) args.push('--subnet', spec.subnet);
+  for (const [k, v] of Object.entries(spec.labels ?? {})) args.push('--label', `${k}=${v}`);
+  args.push(spec.name);
   return args;
 }
 
@@ -93,6 +103,8 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
   function fail(res: ExecResult, what: string): Error {
     return new Error(`nerdctl ${what} failed (exit ${res.code}): ${res.stderr.trim() || res.stdout.trim()}`);
   }
+
+  // ---- containers ---------------------------------------------------------
 
   async function inspect(name: string): Promise<Inspected | null> {
     const res = await call([
@@ -143,7 +155,40 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
     throw fail(res, `start ${name}`);
   }
 
+  // ---- networks -----------------------------------------------------------
+
+  async function createNetwork(spec: NetworkSpec): Promise<void> {
+    const existing = await call(['network', 'inspect', '--format', `{{index .Labels "${SPEC_LABEL}"}}`, spec.name]);
+    if (existing.code === 0) {
+      const digest = existing.stdout.trim();
+      if (digest === specDigest(spec)) return; // adopt
+      if (digest === '') return; // pre-existing, not ours: use it as is
+      throw new Error(
+        `nerdctl network ${spec.name} exists with a different spec; networks are immutable, remove it or rename`,
+      );
+    }
+    const res = await call(networkCreateArgs(spec));
+    if (res.code !== 0) throw fail(res, `network create ${spec.name}`);
+  }
+
+  async function removeNetwork(name: string): Promise<void> {
+    const res = await call(['network', 'rm', name]);
+    if (res.code !== 0 && !/no such|not found/i.test(res.stderr)) throw fail(res, `network rm ${name}`);
+  }
+
+  // ---- dispatch -----------------------------------------------------------
+
   async function execute(op: Op): Promise<void> {
+    if (op.kind === 'network') {
+      switch (op.type) {
+        case 'CREATE':
+          return createNetwork(op.spec);
+        case 'DELETE':
+          return removeNetwork(op.id);
+        case 'UPDATE':
+          throw new Error(`network ${op.id}: [${op.changed.join(',')}] changed but networks are immutable; rename it`);
+      }
+    }
     switch (op.type) {
       case 'CREATE':
         return create(op.spec);
@@ -168,7 +213,7 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Cont
       } catch (e) {
         const error = e instanceof Error ? e : new Error(String(e));
         onError(error, op);
-        if (op.type === 'CREATE' || op.type === 'START' || op.type === 'UPDATE') {
+        if (op.kind === 'container' && op.type !== 'DELETE') {
           status?.set(op.id, 'dead', { reason: error.message });
         }
       }

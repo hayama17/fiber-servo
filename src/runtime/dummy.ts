@@ -27,6 +27,7 @@ export function createDummyRuntime(options: DummyRuntimeOptions | ((line: string
     for (const op of ops) log(`   ${formatOp(op)}`);
     if (!status) return;
     for (const op of ops) {
+      if (op.kind !== 'container') continue; // networks have no status
       switch (op.type) {
         case 'CREATE':
         case 'START':

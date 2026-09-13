@@ -3,7 +3,7 @@ import Reconciler from 'react-reconciler';
 import { ConcurrentRoot } from 'react-reconciler/constants';
 import { StatusContext } from './hooks.js';
 import { createRootContainer, typedHostConfig, type RootContainer } from './hostConfig.js';
-import type { Op, OpSink } from './ops.js';
+import type { InstanceKind, Op, OpSink } from './ops.js';
 import { createStatusStore, type StatusStore } from './status.js';
 
 const reconciler = Reconciler(typedHostConfig);
@@ -20,10 +20,16 @@ export interface Root {
    * to have them committed right now, e.g. in tests with fake timers.
    */
   flush(): void;
+  /**
+   * Resolve once React has nothing left to commit. Unlike `flush()`, this
+   * also waits for work that goes through the Scheduler (a Suspense retry
+   * after `useReady` settles), which cannot be flushed synchronously.
+   */
+  settle(): Promise<void>;
   /** Tear the tree down: emits DELETE for every live container. */
   unmount(): void;
-  /** Ids of containers that currently have a CREATE outstanding, in tree order. */
-  liveIds(): string[];
+  /** Ids of resources of `kind` (default containers) that currently have a CREATE outstanding, in creation order. */
+  liveIds(kind?: InstanceKind): string[];
   /** The status store this tree reads from. Runtimes and tests write to it. */
   readonly status: StatusStore;
 }
@@ -82,17 +88,30 @@ export function createRoot(options: CreateRootOptions = {}): Root {
     flush();
   }
 
+  async function settle(): Promise<void> {
+    // Give the Scheduler (setImmediate in Node) a macrotask, flush, and stop
+    // once two consecutive rounds committed nothing.
+    let quiet = 0;
+    for (let i = 0; i < 100 && quiet < 2; i++) {
+      const before = container.commits;
+      await new Promise<void>((r) => setImmediate(r));
+      flush();
+      quiet = container.commits === before ? quiet + 1 : 0;
+    }
+  }
+
   return {
     status,
     render(element) {
       update(element);
     },
     flush,
+    settle,
     unmount() {
       update(null);
     },
-    liveIds() {
-      return [...container.live.keys()];
+    liveIds(kind = 'container') {
+      return [...container.live.values()].filter((i) => i.kind === kind).map((i) => i.id);
     },
   };
 }

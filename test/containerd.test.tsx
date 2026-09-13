@@ -6,6 +6,7 @@ import {
   createRoot,
   createStatusStore,
   interpretEvent,
+  networkCreateArgs,
   parsePsLine,
   parsePsStatus,
   runArgs,
@@ -171,6 +172,57 @@ describe('containerd runtime: ops -> nerdctl argv', () => {
     expect(order.map((c) => c.split(' ').slice(0, 2).join(' '))).toEqual([
       'inspect --format', 'run -d', 'rm -f', 'inspect --format', 'run -d',
     ]);
+  });
+});
+
+describe('containerd runtime: networks', () => {
+  it('networkCreateArgs labels the network and passes the subnet', () => {
+    const spec = { name: 'app', subnet: '10.9.0.0/24', labels: { tier: 'x' } };
+    expect(networkCreateArgs(spec)).toEqual([
+      'network', 'create',
+      '--label', 'react4c.managed=true',
+      '--label', `react4c.spec=${specDigest(spec)}`,
+      '--subnet', '10.9.0.0/24',
+      '--label', 'tier=x',
+      'app',
+    ]);
+  });
+
+  it('runArgs attaches to the network named in the spec', () => {
+    expect(runArgs({ name: 'a', image: 'x', network: 'app' })).toContain('--network');
+    expect(runArgs({ name: 'a', image: 'x' })).not.toContain('--network');
+  });
+
+  it('CREATE network creates when missing, adopts ours, uses a foreign one as is, refuses a different spec of ours', async () => {
+    const spec = { name: 'app' };
+    const run = async (inspect: ExecResult) => {
+      const errors: string[] = [];
+      const { nerdctl, calls } = fakeNerdctl({ network: (args) => (args[1] === 'inspect' ? inspect : ok()) });
+      const runtime = createContainerdRuntime({ nerdctl, onError: (e) => errors.push(e.message) });
+      runtime.sink([{ type: 'CREATE', kind: 'network', id: 'app', spec }]);
+      await runtime.idle();
+      return { calls: calls.map((c) => c.split(' ').slice(0, 2).join(' ')), errors };
+    };
+
+    expect(await run(fail('no such network'))).toEqual({ calls: ['network inspect', 'network create'], errors: [] });
+    expect(await run(ok(`${specDigest(spec)}\n`))).toEqual({ calls: ['network inspect'], errors: [] });
+    expect(await run(ok('\n'))).toEqual({ calls: ['network inspect'], errors: [] });
+    const refused = await run(ok('other-digest\n'));
+    expect(refused.calls).toEqual(['network inspect']);
+    expect(refused.errors[0]).toMatch(/immutable/);
+  });
+
+  it('DELETE network is network rm; a network UPDATE is reported, not executed', async () => {
+    const errors: string[] = [];
+    const { nerdctl, calls } = fakeNerdctl();
+    const runtime = createContainerdRuntime({ nerdctl, onError: (e) => errors.push(e.message) });
+    runtime.sink([
+      { type: 'UPDATE', kind: 'network', id: 'app', prev: { name: 'app' }, next: { name: 'app', subnet: '10.0.0.0/24' }, changed: ['subnet'] },
+      { type: 'DELETE', kind: 'network', id: 'app' },
+    ]);
+    await runtime.idle();
+    expect(calls).toEqual(['network rm app']);
+    expect(errors).toEqual([expect.stringMatching(/network app: \[subnet\] changed/)]);
   });
 });
 
