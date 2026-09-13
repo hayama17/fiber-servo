@@ -5,7 +5,7 @@
  *   npx fiber-servo plan examples/app.tsx   # see the ops, run nothing
  *   sudo npx fiber-servo up examples/app.tsx  # run it on containerd
  */
-import { Container, Deployment, Network } from 'fiber-servo';
+import { Container, Deployment, Network } from '../src/index.js';
 
 export default function App() {
   return (
