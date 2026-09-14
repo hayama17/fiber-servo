@@ -114,6 +114,9 @@ it lets the tree retry with backoff instead of stalling.
 
 ## 9. nerdctl, not gRPC
 
+**Amended by decision 29.** The conclusion held for writes and did not hold
+for reads: the two halves are now split.
+
 **Decision.** Drive containerd through the nerdctl CLI behind a two-method
 interface (`exec`, `stream`).
 
@@ -470,3 +473,53 @@ property that scaling 3 to 5 touches only the two new Pods.
 the same ones and adopts its own Pods. A trivial template edit (reordering
 env keys is normalised away, but a whitespace change in a command is not)
 triggers a rollout, which is the honest reading of "the template changed".
+
+## 29. Writes through nerdctl, reads through containerd's API
+
+**Decision.** Mutations (`run`, `rm`, `update`, `network create/rm`) keep
+going through the nerdctl CLI. State is read from containerd's own gRPC API —
+`Containers`, `Tasks` and `Events` — with its `.proto` files vendored into the
+repo. Networks are read from CNI configuration files, because containerd has
+no notion of one.
+
+**Why.** Decision 9 weighed gRPC against nerdctl as a single choice and
+answered for the whole adapter. That was one question too few: the two halves
+have almost nothing in common.
+
+Writing genuinely needs what nerdctl brings. Creating a container means
+resolving and unpacking an image, generating an OCI runtime spec, attaching
+CNI, and programming published ports. Reimplementing that is a project in
+itself, and it is not this project.
+
+Reading needs none of it, and pays for the CLI three times over:
+
+- _Wording is a contract nobody agreed to._ `nerdctl inspect --format` answers
+  with a string, and "does this error mean it is already gone" is a guess
+  about phrasing. `removeNetwork` shipped broken for exactly this reason: the
+  test fake answered `no such network`, a string nerdctl never emits, so the
+  suite passed and the adapter threw against the first real daemon it met. A
+  field is not open to interpretation.
+- _A process per read._ `Containers.List` measures about 20ms against the
+  local socket; forking nerdctl costs several times that, and a reconcile pass
+  reads once per Pod.
+- _Events arrive typed._ `Events.Subscribe` delivers a container id and an
+  exit status in fields, replacing a line-oriented parse of `nerdctl events`
+  output — the most fragile code in the old adapter.
+
+**Consequences.** Three runtime dependencies (`@grpc/grpc-js`,
+`@grpc/proto-loader`, `protobufjs`) and 88K of vendored Apache-2.0 `.proto`
+files. They are vendored rather than fetched because they are the wire
+contract state is decoded through, and an `npm install` should not be able to
+change that quietly; `tsc` does not copy them, so the build carries them into
+`dist` explicitly.
+
+The adapter now talks to containerd two ways at once, which is a real cost in
+comprehension, paid for by never parsing a sentence again.
+
+**The one exception.** A Pod's IP address is a CNI result, not containerd
+state, so it is still read with `nerdctl inspect`. It is the only surviving
+read, and it is marked as such in the code.
+
+**Scope.** `Images`, `Snapshots` and everything else containerd exposes stay
+unused; only the three services actually read are vendored. Writing over gRPC
+remains out of scope, and decision 9's reasoning for that is unchanged.
