@@ -30,12 +30,12 @@ Networks have no children — a Network does not own the Pods on it.
 </Pod>
 ```
 
-| Prop | | |
-| --- | --- | --- |
-| `name` | `string?` | Identity. Required at the top level; omitted inside a `<ReplicaSet>` or `<Deployment>`, which name their copies. |
-| `network` | `string?` | Network to attach the sandbox to. |
-| `labels` | `Record<string,string>?` | What a `<Service>` selector matches. |
-| `publish` | `PortMapping[]?` | Host ports. Belong to the sandbox, not to a container. Do not set these on a replicated Pod — several replicas cannot share a host port. |
+| Prop      |                          |                                                                                                                                          |
+| --------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`    | `string?`                | Identity. Required at the top level; omitted inside a `<ReplicaSet>` or `<Deployment>`, which name their copies.                         |
+| `network` | `string?`                | Network to attach the sandbox to.                                                                                                        |
+| `labels`  | `Record<string,string>?` | What a `<Service>` selector matches.                                                                                                     |
+| `publish` | `PortMapping[]?`         | Host ports. Belong to the sandbox, not to a container. Do not set these on a replicated Pod — several replicas cannot share a host port. |
 
 Every Pod prop defines the sandbox and is therefore immutable: changing one
 replaces the Pod.
@@ -91,8 +91,7 @@ editing the template creates a new ReplicaSet and shifts replicas to it within
 ### `<Service>`
 
 ```tsx
-<Service name="api" network="backend" selector={{ app: 'api' }}
-         port={80} targetPort={8080} publish={8080} />
+<Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
 ```
 
 One address in front of whichever Pods currently match `selector`. The backend
@@ -123,14 +122,14 @@ const served = serve(<App />, {
 });
 ```
 
-| Option | | |
-| --- | --- | --- |
-| `runtime` | `RuntimeFactory` | `containerd()` or `memory()`. |
-| `observed` | `ObservedStore?` | Bring your own; one is created otherwise. |
-| `restart` | `RestartPolicy?` | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
-| `onDesired` | `(d: DesiredState) => void` | Every snapshot React commits. |
-| `onActions` | `(a: readonly Action[]) => void` | Every reconcile's actions. |
-| `log`, `onError`, `now` | | |
+| Option                  |                                  |                                                                                                             |
+| ----------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `runtime`               | `RuntimeFactory`                 | `containerd()` or `memory()`.                                                                               |
+| `observed`              | `ObservedStore?`                 | Bring your own; one is created otherwise.                                                                   |
+| `restart`               | `RestartPolicy?`                 | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
+| `onDesired`             | `(d: DesiredState) => void`      | Every snapshot React commits.                                                                               |
+| `onActions`             | `(a: readonly Action[]) => void` | Every reconcile's actions.                                                                                  |
+| `log`, `onError`, `now` |                                  |                                                                                                             |
 
 Returns:
 
@@ -138,9 +137,9 @@ Returns:
 interface Served {
   root: Root;
   observed: ObservedStore;
-  reconcile(): Promise<void>;  // force one pass
-  idle(): Promise<void>;       // wait for queued work
-  stop(): Promise<void>;       // unmount, reconcile it away, stop watching
+  reconcile(): Promise<void>; // force one pass
+  idle(): Promise<void>; // wait for queued work
+  stop(): Promise<void>; // unmount, reconcile it away, stop watching
 }
 ```
 
@@ -169,8 +168,8 @@ served.observed.subscribe(() => { … });
 In components:
 
 ```tsx
-const pod = usePod('db');            // ObservedPod | undefined
-useReady('db', 'ready');             // suspend until up (needs a <Suspense>)
+const pod = usePod('db'); // ObservedPod | undefined
+useReady('db', 'ready'); // suspend until up (needs a <Suspense>)
 ```
 
 ## Controllers and planner
@@ -178,29 +177,29 @@ useReady('db', 'ready');             // suspend until up (needs a <Suspense>)
 Both are pure functions, callable directly:
 
 ```ts
-runControllers(desired, observed);            // → { networks, pods }
-expandDeployment(spec, observed);             // → ReplicaSetSpec[]
-expandReplicaSet(spec, observed);             // → PodSpec[]
-serviceEndpoints(spec, observed);             // → Endpoint[]
+runControllers(desired, observed); // → { networks, pods }
+expandDeployment(spec, observed); // → ReplicaSetSpec[]
+expandReplicaSet(spec, observed); // → PodSpec[]
+serviceEndpoints(spec, observed); // → Endpoint[]
 
-planAll({ networks, pods }, observed);        // → Action[]
-planPod(desiredPod, observedPod);             // → Action[]
-formatAction(action);                         // → "replace-pod api-0 because [image]"
+planAll({ networks, pods }, observed); // → Action[]
+planPod(desiredPod, observedPod); // → Action[]
+formatAction(action); // → "replace-pod api-0 because [image]"
 ```
 
 ## Runtimes
 
 ```ts
-containerd({ namespace: 'default', address: '/run/containerd/containerd.sock' })
-memory({ autoStart: true, autoReady: true })
+containerd({ namespace: 'default', address: '/run/containerd/containerd.sock' });
+memory({ autoStart: true, autoReady: true });
 ```
 
 `createMemoryRuntime()` additionally gives you a test handle:
 
 ```ts
 const runtime = createMemoryRuntime();
-runtime.calls;                  // readable trace of every call
-runtime.kill('api-1');          // make a Pod die behind the control plane's back
+runtime.calls; // readable trace of every call
+runtime.kill('api-1'); // make a Pod die behind the control plane's back
 runtime.markReady('db', 'postgres');
 ```
 

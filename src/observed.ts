@@ -75,6 +75,12 @@ export function applyRuntimeEvent(store: ObservedStore, event: RuntimeEvent): vo
     case 'container':
       store.patchContainer(event.pod, event.container.name, event.container);
       break;
+    case 'network':
+      store.setNetwork(event.network);
+      break;
+    case 'network-removed':
+      store.removeNetwork(event.name);
+      break;
     case 'resync':
       store.reset(event.state);
       break;

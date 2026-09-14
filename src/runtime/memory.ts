@@ -199,8 +199,10 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
       // hold. Throwing here would turn every restart into a conflict instead
       // of a no-op, which is exactly the crash-recovery case this guards.
       if (networks.has(spec.name)) return;
-      networks.set(spec.name, { name: spec.name, subnet: spec.subnet });
+      const network = { name: spec.name, subnet: spec.subnet };
+      networks.set(spec.name, network);
       revision += 1;
+      notify({ type: 'network', network });
     },
 
     async removeNetwork(name: string): Promise<void> {
@@ -208,6 +210,7 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
       if (!networks.has(name)) return; // idempotent: already gone
       networks.delete(name);
       revision += 1;
+      notify({ type: 'network-removed', name });
     },
 
     async createPod(spec: PodSpec): Promise<void> {
@@ -248,7 +251,11 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
       target.containers.set(spec.name, buildContainer(pod, spec));
       target.spec = { ...target.spec, containers: [...target.spec.containers, spec] };
       revision += 1;
-      notify({ type: 'container', pod, container: toObservedContainer(target.containers.get(spec.name)!) });
+      // A whole-Pod event, not just a container one: this changed the Pod's
+      // recorded spec, and a container event does not carry that. Announcing
+      // only the container would leave the control plane comparing against a
+      // stale record and deciding to make the same change again, for ever.
+      notify({ type: 'pod', pod: toObservedPod(target) });
     },
 
     async removeContainer(pod: string, name: string): Promise<void> {
@@ -279,10 +286,12 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
         containers: owner.spec.containers.map((s) => (s.name === container ? { ...s, resources } : s)),
       };
       revision += 1;
-      // Nothing observable changes -- resources are not part of
-      // `ObservedContainer` -- but a mutation happened, so subscribers still
-      // hear about it, the same as a real runtime firing an "update" event.
-      notify({ type: 'container', pod, container: toObservedContainer(c) });
+      // `ObservedContainer` has no `resources` field, so nothing *observable*
+      // about the container changed — but the Pod's recorded spec did, and
+      // that is what the planner compares against. Emitting a container event
+      // here would leave the record stale and the planner would reissue this
+      // same update on every pass.
+      notify({ type: 'pod', pod: toObservedPod(owner) });
     },
 
     async inspect(): Promise<ObservedState> {

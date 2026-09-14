@@ -27,3 +27,4 @@ jobs:
           npm run example
           npm run example:replicaset
           npm run example:webapp
+          npm run example:plan

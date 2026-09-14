@@ -12,14 +12,7 @@
  *
  * Run it with `npm run example:replicaset`.
  */
-import {
-  Container,
-  Pod,
-  ReplicaSet,
-  createMemoryRuntime,
-  formatAction,
-  serve,
-} from '../src/index.js';
+import { Container, Pod, ReplicaSet, createMemoryRuntime, formatAction, serve } from '../src/index.js';
 
 const runtime = createMemoryRuntime();
 

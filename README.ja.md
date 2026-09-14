@@ -17,7 +17,14 @@ serve(
       </Pod>
     </ReplicaSet>
 
-    <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+    <Service
+      name="api"
+      network="backend"
+      selector={{ app: 'api' }}
+      port={80}
+      targetPort={8080}
+      publish={8080}
+    />
   </>,
   { runtime: containerd() },
 );
@@ -59,9 +66,9 @@ bringing up three replicas:
   -> api-0:running api-1:running api-2:running
   React commits so far: 1
 
-killing api-1 behind the control plane's back:
+killing api-1 behind the control plane’s back:
   replace-pod api-1 because [phase]
-  -> api-0:running api-1:running api-2:running
+  -> api-0:running api-2:running api-1:running
   React commits caused by the failure: 0 (the tree never changed)
 ```
 
@@ -132,15 +139,15 @@ Deployment
 
 ReplicaSet を `<Network>` の中に入れるのは正しくありません——Network は、そこに接続する Pod を所有していないからです。
 
-| コンポーネント | 意味 |
-| --- | --- |
-| `<Network>` | ローカルブリッジネットワーク。 |
-| `<Pod>` | 実行サンドボックス。ネットワーク名前空間と1つ以上のコンテナ。 |
-| `<Container>` | Pod 内の1プロセスとルートファイルシステム。 |
-| `<ReplicaSet>` | 「このテンプレートの Pod を N 個保つ」。 |
-| `<Deployment>` | ReplicaSet 上のロールアウト方針。 |
-| `<Service>` | セレクタに一致する Pod 群の前に立つ安定したエンドポイント。 |
-| `<Ready>` | 順序付け。Pod が起動するまで中身を宣言しない。 |
+| コンポーネント | 意味                                                          |
+| -------------- | ------------------------------------------------------------- |
+| `<Network>`    | ローカルブリッジネットワーク。                                |
+| `<Pod>`        | 実行サンドボックス。ネットワーク名前空間と1つ以上のコンテナ。 |
+| `<Container>`  | Pod 内の1プロセスとルートファイルシステム。                   |
+| `<ReplicaSet>` | 「このテンプレートの Pod を N 個保つ」。                      |
+| `<Deployment>` | ReplicaSet 上のロールアウト方針。                             |
+| `<Service>`    | セレクタに一致する Pod 群の前に立つ安定したエンドポイント。   |
+| `<Ready>`      | 順序付け。Pod が起動するまで中身を宣言しない。                |
 
 ### Pod
 

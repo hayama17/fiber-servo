@@ -132,6 +132,8 @@ export type RuntimeEvent =
   | { type: 'pod'; pod: ObservedPod }
   | { type: 'pod-removed'; name: string }
   | { type: 'container'; pod: string; container: ObservedContainer }
+  | { type: 'network'; network: ObservedNetwork }
+  | { type: 'network-removed'; name: string }
   | { type: 'resync'; state: Pick<ObservedState, 'pods' | 'networks'> };
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;

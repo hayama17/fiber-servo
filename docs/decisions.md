@@ -339,7 +339,7 @@ collapsing delete-then-create back into an update, a `rename` path. Every one
 of those was React compensating for not being able to see the host.
 
 A snapshot makes the question go away. React states what should exist; the
-control loop, which *can* see observed state, works out the difference. All
+control loop, which _can_ see observed state, works out the difference. All
 the repair machinery deleted itself.
 
 **Consequences.** Re-serialising the tree on every commit is O(tree) where the op
@@ -362,7 +362,7 @@ restarts and what the runtime had actually done — and keeping them agreeing
 was work with no upside.
 
 Under `<ReplicaSet replicas={3}>` the point is sharper: after a Pod dies the
-JSX still says 3, and it is still *correct*. There is genuinely nothing for
+JSX still says 3, and it is still _correct_. There is genuinely nothing for
 React to re-render.
 
 **Consequences.** Replacing a dead Pod costs zero React renders, which
@@ -391,7 +391,7 @@ not offered at all.
 **Decision.** JSX nesting means ownership only. A Pod joins a Network with
 `network="backend"` and a Service finds Pods with `selector={{...}}`.
 
-**Why.** Decision 14 made nesting mean membership *and* dependency, which read
+**Why.** Decision 14 made nesting mean membership _and_ dependency, which read
 well until the graph stopped being a tree. A Pod owned by a ReplicaSet cannot
 also be nested inside its Network, so one of the two relationships had to
 become a reference anyway — and choosing by which is structurally an
@@ -416,14 +416,21 @@ was wrong exactly when it mattered.
 which is better than a proxy answering with 502. Control plane and data plane
 are separable: replacing the caddy Pod with nftables changes one function.
 
+The endpoint set is part of the proxy container's command, so every change to
+it is a `replace-container` — visible as churn while replicas are still coming
+up one by one. That is the immutability model behaving exactly as specified
+rather than a bug, but it is also the clearest argument for a data plane that
+can be reconfigured instead of recreated, and it is where the next Service
+implementation should start.
+
 ## 26. The adapter records the spec it created from
 
 **Decision.** `ObservedPod` carries `spec` (and `specDigest`), written into a
 label by the adapter and read back by `inspect()`.
 
 **Why.** Observation tells you what is running, not what was asked for. Given
-only a live Pod and a desired spec you can tell *that* they differ but not
-*which field* — and the whole immutability model turns on that distinction,
+only a live Pod and a desired spec you can tell _that_ they differ but not
+_which field_ — and the whole immutability model turns on that distinction,
 because a cpu change is an in-place update and an image change is a
 replacement. Keeping the answer in the process would lose it on restart, so it
 lives on the resource, which is also what makes adopting existing containers

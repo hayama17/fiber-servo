@@ -32,10 +32,31 @@ export interface NerdctlOptions {
   address?: string;
 }
 
-/** Label that marks containers this reconciler owns. */
+/** Label that marks every resource this reconciler owns (sandboxes, members, networks alike). */
 export const MANAGED_LABEL = 'fiber-servo.managed';
-/** Label carrying `specDigest()` of the spec the container was created from. */
+/** Label carrying `digest()` of the spec a resource was created from (decision 10: adoption by spec digest). */
 export const SPEC_LABEL = 'fiber-servo.spec';
+/**
+ * Which Pod a container belongs to. Set on the sandbox *and* every member, so
+ * both are one `ps --filter label=fiber-servo.pod=<name>` away from either
+ * other -- this is how `inspect()` and `removePod` find "everything that
+ * makes up this Pod" without keeping their own membership list.
+ */
+export const POD_LABEL = 'fiber-servo.pod';
+/** A member's name *within* its Pod. Absent on the sandbox, which has no such name. */
+export const CONTAINER_LABEL = 'fiber-servo.container';
+/** `infra` for the sandbox container, `member` for everything else. */
+export const ROLE_LABEL = 'fiber-servo.role';
+/**
+ * The resource's own spec -- `PodSpec` on the sandbox, `ContainerSpec` on a
+ * member -- percent-encoded JSON (escaping survives `nerdctl ps`'s
+ * comma-joined `Labels` column, which a raw JSON object would not). This is
+ * how `ObservedPod.spec` and the readiness prober's schedule both survive a
+ * fiber-servo restart: neither exists anywhere else in containerd. See the
+ * "recorded spec" section in `runtime.ts` for why resources are *not* read
+ * from this label even though `ContainerSpec.resources` is JSON inside it.
+ */
+export const SPEC_JSON_LABEL = 'fiber-servo.spec-json';
 
 export function createNerdctl(options: NerdctlOptions = {}): Nerdctl {
   const bin = options.bin ?? 'nerdctl';

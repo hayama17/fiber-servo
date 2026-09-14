@@ -65,6 +65,14 @@ export function backoffDelay(consecutive: number, policy: ResolvedPolicy): numbe
   return Math.min(policy.baseDelayMs * policy.factor ** consecutive, policy.maxDelayMs);
 }
 
+/**
+ * How many times the control loop will reconcile an identical plan before
+ * concluding it is not converging. Generous enough that no honest rollout
+ * reaches it, small enough that a bug costs a few operations rather than a
+ * pegged CPU.
+ */
+const MAX_IDENTICAL_PASSES = 20;
+
 interface RestartRecord {
   consecutive: number;
   /** Earliest time the next replacement of this Pod may happen. */
@@ -156,6 +164,10 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   let running: Promise<void> | null = null;
   let again = false;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Loop-guard state; see `wedged` below.
+  let lastPlan = '';
+  let repeats = 0;
+  let stalled = false;
 
   /**
    * Serialise reconciles and coalesce requests. A burst of runtime events
@@ -164,12 +176,23 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
    * indistinguishable from one that has not been requested yet.
    */
   function request(): Promise<void> {
-    if (stopped) return Promise.resolve();
+    if (stopped || stalled) return Promise.resolve();
     if (running !== null) {
       again = true;
       return running;
     }
-    running = pass()
+    // Start the pass on a microtask rather than calling it here.
+    //
+    // `pass()` runs synchronously until its first await, and the first thing
+    // it awaits is a runtime call — which, for an in-process adapter, notifies
+    // its subscribers synchronously. That notification calls `request()` again
+    // while `running` is still null, because the assignment below has not
+    // happened yet, and a second pass starts on top of the first. Two passes
+    // reading the same stale snapshot then both decide to create the same Pod.
+    // Deferring by one microtask means `running` is set before any of that can
+    // happen, so the guard above actually guards.
+    running = Promise.resolve()
+      .then(pass)
       .catch((error: unknown) => onError(error instanceof Error ? error : new Error(String(error))))
       .then(() => {
         running = null;
@@ -227,11 +250,48 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       if (pod.phase === 'running') gate.observeHealthy(pod.name, pod.at);
     }
 
+    if (wedged(actions)) return;
+
     options.onActions?.(actions);
     for (const action of actions) {
       log(formatAction(action));
       await execute(action);
     }
+  }
+
+  /**
+   * Stop a loop that is not getting anywhere.
+   *
+   * Executing an action changes observed state, which schedules another pass —
+   * which is exactly right while each pass makes progress. But if an action
+   * fails to change what the next pass compares against (an adapter that
+   * mutates a resource without reporting the new spec, say), the same plan
+   * comes back for ever and the loop hammers the runtime as fast as it can.
+   *
+   * A rollout legitimately runs many passes in a row, so "many passes" is not
+   * the signal. *Identical* plans are: a pass that proposes exactly what the
+   * last one proposed, repeatedly, is by definition not converging. Report it
+   * once and stand down until the desired state changes, rather than burning
+   * the machine on a bug.
+   */
+  function wedged(actions: readonly Action[]): boolean {
+    if (actions.length === 0) {
+      repeats = 0;
+      lastPlan = '';
+      return false;
+    }
+    const plan = actions.map(formatAction).join('\n');
+    repeats = plan === lastPlan ? repeats + 1 : 0;
+    lastPlan = plan;
+    if (repeats < MAX_IDENTICAL_PASSES) return false;
+    stalled = true;
+    onError(
+      new Error(
+        `fiber-servo: the same plan has been reconciled ${repeats} times without converging, so it has ` +
+          `been stopped. This means an action is not changing what the next pass observes. Plan:\n${plan}`,
+      ),
+    );
+    return true;
   }
 
   async function execute(action: Action): Promise<void> {
@@ -277,6 +337,11 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     observed,
     onCommit: (next) => {
       desired = next;
+      // A new desired state is new information, so a stalled loop gets another
+      // chance: whatever the operator just changed may well be the fix.
+      stalled = false;
+      repeats = 0;
+      lastPlan = '';
       options.onDesired?.(next);
       void request();
     },

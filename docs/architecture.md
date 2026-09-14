@@ -46,7 +46,7 @@ actual  = 2   <- changed.
 ```
 
 Nothing React can see is different. To make React notice, you would have to
-invent a prop — a restart generation, a nonce — and change it *because* a Pod
+invent a prop — a restart generation, a nonce — and change it _because_ a Pod
 died. That prop is a lie: it encodes an observation as if it were an intention,
 and once you have it you have two sources of truth about the same fact.
 
@@ -56,7 +56,7 @@ times. `examples/replicaset.tsx` prints the render count so you can watch this
 happen.
 
 This is also why the component is called `ReplicaSet` and takes `replicas`
-rather than rendering three `<Pod>` children: it declares a *count*, not three
+rather than rendering three `<Pod>` children: it declares a _count_, not three
 identities. A count stays true when a Pod dies.
 
 ## The pipeline
@@ -96,20 +96,20 @@ halves.
 
 ## What each file is for
 
-| File | Job |
-| --- | --- |
-| `resources.ts` | The vocabulary. Specs — what should exist. No verbs. |
-| `components.tsx` | Six components, each a thin wrapper over one host element. |
-| `hostConfig.ts` | React's commit becomes a `DesiredState` snapshot. No ops. |
-| `reconciler.ts` | `createRoot`: render a tree, publish snapshots. |
-| `hooks.ts` | The read path from observed state into the tree. |
-| `observed.ts` | What is actually running. Written by adapters, read by controllers. |
-| `controllers.ts` | Management resources become runtime resources. Pure. |
-| `planner.ts` | Desired vs observed becomes actions. Pure. Owns the immutability model. |
-| `runtime/types.ts` | The adapter contract. |
-| `runtime/memory.ts` | The reference adapter: the whole system runs without containerd. |
-| `runtime/containerd/` | The real adapter, over nerdctl. |
-| `serve.ts` | The control loop, plus restart backoff. |
+| File                  | Job                                                                     |
+| --------------------- | ----------------------------------------------------------------------- |
+| `resources.ts`        | The vocabulary. Specs — what should exist. No verbs.                    |
+| `components.tsx`      | Six components, each a thin wrapper over one host element.              |
+| `hostConfig.ts`       | React's commit becomes a `DesiredState` snapshot. No ops.               |
+| `reconciler.ts`       | `createRoot`: render a tree, publish snapshots.                         |
+| `hooks.ts`            | The read path from observed state into the tree.                        |
+| `observed.ts`         | What is actually running. Written by adapters, read by controllers.     |
+| `controllers.ts`      | Management resources become runtime resources. Pure.                    |
+| `planner.ts`          | Desired vs observed becomes actions. Pure. Owns the immutability model. |
+| `runtime/types.ts`    | The adapter contract.                                                   |
+| `runtime/memory.ts`   | The reference adapter: the whole system runs without containerd.        |
+| `runtime/containerd/` | The real adapter, over nerdctl.                                         |
+| `serve.ts`            | The control loop, plus restart backoff.                                 |
 
 ## Ownership is a tree; relationships are a graph
 
@@ -139,7 +139,7 @@ Everything else is a reference by name:
 Writing `<Network><ReplicaSet/></Network>` would read as though the Network
 owned the ReplicaSet, which it does not — it would also mean a Pod could only be
 on a network its ancestors chose. (This reverses an earlier design where
-`<Network>` ancestry *was* membership; see decision 14.)
+`<Network>` ancestry _was_ membership; see decision 14.)
 
 ## The immutability model
 
@@ -153,7 +153,7 @@ network anything                      → replace the Network
 pod observed as exited                → replace the Pod
 ```
 
-Note the last line. A crash and an image change produce the *same* action,
+Note the last line. A crash and an image change produce the _same_ action,
 `replace-pod`, from the same function — which is what it looks like when
 "desired state changed" and "reality drifted" are genuinely handled by one
 mechanism instead of two.
@@ -173,7 +173,7 @@ Four places, and the rule is which goes where:
 2. **The runtime** — containerd. React never looks at it and assumes nothing
    about it.
 3. **`observed.ts`** — the observation of 2. Because React cannot re-verify the
-   host, drift has to come back as an *input*, and this is where it arrives.
+   host, drift has to come back as an _input_, and this is where it arrives.
 4. **`serve.ts`'s restart gate** — how many times a Pod has already failed. The
    one piece of state the controllers and planner cannot hold, because they are
    pure functions of (desired, observed) and this is neither.
@@ -185,7 +185,7 @@ that compares desired state against a cache, and `observed.ts` is the informer.
 
 `<Ready on="db" until="ready">` suspends its children until the `db` Pod is
 observed running (or ready). This is the one place the tree reads observed
-state, and it reads it to decide what to *want* — which is legitimate, and
+state, and it reads it to decide what to _want_ — which is legitimate, and
 different from restating an observation as an intention.
 
 It latches: a dependency that later dies does not retract what depends on it.

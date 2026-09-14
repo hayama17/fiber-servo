@@ -197,7 +197,7 @@ describe('the immutability model', () => {
 
     const added = runtime.calls.slice(callsBefore);
     expect(added).toContain('removeContainer web/nginx');
-    expect(added).toContain('createContainer web/nginx');
+    expect(added.some((c) => c.startsWith('createContainer web/nginx'))).toBe(true);
     expect(added.some((c) => c.startsWith('removePod'))).toBe(false);
 
     await served.stop();

@@ -56,7 +56,14 @@ const app = (
         </Pod>
       </Deployment>
 
-      <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+      <Service
+        name="api"
+        network="backend"
+        selector={{ app: 'api' }}
+        port={80}
+        targetPort={8080}
+        publish={8080}
+      />
     </Ready>
   </>
 );

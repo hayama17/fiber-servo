@@ -86,7 +86,10 @@ function podPrinter(log: (line: string) => void): (state: ObservedState) => void
       if (seen.get(name) === pod) continue;
       seen.set(name, pod);
       const detail = pod.containers
-        .map((c) => `${c.name}=${c.phase}${c.ready ? '/ready' : ''}${c.exitCode !== undefined ? ` exit ${c.exitCode}` : ''}`)
+        .map(
+          (c) =>
+            `${c.name}=${c.phase}${c.ready ? '/ready' : ''}${c.exitCode !== undefined ? ` exit ${c.exitCode}` : ''}`,
+        )
         .join(' ');
       log(`pod ${name} ${pod.phase}${pod.ip ? ` ip=${pod.ip}` : ''}${detail ? ` [${detail}]` : ''}`);
     }
@@ -162,10 +165,9 @@ export async function main(argv: readonly string[]): Promise<number> {
       {
         runtime: pickRuntime(flags, quiet ? () => {} : stamp),
         log: quiet ? () => {} : stamp,
+        // No `onActions` here: `serve` already logs each action through `log`,
+        // and printing from both channels doubles every line.
         onError: (e) => stamp(`!! ${e.message}`),
-        onActions: (actions) => {
-          for (const action of actions) stamp(formatAction(action));
-        },
       },
       () => loadElement(canonicalFile),
     );

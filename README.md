@@ -18,7 +18,14 @@ serve(
       </Pod>
     </ReplicaSet>
 
-    <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+    <Service
+      name="api"
+      network="backend"
+      selector={{ app: 'api' }}
+      port={80}
+      targetPort={8080}
+      publish={8080}
+    />
   </>,
   { runtime: containerd() },
 );
@@ -65,9 +72,9 @@ bringing up three replicas:
   -> api-0:running api-1:running api-2:running
   React commits so far: 1
 
-killing api-1 behind the control plane's back:
+killing api-1 behind the control plane’s back:
   replace-pod api-1 because [phase]
-  -> api-0:running api-1:running api-2:running
+  -> api-0:running api-2:running api-1:running
   React commits caused by the failure: 0 (the tree never changed)
 ```
 
@@ -147,15 +154,15 @@ So this is right:
 and wrapping the ReplicaSet inside the `<Network>` would not be — a Network does
 not own the Pods that attach to it.
 
-| Component | What it is |
-| --- | --- |
-| `<Network>` | A local bridge network. |
-| `<Pod>` | An execution sandbox: a network namespace and one or more containers. |
-| `<Container>` | One process and root filesystem inside a Pod. |
-| `<ReplicaSet>` | "Keep N Pods of this template alive." |
-| `<Deployment>` | Rollout policy over ReplicaSets. |
-| `<Service>` | A stable endpoint in front of whichever Pods match a selector. |
-| `<Ready>` | Ordering: declare nothing inside until a Pod is up. |
+| Component      | What it is                                                            |
+| -------------- | --------------------------------------------------------------------- |
+| `<Network>`    | A local bridge network.                                               |
+| `<Pod>`        | An execution sandbox: a network namespace and one or more containers. |
+| `<Container>`  | One process and root filesystem inside a Pod.                         |
+| `<ReplicaSet>` | "Keep N Pods of this template alive."                                 |
+| `<Deployment>` | Rollout policy over ReplicaSets.                                      |
+| `<Service>`    | A stable endpoint in front of whichever Pods match a selector.        |
+| `<Ready>`      | Ordering: declare nothing inside until a Pod is up.                   |
 
 ### Pods
 
