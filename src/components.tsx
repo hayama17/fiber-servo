@@ -66,7 +66,15 @@ export function Network(props: NetworkProps): ReactElement {
 
 // ---- Container ---------------------------------------------------------------
 
-export interface ContainerProps extends ContainerSpec {
+export interface ContainerProps extends Omit<ContainerSpec, 'name'> {
+  /**
+   * Required at the top level; omitted when the Container is a
+   * `<ReplicaSet>`'s or `<Deployment>`'s template, because those name the
+   * copies they create. Optional here rather than a discriminated union so
+   * both uses share one component; `hostConfig.ts` enforces which is
+   * required, at render time, for whichever position this element is in.
+   */
+  name?: string;
   /** Containers own nothing. Ordering between them is `<Ready>`. */
   children?: never;
 }

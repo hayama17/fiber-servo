@@ -5,7 +5,7 @@ Everything is exported from the package root. The layers below mirror
 is the document that explains why it exists.
 
 ```ts
-import { Pod, Container, ReplicaSet, Service, serve, containerd } from 'fiber-servo';
+import { Container, Network, ReplicaSet, Service, serve, containerd } from 'fiber-servo';
 ```
 
 ## Components
@@ -16,77 +16,72 @@ import { Pod, Container, ReplicaSet, Service, serve, containerd } from 'fiber-se
 <Network name="backend" subnet="10.88.0.0/24" labels={{ tier: 'app' }} />
 ```
 
-A local bridge network. Pods join it by name. Every field but `name` is fixed
-once created, so changing one replaces the Network.
+A local bridge network. Containers join it by name. Networks have no children —
+a Network does not own the containers on it.
 
-Networks have no children — a Network does not own the Pods on it.
-
-### `<Pod>`
-
-```tsx
-<Pod name="api" network="backend" labels={{ app: 'api' }} publish={[{ host: 8080, target: 80 }]}>
-  <Container name="app" image="api:v1" />
-  <Container name="sidecar" image="proxy:v1" />
-</Pod>
-```
-
-| Prop      |                          |                                                                                                                                          |
-| --------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`    | `string?`                | Identity. Required at the top level; omitted inside a `<ReplicaSet>` or `<Deployment>`, which name their copies.                         |
-| `network` | `string?`                | Network to attach the sandbox to.                                                                                                        |
-| `labels`  | `Record<string,string>?` | What a `<Service>` selector matches.                                                                                                     |
-| `publish` | `PortMapping[]?`         | Host ports. Belong to the sandbox, not to a container. Do not set these on a replicated Pod — several replicas cannot share a host port. |
-
-Every Pod prop defines the sandbox and is therefore immutable: changing one
-replaces the Pod.
+Compose creates and removes networks as part of applying the model, so nothing
+in fiber-servo decides anything about their lifecycle.
 
 ### `<Container>`
 
 ```tsx
 <Container
-  name="app"
+  name="api"
   image="api:v1"
   command={['./server']}
   env={{ PORT: '8080' }}
   ports={[8080]}
+  network="backend"
+  labels={{ app: 'api' }}
+  publish={[{ host: 8080, target: 80 }]}
   resources={{ cpu: 0.5, memory: '512m' }}
   readiness={{ exec: ['curl', '-fs', 'localhost:8080/health'], intervalMs: 2000 }}
 />
 ```
 
-Only valid inside a `<Pod>`. `resources` is the one field that can change
-without replacing the container; everything else is immutable. `ports` is
-documentation for Services — it publishes nothing.
+The unit of everything: one process, one image, one Compose service.
+
+| Prop        |                          |                                                                                           |
+| ----------- | ------------------------ | ----------------------------------------------------------------------------------------- |
+| `name`      | `string?`                | Identity. Required at the top level; omitted as a `<ReplicaSet>`/`<Deployment>` template. |
+| `image`     | `string`                 |                                                                                           |
+| `command`   | `string[]?`              |                                                                                           |
+| `env`       | `Record<string,string>?` |                                                                                           |
+| `ports`     | `number[]?`              | Documentation for Services. Publishes nothing.                                            |
+| `network`   | `string?`                | Network to join, by name.                                                                 |
+| `labels`    | `Record<string,string>?` | What a `<Service>` selector matches.                                                      |
+| `publish`   | `PortMapping[]?`         | Host ports. Do not set these on a replicated container — replicas would collide.          |
+| `resources` | `ResourceLimits?`        | `{ cpu?: number; memory?: string }`.                                                      |
+| `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number }`. Exit 0 means ready.                            |
+
+**Every field is immutable, `resources` included.** Changing any of them
+replaces the container. There is no in-place update: Compose has no
+live-update primitive, so raising a memory limit restarts the process. See
+decision 34.
 
 ### `<ReplicaSet>`
 
 ```tsx
 <ReplicaSet name="api" replicas={3}>
-  <Pod labels={{ app: 'api' }}>
-    <Container name="app" image="api:v1" />
-  </Pod>
+  <Container image="api:v1" labels={{ app: 'api' }} />
 </ReplicaSet>
 ```
 
-Keeps `replicas` Pods of its template alive, named `api-0`, `api-1`, …. Takes
-exactly one unnamed `<Pod>`.
-
-It declares a count, not identities — which is why a Pod dying needs no change
-here and produces no React render.
+Keeps `replicas` copies of its `<Container>` template alive, named
+`<name>-<index>`. It declares a count, not identities — which is why a dead
+container is a controller's problem and not a re-render.
 
 ### `<Deployment>`
 
 ```tsx
 <Deployment name="api" replicas={3} strategy={{ maxSurge: 1, maxUnavailable: 0 }}>
-  <Pod labels={{ app: 'api' }}>
-    <Container name="app" image="api:v2" />
-  </Pod>
+  <Container image="api:v2" labels={{ app: 'api' }} />
 </Deployment>
 ```
 
-A rollout policy over ReplicaSets. The template's digest is its generation, so
-editing the template creates a new ReplicaSet and shifts replicas to it within
-`strategy`'s bounds rather than mutating Pods in place.
+Rollout policy over ReplicaSets. Editing the template creates a new generation
+(keyed by a digest of it) and shifts replicas across, rather than editing
+containers in place.
 
 ### `<Service>`
 
@@ -94,21 +89,20 @@ editing the template creates a new ReplicaSet and shifts replicas to it within
 <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
 ```
 
-One address in front of whichever Pods currently match `selector`. The backend
-set comes from observed state, not from a prop. With nothing matching, no proxy
-is created at all.
+A stable endpoint in front of whichever containers currently match `selector`.
+The backend set is resolved from observed state, not from the tree.
 
 ### `<Ready>`
 
 ```tsx
 <Ready on="db" until="ready">
-  <Pod name="migrate">…</Pod>
+  …
 </Ready>
 ```
 
-Declares nothing inside until every Pod in `on` is observed `running`, or
-`ready` when `until="ready"`. Latches: a dependency that later dies does not
-retract what depends on it.
+Nothing inside is declared until the named container(s) are observed
+`running`, or `ready` when `until="ready"`. Latches: a dependency that later
+dies does not retract what depends on it.
 
 ## Running a tree
 
@@ -118,18 +112,19 @@ retract what depends on it.
 const served = serve(<App />, {
   runtime: containerd(),
   restart: { baseDelayMs: 1000, maxRestarts: 10 },
-  onActions: (actions) => actions.forEach((a) => console.log(formatAction(a))),
+  onApply: (plan) => console.log(formatPlan(plan)),
 });
 ```
 
-| Option                  |                                  |                                                                                                             |
-| ----------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `runtime`               | `RuntimeFactory`                 | `containerd()` or `memory()`.                                                                               |
-| `observed`              | `ObservedStore?`                 | Bring your own; one is created otherwise.                                                                   |
-| `restart`               | `RestartPolicy?`                 | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
-| `onDesired`             | `(d: DesiredState) => void`      | Every snapshot React commits.                                                                               |
-| `onActions`             | `(a: readonly Action[]) => void` | Every reconcile's actions.                                                                                  |
-| `log`, `onError`, `now` |                                  |                                                                                                             |
+| Option                  |                             |                                                                                                             |
+| ----------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `runtime`               | `RuntimeFactory`            | `containerd()` or `memory()`.                                                                               |
+| `observed`              | `ObservedStore?`            | Bring your own; one is created otherwise.                                                                   |
+| `project`               | `string?`                   | The Compose project this tree applies as, passed down to the adapter. Default `fiber-servo`.                |
+| `restart`               | `RestartPolicy?`            | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
+| `onDesired`             | `(d: DesiredState) => void` | Every snapshot React commits.                                                                               |
+| `onApply`               | `(p: Plan) => void`         | What each pass is about to apply, after the restart gate has filtered it.                                   |
+| `log`, `onError`, `now` |                             |                                                                                                             |
 
 Returns:
 
@@ -160,31 +155,52 @@ waits for Suspense retries (what `<Ready>` uses).
 ## Reading observed state
 
 ```ts
-const pod = served.observed.getPod('api-0');   // ObservedPod | undefined
-served.observed.snapshot();                     // ObservedState, stable by identity
+served.observed.get('api-0'); // ObservedContainer | undefined
+served.observed.snapshot(); // ObservedState, stable by identity
 served.observed.subscribe(() => { … });
 ```
 
 In components:
 
 ```tsx
-const pod = usePod('db'); // ObservedPod | undefined
-useReady('db', 'ready'); // suspend until up (needs a <Suspense>)
+const container = useContainer('db'); // ObservedContainer | undefined
+useReady('db', 'ready'); // suspend until ready (needs a <Suspense>)
 ```
 
-## Controllers and planner
+`ObservedState` is `{ containers: ReadonlyMap<string, ObservedContainer>, revision }`.
+There are no networks in it: Compose owns their lifecycle, so nothing in the
+control plane decides anything about them. A container's own attachments are on
+`ObservedContainer.networks`.
 
-Both are pure functions, callable directly:
+## Controllers, the Compose model, and the planner
+
+All pure functions, callable directly:
 
 ```ts
-runControllers(desired, observed); // → { networks, pods }
+runControllers(desired, observed); // → { networks, containers }
 expandDeployment(spec, observed); // → ReplicaSetSpec[]
-expandReplicaSet(spec, observed); // → PodSpec[]
+expandReplicaSet(spec, observed); // → ContainerSpec[]
 serviceEndpoints(spec, observed); // → Endpoint[]
+serviceProxyContainer(spec, endpoints); // → ContainerSpec | undefined
 
-planAll({ networks, pods }, observed); // → Action[]
-planPod(desiredPod, observedPod); // → Action[]
-formatAction(action); // → "replace-pod api-0 because [image]"
+toComposeApplication(containers, networks, project); // → ComposeApplication
+renderCompose(app); // → the file handed to `nerdctl compose -f`
+
+planApply({ networks, containers }, observed, project); // → Plan
+planIsEmpty(plan); // → nothing would change
+formatPlan(plan); // → "create api-0 image=api:v1\nreplace db"
+```
+
+A `Plan` is informational — `Runtime.apply` is what actually changes anything:
+
+```ts
+interface Plan {
+  model: ComposeApplication; // the whole desired application, never a diff
+  missing: readonly string[]; // will be created
+  changed: readonly string[]; // exist with a different spec digest; will be replaced
+  restarting: readonly string[]; // same digest, but exited; will be restarted
+  orphaned: readonly string[]; // managed, but no longer declared; will be removed
+}
 ```
 
 ## Runtimes
@@ -194,15 +210,45 @@ containerd({ namespace: 'default', address: '/run/containerd/containerd.sock' })
 memory({ autoStart: true, autoReady: true });
 ```
 
+See [`docs/containerd.md`](containerd.md) for the containerd adapter's options
+and behaviour.
+
 `createMemoryRuntime()` additionally gives you a test handle:
 
 ```ts
 const runtime = createMemoryRuntime();
 runtime.calls; // readable trace of every call
-runtime.kill('api-1'); // make a Pod die behind the control plane's back
-runtime.markReady('db', 'postgres');
+runtime.kill('api-1'); // make a container die behind the control plane's back
+runtime.markReady('db');
 ```
 
 Writing your own adapter means implementing `Runtime` from
-`src/runtime/types.ts`. `src/runtime/memory.ts` is the reference
-implementation and the shortest way to see what the contract asks for.
+`src/runtime/types.ts`:
+
+```ts
+interface Runtime {
+  apply(model: ComposeApplication): Promise<void>; // must be idempotent
+  down(): Promise<void>;
+  inspect(): Promise<ObservedState>;
+  subscribe(listener: RuntimeEventListener): Unsubscribe;
+  close?(): Promise<void>;
+}
+```
+
+`apply` takes the complete desired application, not a list of operations:
+deciding that a changed image means "remove this service, then recreate it" is
+the adapter's business, because it is the only layer that knows its actuator
+well enough to decide it. It must be a no-op when nothing changed — the control
+loop is level-triggered and will call it again on every observation.
+
+Two labels carry fiber-servo's own state on each container, and an adapter
+reads both back rather than keeping them in memory, so that a fiber-servo
+restart recovers:
+
+```ts
+SPEC_LABEL; // 'fiber-servo.spec' — digest() of the ContainerSpec it was created from
+READINESS_LABEL; // 'fiber-servo.readiness' — the probe, via encodeReadiness/decodeReadiness
+```
+
+`src/runtime/memory.ts` is the reference implementation and the shortest way to
+see what the contract asks for.

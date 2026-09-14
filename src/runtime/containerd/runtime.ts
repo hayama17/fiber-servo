@@ -273,6 +273,18 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   async function apply(model: ComposeApplication): Promise<void> {
+    // The model names the project it is; this adapter reads containers back
+    // by that same name. If the two ever disagreed, every `inspect()` would
+    // filter for a project nothing was created under, the plan would report
+    // the whole application missing on every pass, and the loop would apply
+    // it again for ever without a single error. Saying so once, loudly, is
+    // worth more than an infinite quiet retry.
+    if (model.name !== project) {
+      throw new Error(
+        `fiber-servo: this adapter reads project "${project}" but was handed a model for "${model.name}". ` +
+          `Set the project in one place — serve({ project }) passes it to the adapter for you.`,
+      );
+    }
     const { digests, images } = await recordedState();
     const changed = changedServices(model, digests);
     const orphaned = orphanedServices(model, digests);
@@ -290,6 +302,17 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     // `up` would recreate the very orphan `rm` just evicted. A no-op write
     // when `toRemove` was empty.
     writeModel(model);
+
+    // An empty application is a legitimate desired state -- it is what the
+    // last pass of `serve().stop()` asks for, and what a tree that renders
+    // nothing asks for -- but `compose up` on a file with no services is a
+    // hard error (`no service was provided`, verified live). Step (b) has
+    // already removed whatever was there, so there is genuinely nothing left
+    // for `up` to do.
+    if (Object.keys(model.services).length === 0) {
+      syncReadinessTargets(model, new Set(changed));
+      return;
+    }
 
     const res = await call(['compose', '-f', composeFile, 'up', '-d', '--no-recreate']);
     if (res.code !== 0) throw fail(res, 'compose up');

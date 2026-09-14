@@ -116,9 +116,24 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
   let revision = 0;
   let instanceCounter = 0;
 
+  /**
+   * Two ways a call gets recorded, and they exist for different readers.
+   * `calls` is the assertion surface for tests and always gets every line.
+   * `log` is the human-facing one — the same sink `serve.ts` prints its own
+   * plan summary through (`RuntimeContext.log`, shared on purpose) — so a
+   * per-service outcome here would print the *exact same line*
+   * `formatPlan` already logged one layer up (`create web-0 image=nginx`,
+   * verbatim). `record` is for framing calls only (`apply`, `down`,
+   * `inspect`, ...); `recordOnly` is for the per-service detail that
+   * `formatPlan` already narrates, kept in `calls` for tests without also
+   * doubling every line a human watching `log` sees.
+   */
   const record = (line: string): void => {
     calls.push(line);
     log(line);
+  };
+  const recordOnly = (line: string): void => {
+    calls.push(line);
   };
 
   const notify = (event: RuntimeEvent): void => {
@@ -177,7 +192,7 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
       for (const name of [...containers.keys()]) {
         if (!(name in model.services)) {
           containers.delete(name);
-          record(`remove ${name}`);
+          recordOnly(`remove ${name}`);
           notify({ type: 'container-removed', name });
         }
       }
@@ -188,13 +203,13 @@ export function createMemoryRuntime(options: MemoryRuntimeOptions = {}): MemoryR
         if (existing && existing.phase !== 'exited' && existing.specDigest === digest) {
           // Idempotent: this is the exact container we already have, still
           // alive. Left completely alone — same id, no event, nothing to see.
-          record(`skip ${name} (unchanged)`);
+          recordOnly(`skip ${name} (unchanged)`);
           continue;
         }
         const reason = !existing ? 'create' : existing.phase === 'exited' ? 'restart' : 'replace';
         const built = buildContainer(model.name, name, service);
         containers.set(name, built);
-        record(`${reason} ${name} image=${service.image}`);
+        recordOnly(`${reason} ${name} image=${service.image}`);
         notify({ type: 'container', container: toObserved(built) });
       }
     },

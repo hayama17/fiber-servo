@@ -3,15 +3,16 @@
  *
  * `createRoot` renders a tree and publishes a `DesiredState` snapshot after
  * every commit. That is the entirety of React's job here. It never learns
- * whether a Pod actually started, and it is never asked to re-render because
- * one stopped — that is observed state, and it reaches the control loop by a
- * different path (see `observed.ts`).
+ * whether a container actually started, and it is never asked to re-render
+ * because one stopped — that is observed state, and it reaches the control
+ * loop by a different path (see `observed.ts`).
  *
  * The tree can still *read* observed state, through `useReady` and friends, to
- * decide what it wants next: "don't declare the web Pod until the database is
- * ready" is a statement about desired state that happens to depend on an
- * observation. Reading is fine. What the tree must never do is restate an
- * observation as a fake desired-state change in order to provoke a commit.
+ * decide what it wants next: "don't declare the web container until the
+ * database is ready" is a statement about desired state that happens to
+ * depend on an observation. Reading is fine. What the tree must never do is
+ * restate an observation as a fake desired-state change in order to provoke a
+ * commit.
  */
 import { createElement, type ReactNode } from 'react';
 import Reconciler from 'react-reconciler';

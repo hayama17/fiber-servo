@@ -43,16 +43,25 @@ const served = serve(<App />, {
 | `namespace`        | `default`                          | containerd namespace. Reaches **both** seams; see below.               |
 | `address`          | `/run/containerd/containerd.sock`  | containerd's socket. Rootless containerd puts it elsewhere.            |
 | `bin`              | `nerdctl`                          | The actuator binary.                                                   |
-| `project`          | `fiber-servo`                      | The Compose project every container belongs to.                        |
+| `project`          | from `serve()`                     | Normally left unset; see below.                                        |
 | `composeFile`      | `$TMPDIR/fiber-servo/compose.json` | Where the rendered model is written. Must be stable — `down` reads it. |
 | `probeTickMs`      | `250`                              | How often the readiness prober looks for work.                         |
 | `reconnectDelayMs` | `1000`                             | Backoff before reattaching a dead event stream.                        |
 
-**`namespace` is computed once and handed to both seams.** It becomes
+**Two names must not be set twice.** `namespace` is computed once and handed
+to both seams. It becomes
 `nerdctl --namespace <ns> compose …` and containerd's `containerd-namespace`
 gRPC metadata. If the two ever disagreed, the write path would create
 containers the read path could not see, and the loop would create them again
 for ever. `index.ts` is the only place it is resolved.
+
+The Compose **project** has the same hazard and is settled the same way:
+`serve({ project })` owns it and passes it to the adapter through
+`RuntimeContext`, so `containerd({ project })` is only for driving the adapter
+directly. Should the two ever disagree anyway, `apply()` refuses the model and
+says so — a read path filtering for a project nothing was created under would
+otherwise report the whole application missing on every pass and recreate it
+for ever, without a single error.
 
 ## What `apply()` does
 
@@ -88,6 +97,11 @@ container by label. An orphaned service is by definition no longer in the
 model, so step 1 writes the model _plus a bare `{ image }` stub_ for each
 orphan, and rewrites the file as the true model immediately afterwards, before
 `up` ever reads it.
+
+An **empty** application is a legitimate desired state — it is what the last
+pass of `serve().stop()` asks for — but `compose up` on a file with no
+services fails outright (`no service was provided`). Step 2 has already
+removed everything by then, so step 3 is skipped.
 
 `down()` is `compose -f <file> down`, guarded by the file existing — `down`
 against a missing file is an error, not a no-op.

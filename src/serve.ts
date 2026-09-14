@@ -30,10 +30,10 @@
  * this pass's model at all.
  */
 import type { ReactNode } from 'react';
-import { DEFAULT_PROJECT, renderCompose, toComposeApplication } from './compose.js';
+import { DEFAULT_PROJECT, renderCompose } from './compose.js';
 import { runControllers } from './controllers.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
-import { planApply, type Plan } from './planner.js';
+import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
 import type { ContainerSpec, DesiredState } from './resources.js';
 import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
@@ -117,6 +117,16 @@ interface RestartRecord {
  * it by removing the container. A brand-new `absent` name with no record at
  * all — a container that has simply never been created yet — passes
  * straight through; nothing here ever gates a container's *first* creation.
+ *
+ * `resetAfterMs` is resolved the same way, and deliberately *not* via a
+ * separate "is it healthy" check run on every pass: a container that stays
+ * up quietly triggers no further passes at all (nothing about it is
+ * changing), so there would be no reliable moment to run such a check. The
+ * gate instead resolves it lazily, the next time it actually matters: at the
+ * start of handling a *new* crash, `now - record.lastAt >= resetAfterMs`
+ * means the previous trouble is old news, and this crash is treated exactly
+ * like a first-ever failure — immediate, uncounted against the old streak —
+ * rather than an escalation of it.
  */
 class RestartGate {
   private readonly records = new Map<string, RestartRecord>();
@@ -128,22 +138,16 @@ class RestartGate {
 
   /** `true` to include `name` this pass; a retry time; or `null` to give up permanently. */
   admit(name: string, phase: ContainerPhase | 'absent'): true | { retryAt: number } | null {
-    const now = this.now();
+    if (phase !== 'exited' && phase !== 'absent') return true; // running/waiting/unknown: never gated
     const record = this.records.get(name);
-
-    if (phase === 'running') {
-      // A long enough run, undisturbed by this gate, earns a clean slate.
-      if (record !== undefined && now - record.lastAt >= this.policy.resetAfterMs) {
-        this.records.delete(name);
-      }
-      return true;
-    }
-    if (phase !== 'exited' && phase !== 'absent') return true; // waiting/unknown: never gated
     if (phase === 'absent' && record === undefined) return true; // never created yet: nothing to gate
 
-    if (record === undefined) {
-      // A first-ever crash is always let through immediately; only a
-      // *second* failure within the resulting window is ever held back.
+    const now = this.now();
+
+    if (record === undefined || now - record.lastAt >= this.policy.resetAfterMs) {
+      // A first-ever crash, or one far enough past the last restart to count
+      // as a fresh problem rather than a continuation of the old one: always
+      // let the first restart through immediately.
       this.records.set(name, { consecutive: 1, nextAt: now + backoffDelay(1, this.policy), lastAt: now });
       return true;
     }
@@ -202,7 +206,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
   const project = options.project ?? DEFAULT_PROJECT;
   const gate = new RestartGate(policy, now);
-  const runtime: Runtime = options.runtime({ log, onError });
+  const runtime: Runtime = options.runtime({ log, onError, project });
   const warnedGiveUp = new Set<string>();
 
   let desired: DesiredState = EMPTY_DESIRED;
@@ -297,10 +301,6 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       included.push(spec);
     }
     if (soonest !== Number.POSITIVE_INFINITY) scheduleRetry(soonest);
-    // Note that the loop above already cleared any gate record for a
-    // container this pass observes `running` for long enough (see
-    // `RestartGate.admit`'s `running` branch) — there is no separate
-    // "mark healthy" step to run afterwards.
 
     // 3. Build the Compose Application Model this pass would apply, and stop
     //    if reconciling it is not converging (see `wedged` below).
@@ -308,18 +308,25 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     if (wedged(plan)) return;
 
     options.onApply?.(plan);
-    log(formatShort(plan));
+    // A pass with nothing pending is not merely quiet to log about — calling
+    // `apply` at all would be pointless work for a real actuator (a whole
+    // `nerdctl compose up` invocation) to prove what this plan already
+    // proves for free: recomputing it is exactly how the runtime itself
+    // would answer "does anything need to change", and this pass just did
+    // that computation already. Skipping it here is also what keeps a
+    // notify-triggered reflow pass (`apply()` notifying observed state
+    // synchronously, which re-triggers `request()` before this pass has
+    // even returned) from being a second, redundant call into the runtime
+    // for the same already-settled state.
+    if (planIsEmpty(plan)) return;
+
+    // One log line per pending change, the same way the old action-list
+    // write path logged one line per action.
+    for (const line of formatPlan(plan).split('\n')) log(line);
 
     // 4. Hand the whole model to the runtime. It decides create vs. replace
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
-  }
-
-  function formatShort(plan: Plan): string {
-    const total = plan.missing.length + plan.changed.length + plan.orphaned.length;
-    return total === 0
-      ? 'apply: nothing to do'
-      : `apply: ${plan.missing.length} create, ${plan.changed.length} replace, ${plan.orphaned.length} remove`;
   }
 
   /**
@@ -338,7 +345,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
    * than burning the machine on a bug.
    */
   function wedged(plan: Plan): boolean {
-    const total = plan.missing.length + plan.changed.length + plan.orphaned.length;
+    const total = plan.missing.length + plan.changed.length + plan.orphaned.length + plan.restarting.length;
     if (total === 0) {
       repeats = 0;
       lastModel = '';
@@ -404,11 +411,19 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     async stop() {
       await started;
       root.unmount();
+      // Let the unmount-triggered pass (if any) actually finish before
+      // tearing anything down — otherwise it can still be mid-flight,
+      // calling into a runtime that `close()` has already released.
+      await request();
       stopped = true;
       if (retryTimer !== null) clearTimeout(retryTimer);
       unsubscribeObserved();
-      unsubscribeRuntime();
+      // Stay subscribed through `down()` itself: it notifies removals just
+      // like any other runtime call, and `observed` should end up accurate
+      // (empty) rather than stale, even though nothing is left to react to
+      // those notifications since `stopped` is already true.
       await runtime.down();
+      unsubscribeRuntime();
       await runtime.close?.();
     },
   };

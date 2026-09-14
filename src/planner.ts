@@ -53,6 +53,17 @@ export interface Plan {
   orphaned: readonly string[];
   /** Desired services that do not exist yet — will be created. */
   missing: readonly string[];
+  /**
+   * Services present with the *same* spec digest, but currently `exited` —
+   * will be restarted. This is not a `changedServices`/`orphanedServices`
+   * question at all: nothing about the desired spec differs, so a digest
+   * comparison alone reports these as neither missing nor changed. It is
+   * `Runtime.apply`'s own idempotence contract (see `runtime/memory.ts`)
+   * that treats "same spec, but exited" as needing a restart, so this list
+   * is built by asking observed phase directly, the one thing a spec digest
+   * can never encode.
+   */
+  restarting: readonly string[];
 }
 
 /**
@@ -91,7 +102,30 @@ export function planApply(
   const missing = Object.keys(model.services)
     .filter((name) => !recorded.has(name))
     .sort();
-  return { model, changed, orphaned, missing };
+  const changedOrMissing = new Set([...changed, ...missing]);
+  const restarting = Object.keys(model.services)
+    .filter((name) => !changedOrMissing.has(name) && recorded.has(name))
+    .filter((name) => observed.containers.get(name)?.phase === 'exited')
+    .sort();
+  return { model, changed, orphaned, missing, restarting };
+}
+
+/**
+ * True when applying this plan would change nothing.
+ *
+ * The control loop uses it to skip the `apply` call entirely — recomputing
+ * the plan is exactly how the runtime itself would answer "does anything need
+ * to change", so a whole `nerdctl compose up` invocation would only prove
+ * what this already proves for free. Callers logging plans want the same
+ * question, which is why it is exported rather than being an inline sum.
+ */
+export function planIsEmpty(plan: Plan): boolean {
+  return (
+    plan.missing.length === 0 &&
+    plan.changed.length === 0 &&
+    plan.orphaned.length === 0 &&
+    plan.restarting.length === 0
+  );
 }
 
 // ---- rendering ---------------------------------------------------------------
@@ -103,6 +137,7 @@ export function formatPlan(plan: Plan): string {
     lines.push(`create ${name} image=${plan.model.services[name]?.image ?? '?'}`);
   }
   for (const name of plan.changed) lines.push(`replace ${name}`);
+  for (const name of plan.restarting) lines.push(`restart ${name}`);
   for (const name of plan.orphaned) lines.push(`remove ${name}`);
   return lines.length > 0 ? lines.join('\n') : '(nothing to do)';
 }

@@ -26,10 +26,11 @@ describe('cli plan', () => {
 
   /**
    * `plan` must print the FULL expansion, including a subtree behind
-   * `<Ready>` — which is not declared until its dependency Pod is *observed*
-   * running. The old `plan` only settled React, so those subtrees never
-   * appeared; the rewritten one settles React and the control loop together
-   * against the in-memory runtime until neither produces anything new.
+   * `<Ready>` — which is not declared until its dependency container is
+   * *observed* running. The old `plan` only settled React, so those
+   * subtrees never appeared; the rewritten one settles React and the
+   * control loop together against the in-memory runtime until neither
+   * produces anything new.
    *
    * The app is written to a temp file importing "fiber-servo" by name rather
    * than pointing at `examples/app.tsx`, which imports `../src` — see the
@@ -44,19 +45,15 @@ describe('cli plan', () => {
     await writeFile(
       file,
       `
-      import { Container, Deployment, Network, Pod, Ready, Service } from 'fiber-servo';
+      import { Container, Deployment, Network, Ready, Service } from 'fiber-servo';
       export default () => (
         <>
           <Network name="app" />
-          <Pod name="db" network="app" labels={{ app: 'db' }}>
-            <Container name="postgres" image="postgres:16"
-                       readiness={{ exec: ['pg_isready'] }} />
-          </Pod>
+          <Container name="db" image="postgres:16" network="app" labels={{ app: 'db' }}
+                     readiness={{ exec: ['pg_isready'] }} />
           <Ready on="db" until="ready">
             <Deployment name="web" replicas={2}>
-              <Pod network="app" labels={{ app: 'web' }}>
-                <Container name="nginx" image="nginx:alpine" ports={[80]} />
-              </Pod>
+              <Container network="app" labels={{ app: 'web' }} image="nginx:alpine" ports={[80]} />
             </Deployment>
             <Service name="web" network="app" selector={{ app: 'web' }} port={80} publish={8080} />
           </Ready>
@@ -74,24 +71,23 @@ describe('cli plan', () => {
         .map((l) => l.trim())
         .filter(Boolean);
 
-      expect(lines[0]).toBe('create-network app');
-      expect(lines[1]).toBe('create-pod db');
+      expect(lines[0]).toBe('create db image=postgres:16');
       // Everything from here on is behind the gate. If `plan` regressed to
-      // settling React only, the output would stop at the two lines above.
-      const gated = lines.slice(2);
+      // settling React only, the output would stop at the line above.
+      const gated = lines.slice(1);
       // The Deployment's replicas are named `web-<template digest>-<index>`:
       // content-addressed, so the digest cannot be hardcoded, only shown to be
       // one generation across both replicas.
       const replicas = gated
-        .map((l) => /^create-pod web-([0-9a-f]{8})-([01])$/.exec(l))
+        .map((l) => /^create web-([0-9a-f]{8})-([01]) image=nginx:alpine$/.exec(l))
         .filter((m): m is RegExpExecArray => m !== null);
-      expect(replicas, `expected two replica Pods in:\n${gated.join('\n')}`).toHaveLength(2);
+      expect(replicas, `expected two replica containers in:\n${gated.join('\n')}`).toHaveLength(2);
       expect(replicas[1]![1]).toBe(replicas[0]![1]);
       expect([replicas[0]![2], replicas[1]![2]].sort()).toEqual(['0', '1']);
-      // The Service's data plane: a proxy Pod taking the Service's own name.
-      expect(gated).toContain('create-pod web');
+      // The Service's data plane: a proxy container taking the Service's own name.
+      expect(gated).toContain('create web image=docker.io/library/caddy:2-alpine');
       // "executes nothing" — every line is a plan, never a status report.
-      expect(stdout).not.toContain('pod db running');
+      expect(stdout).not.toContain('container db running');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -106,10 +102,10 @@ describe('cli --watch', () => {
     const dir = `${projectRoot}test/tmp-watch`;
     const file = `${dir}/app.tsx`;
     const app = (replicas: number) => `
-      import { Container, Pod, ReplicaSet } from 'fiber-servo';
+      import { Container, ReplicaSet } from 'fiber-servo';
       export default () => (
         <ReplicaSet name="web" replicas={${replicas}}>
-          <Pod><Container name="app" image="nginx" /></Pod>
+          <Container image="nginx" />
         </ReplicaSet>
       );
     `;
@@ -118,19 +114,19 @@ describe('cli --watch', () => {
 
     const up = cli(['up', '--watch', '--runtime', 'memory', file]);
     try {
-      await up.until('create-pod web-0');
+      await up.until('create web-0');
       await up.until(`watching ${file}`);
       await writeFile(file, app(2));
-      await up.until('create-pod web-1');
-      // web-0's spec did not change (only the replica count did), so the
-      // planner recognises it against the spec it was created from and
-      // leaves it alone: one creation, ever, and no removal.
-      expect(up.output().match(/create-pod web-0/g)).toHaveLength(1);
-      expect(up.output()).not.toContain('remove-pod web-0');
+      await up.until('create web-1');
+      // web-0's spec did not change (only the replica count did), so its
+      // spec digest matches what it was created from and it is left alone:
+      // one creation, ever, and no removal.
+      expect(up.output().match(/create web-0/g)).toHaveLength(1);
+      expect(up.output()).not.toContain('remove web-0');
 
       await up.stop();
-      expect(up.output()).toContain('remove-pod web-1');
-      expect(up.output()).toContain('remove-pod web-0');
+      expect(up.output()).toContain('remove web-1');
+      expect(up.output()).toContain('remove web-0');
     } finally {
       await up.stop();
       await rm(dir, { recursive: true, force: true });

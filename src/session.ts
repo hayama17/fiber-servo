@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import type { ApplyResult } from './control.js';
-import { formatAction } from './planner.js';
+import { formatPlan } from './planner.js';
 import { serve, type ServeOptions } from './serve.js';
 
 /** One writer for explicit apply, watch reloads, and shutdown. */
@@ -8,9 +8,10 @@ export function createSession(options: ServeOptions, load: () => Promise<ReactNo
   let active: ApplyResult | undefined;
   const served = serve(null, {
     ...options,
-    onActions(actions) {
-      active?.ops.push(...actions.map(formatAction));
-      options.onActions?.(actions);
+    onApply(plan) {
+      const total = plan.missing.length + plan.changed.length + plan.orphaned.length;
+      if (total > 0) active?.ops.push(...formatPlan(plan).split('\n'));
+      options.onApply?.(plan);
     },
     onError(error) {
       active?.errors.push(error.message);

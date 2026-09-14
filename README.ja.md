@@ -99,7 +99,7 @@ npx fiber-servo plan examples/app.tsx
 ## CLI
 
 ```console
-fiber-servo plan  <app.tsx>                     何が適用されるかを表示し、実行はしない
+fiber-servo plan  <app.tsx> [--model]           何が作られるかを表示する。--model は Compose ファイル自体
 fiber-servo up    <app.tsx> [--watch]           Ctrl-C まで containerd 上で動かす
 fiber-servo apply <app.tsx>                     動作中のセッションを再評価する
 ```

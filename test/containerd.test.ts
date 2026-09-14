@@ -527,6 +527,37 @@ describe('containerd runtime: inspect()', () => {
     const state = await runtime2.inspect();
     expect(state.containers.get('app')?.specDigest).toBe(spec.services['app']!.labels![SPEC_LABEL]);
   });
+
+  // `compose up` on a file with no services is a hard error, not a no-op --
+  // and an empty application is exactly what the last pass of `stop()` asks
+  // for. Removing everything must not then fail on the way out.
+  it('applies an empty model by removing what is there, without calling `up` on nothing', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
+    fc.calls.length = 0;
+
+    await runtime.apply(model([]));
+
+    const nerdctlCalls = fc.calls.filter((c) => !c.startsWith('api.'));
+    expect(nerdctlCalls.some((c) => c.includes('rm -f -s app'))).toBe(true);
+    expect(nerdctlCalls.some((c) => c.includes('up'))).toBe(false);
+    expect((await runtime.inspect()).containers.size).toBe(0);
+  });
+
+  // A model for one project applied by an adapter reading another is the
+  // failure with no symptom: every inspect() filters for a project nothing
+  // was created under, so the plan reports the whole application missing on
+  // every pass and the loop reapplies it for ever, silently.
+  it('refuses a model whose project is not the one it reads back, rather than looping for ever', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    const foreign = toComposeApplication([{ name: 'app', image: 'app:1' }], [], 'somebody-elses-project');
+    await expect(runtime.apply(foreign)).rejects.toThrow(
+      /reads project "fiber-servo".*"somebody-elses-project"/s,
+    );
+    expect(fc.calls).toEqual([]); // and it never touched the machine
+  });
 });
 
 // ---- events -> RuntimeEvent ---------------------------------------------------

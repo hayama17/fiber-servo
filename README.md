@@ -115,7 +115,7 @@ npx fiber-servo plan examples/app.tsx
 ## CLI
 
 ```console
-fiber-servo plan  <app.tsx>                     print what would be applied, execute nothing
+fiber-servo plan  <app.tsx> [--model]           print what would be created; --model prints the Compose file
 fiber-servo up    <app.tsx> [--watch]           run it on containerd until Ctrl-C
 fiber-servo apply <app.tsx>                     re-evaluate the running session
 ```

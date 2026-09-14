@@ -16,7 +16,12 @@ import { createContainerdRuntime } from './runtime.js';
 export const DEFAULT_COMPOSE_FILE = join(tmpdir(), 'fiber-servo', 'compose.json');
 
 export interface ContainerdOptions extends NerdctlOptions {
-  /** The Compose project this adapter manages. Default `compose.ts`'s `DEFAULT_PROJECT`. */
+  /**
+   * The Compose project this adapter manages. Normally left unset: `serve()`
+   * passes its own project down through `RuntimeContext`, so there is one
+   * place to set it. Set it here only when driving the adapter directly,
+   * without `serve()`.
+   */
   project?: string;
   /** Stable path the rendered model is written to and `down` is applied against. Default `DEFAULT_COMPOSE_FILE`. */
   composeFile?: string;
@@ -39,7 +44,7 @@ export function containerd(options: ContainerdOptions = {}): RuntimeFactory {
     createContainerdRuntime({
       nerdctl: createNerdctl({ bin: options.bin, namespace, address: options.address }),
       api: createContainerdApi({ address: options.address, namespace }),
-      project: options.project ?? DEFAULT_PROJECT,
+      project: options.project ?? ctx.project ?? DEFAULT_PROJECT,
       composeFile: options.composeFile ?? DEFAULT_COMPOSE_FILE,
       probeTickMs: options.probeTickMs,
       reconnectDelayMs: options.reconnectDelayMs,

@@ -146,6 +146,19 @@ export interface Runtime {
 export interface RuntimeContext {
   log: (line: string) => void;
   onError: (error: Error) => void;
+  /**
+   * The Compose project the control loop will apply as — the `name` of every
+   * `ComposeApplication` this adapter is about to receive.
+   *
+   * An adapter needs it before the first `apply`, to know which of the
+   * machine's containers are this tree's when `inspect()` is called. It is
+   * passed down rather than configured on the adapter so that there is one
+   * place to set it: an adapter filtering reads by one project while the loop
+   * applies another observes an empty world and recreates the application on
+   * every pass, for ever. (The same hazard as the containerd namespace, and
+   * it is settled the same way.)
+   */
+  project: string;
 }
 
 export type RuntimeFactory = (ctx: RuntimeContext) => Runtime;
