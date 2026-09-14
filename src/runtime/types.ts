@@ -1,172 +1,141 @@
 /**
  * The runtime boundary.
  *
- * Above this line everything is declarative: specs describing what should
- * exist. Below it is the only place in the project allowed to know that
- * bringing up a Pod means "create a sandbox, then create containers, then
- * start them" — and that sequence never leaks upwards.
+ * Above this line everything is declarative. Below it is the only place
+ * allowed to know how a container actually gets created — and after the move
+ * to Compose, even that is mostly delegated: the adapter hands a whole
+ * application model to an actuator and reads the result back.
  *
- * An adapter owes the control plane two things:
+ * An adapter owes the control plane two things, and they come from different
+ * places on purpose:
  *
- *   apply     make one named resource match a spec, or be gone
- *   observe   report what is actually there, now and as it changes
+ *   apply / down   the write path — `nerdctl compose`, which owns image
+ *                  pulling, network creation and running containers
+ *   inspect /      the read path — containerd's own gRPC API, which owns
+ *   subscribe      what is actually running
  *
- * The second is not optional and not a nicety: controllers compare desired
- * against observed, so an adapter that cannot be observed cannot be
- * reconciled.
+ * The seam is **who owns the resource**, not read-versus-write. An earlier
+ * design split it the other way and ended up talking to one dependency three
+ * ways, with an exception in its own headline rule; see `docs/decisions.md`.
  */
-import type { ContainerSpec, NetworkSpec, PodSpec, ResourceLimits } from '../resources.js';
+import type { ComposeApplication } from '../compose.js';
 
 // ---- observed state --------------------------------------------------------
 
 /**
  * Where a container is in its life. `waiting` covers created-but-not-running;
  * `unknown` is what you get before the first observation, and is never
- * treated as "absent" — absence is the resource not appearing at all.
+ * treated as "absent" — absence is the container not appearing at all.
  */
 export type ContainerPhase = 'waiting' | 'running' | 'exited' | 'unknown';
 
 /**
- * A Pod's phase is derived from its containers by the adapter: `running` once
- * the sandbox and every container are up, `exited` once the sandbox is gone
- * or every container has stopped.
+ * One container as the runtime currently holds it.
+ *
+ * `name` is the Compose service name, which is the name fiber-servo's
+ * controllers chose (`api-0`, `web-43bfee23-1`). Compose mangles the actual
+ * container name to `<project>-<service>-<index>` but records the service
+ * name in a label, so identity survives the round trip without fiber-servo
+ * having to invent a label of its own.
  */
-export type PodPhase = 'pending' | 'running' | 'exited' | 'unknown';
-
 export interface ObservedContainer {
-  /** Identity within the Pod. */
   readonly name: string;
-  /** The runtime's own handle, when it has one. */
+  /** containerd's id, which is not the name. */
   readonly id?: string;
   readonly phase: ContainerPhase;
   readonly exitCode?: number;
   /** Set by the readiness prober once the container answers its probe. */
   readonly ready?: boolean;
   readonly image?: string;
-}
-
-export interface ObservedPod {
-  readonly name: string;
-  readonly id?: string;
-  readonly phase: PodPhase;
-  /** Address inside its Network. What a Service routes to. */
-  readonly ip?: string;
+  /** Networks it is attached to, read back from nerdctl's own label. */
+  readonly networks: readonly string[];
   readonly labels: Readonly<Record<string, string>>;
   /**
-   * `digest(spec)` of the PodSpec this Pod was created from, when the adapter
-   * recorded one. Lets the control plane recognise a Pod it already owns
-   * across a process restart instead of replacing it.
+   * `digest()` of the ContainerSpec it was created from, from the
+   * `fiber-servo.spec` label.
+   *
+   * This is the whole of the change-detection mechanism. It answers "is this
+   * container still the one we asked for", which is all the write path needs:
+   * the response to any difference is the same — remove this one service and
+   * let `compose up` recreate it — so nothing has to know *which* field moved.
    */
   readonly specDigest?: string;
-  /**
-   * The PodSpec this Pod was created from, as the adapter recorded it — in a
-   * label, for containerd.
-   *
-   * This is what makes the immutability model possible. Comparing a desired
-   * spec against a live Pod tells you only *that* something differs; comparing
-   * it against the spec the Pod was created from tells you *which field*, and
-   * therefore whether the change can be applied in place (cpu) or needs a
-   * replacement (image). Storing it on the resource rather than in the
-   * process is what lets a restarted fiber-servo answer that question too.
-   *
-   * Absent when the Pod was not created by fiber-servo, or by a version that
-   * did not record it: the planner then falls back to `specDigest`.
-   */
-  readonly spec?: PodSpec;
-  readonly containers: readonly ObservedContainer[];
   /** `Date.now()` of the observation. */
   readonly at: number;
 }
 
-export interface ObservedNetwork {
-  readonly name: string;
-  readonly subnet?: string;
-}
-
-/** Everything the runtime currently holds, as one immutable snapshot. */
+/**
+ * Everything the runtime currently holds, as one immutable snapshot.
+ *
+ * Networks are deliberately absent. Compose creates and removes them as part
+ * of applying the model, so nothing in the control plane decides anything
+ * about them and nothing needs to read them. A container's own attachments
+ * are on `ObservedContainer.networks` for diagnostics.
+ */
 export interface ObservedState {
-  readonly pods: ReadonlyMap<string, ObservedPod>;
-  readonly networks: ReadonlyMap<string, ObservedNetwork>;
+  readonly containers: ReadonlyMap<string, ObservedContainer>;
   /** Bumped on every change, so a reader can tell two snapshots apart cheaply. */
   readonly revision: number;
 }
 
 /**
- * The mutable store behind those snapshots. Runtime watchers write; the
+ * The mutable store behind those snapshots. The runtime watcher writes; the
  * control loop reads and subscribes.
  *
  * This is the *only* path by which reality reaches the control plane. It is
- * deliberately not a React state hook: a Pod dying is not a change to what we
+ * deliberately not React state: a container dying is not a change to what we
  * want, so it must not look like one.
  */
 export interface ObservedStore {
   snapshot(): ObservedState;
-  getPod(name: string): ObservedPod | undefined;
-  /** Replace what is known about one Pod. */
-  setPod(pod: ObservedPod): void;
-  /** Merge a partial observation into the Pod, keeping fields not mentioned. */
-  patchPod(name: string, patch: PodPatch): void;
-  /** Amend one container inside a Pod (a readiness result, an exit code). */
-  patchContainer(pod: string, container: string, patch: ContainerPatch): void;
-  removePod(name: string): void;
-  setNetwork(network: ObservedNetwork): void;
-  removeNetwork(name: string): void;
+  get(name: string): ObservedContainer | undefined;
+  /** Replace what is known about one container. */
+  set(container: ObservedContainer): void;
+  /** Merge a partial observation, keeping fields not mentioned. */
+  patch(name: string, patch: ContainerPatch): void;
+  remove(name: string): void;
   /** Replace the whole snapshot, as a full resync from `Runtime.inspect` does. */
-  reset(state: Pick<ObservedState, 'pods' | 'networks'>): void;
+  reset(containers: Iterable<ObservedContainer>): void;
   subscribe(listener: () => void): () => void;
 }
 
-export type PodPatch = Partial<Omit<ObservedPod, 'name' | 'containers'>>;
 export type ContainerPatch = Partial<Omit<ObservedContainer, 'name'>>;
 
 // ---- the adapter -----------------------------------------------------------
 
 export type Unsubscribe = () => void;
 
-/**
- * A change the runtime noticed on its own. Adapters emit these from whatever
- * event source they have (`nerdctl events`, a CRI stream, a poll); the
- * control plane does not care which.
- */
+/** A change the runtime noticed on its own. */
 export type RuntimeEvent =
-  | { type: 'pod'; pod: ObservedPod }
-  | { type: 'pod-removed'; name: string }
-  | { type: 'container'; pod: string; container: ObservedContainer }
-  | { type: 'network'; network: ObservedNetwork }
-  | { type: 'network-removed'; name: string }
-  | { type: 'resync'; state: Pick<ObservedState, 'pods' | 'networks'> };
+  | { type: 'container'; container: ObservedContainer }
+  | { type: 'container-removed'; name: string }
+  | { type: 'resync'; containers: readonly ObservedContainer[] };
 
-export type RuntimeEventListener = (event: RuntimeEvent) => void;
+export type RuntimeEventListener = (event: RuntimeEvent) => void | Promise<void>;
 
 /**
- * What it takes to realize Pods on one machine.
+ * What it takes to run an application on one machine.
  *
- * Every method is a statement about a single named resource, and each is
- * expected to be idempotent: the control loop may call `createPod` for a Pod
- * that already exists after a resync, and should get a no-op rather than an
- * error. Ordering between resources (network before the Pods on it) is the
- * control loop's business, not the adapter's.
+ * `apply` is the whole write path. It takes the complete desired application,
+ * not a list of operations: deciding that a changed image means "remove this
+ * service, then recreate it" is the adapter's business, and it is the only
+ * layer that knows the actuator well enough to decide it.
+ *
+ * It must be idempotent. The control loop is level-triggered and will call it
+ * again on every observation, so applying an unchanged model has to be a
+ * no-op — an actuator that recreates containers on every apply would churn
+ * the whole application for ever. (`nerdctl compose up` does exactly that;
+ * see the adapter for what it does instead.)
  */
 export interface Runtime {
-  createNetwork(spec: NetworkSpec): Promise<void>;
-  removeNetwork(name: string): Promise<void>;
-
-  /** Create the sandbox and every container in `spec`, and start them. */
-  createPod(spec: PodSpec): Promise<void>;
-  removePod(name: string): Promise<void>;
-
-  /** Add one container to an existing sandbox. */
-  createContainer(pod: string, spec: ContainerSpec): Promise<void>;
-  removeContainer(pod: string, name: string): Promise<void>;
-  /**
-   * The one in-place mutation. Everything else about a container is immutable
-   * and a change to it is a replacement, decided by the planner.
-   */
-  updateContainerResources(pod: string, container: string, resources: ResourceLimits): Promise<void>;
+  /** Make the machine match this application. Idempotent. */
+  apply(model: ComposeApplication): Promise<void>;
+  /** Remove the whole application. */
+  down(): Promise<void>;
 
   /** Full resync. Called at startup and whenever the event stream is doubted. */
   inspect(): Promise<ObservedState>;
-  /** Stream changes until the returned function is called. */
+  /** Stream changes until the returned function is called, in order. */
   subscribe(listener: RuntimeEventListener): Unsubscribe;
 
   /** Optional: release watchers, child processes and the like. */

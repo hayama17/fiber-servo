@@ -10,21 +10,21 @@
  *
  *   management resources  Deployment, ReplicaSet. Policies. They describe how
  *                         many of something should exist and how it should be
- *                         rolled out. Controllers turn them into Pods.
+ *                         rolled out. Controllers turn them into Containers.
  *
- *   runtime resources     Network, Pod, Container, Service. Things a runtime
+ *   runtime resources     Network, Container, Service. Things a runtime
  *                         actually materializes.
  *
- * Ownership is a tree (a ReplicaSet owns Pods, a Pod owns Containers) and it
- * is expressed by nesting. Relationships are a graph (a Pod attaches to a
- * Network, a Service selects Pods) and they are expressed by *name*, never by
- * nesting.
+ * Ownership is a tree (a Deployment owns ReplicaSets, a ReplicaSet owns
+ * Containers) and it is expressed by nesting. Relationships are a graph (a
+ * Container attaches to a Network, a Service selects Containers) and they are
+ * expressed by *name*, never by nesting.
  */
 
-/** A host port bound to a port inside the Pod sandbox. */
+/** A host port bound to a port inside the container. */
 export interface PortMapping {
   host: number;
-  /** Port inside the sandbox. */
+  /** Port inside the container. */
   target: number;
   protocol?: 'tcp' | 'udp';
 }
@@ -52,11 +52,16 @@ export interface ResourceLimits {
 }
 
 /**
- * One process and one root filesystem inside a Pod sandbox.
+ * One container: the unit of everything.
  *
- * `name` is the identity *within its Pod*: the full identity of a container is
- * `podName/containerName`. Containers do not carry a network of their own;
- * they inherit the sandbox's (see `PodSpec.network`).
+ * A ReplicaSet counts these, a Service routes to them, and one of these
+ * becomes exactly one Compose service. There is no Pod: an earlier design
+ * had one, emulated out of an infra container plus members sharing its
+ * network namespace, and it bought sidecars at the price of building by hand
+ * a thing neither containerd nor Compose has. The unit is the container.
+ *
+ * `name` is the identity. Everything else except `resources` is fixed at
+ * creation — a change to it means this container is replaced, not edited.
  */
 export interface ContainerSpec {
   name: string;
@@ -65,43 +70,27 @@ export interface ContainerSpec {
   env?: Readonly<Record<string, string>>;
   /** Ports the process listens on. Documentation for Services; not published. */
   ports?: readonly number[];
+  /** Attaches to this Network, by name. Undefined means the default. */
+  network?: string;
+  /** Key/value pairs a Service selector matches against. */
+  labels?: Readonly<Record<string, string>>;
+  /** Host ports to bind. A replicated container should not set these: replicas would collide. */
+  publish?: readonly PortMapping[];
   resources?: ResourceLimits;
   /** With a probe, dependents wait for `ready`, not merely `running`. */
   readiness?: ReadinessProbe;
 }
 
 /**
- * A Pod without an identity: what a ReplicaSet stamps out `replicas` times.
- *
- * Everything here defines the sandbox, so any change to it replaces the Pod
- * rather than mutating it (see `planner.ts`). Keeping the template separate
- * from `PodSpec` is what lets a ReplicaSet own "three of these" instead of
- * three fixed names.
+ * A container without an identity: what a ReplicaSet stamps out `replicas`
+ * times. Keeping the template separate from `ContainerSpec` is what lets a
+ * ReplicaSet own "three of these" rather than three fixed names.
  */
-export interface PodTemplate {
-  /** Attaches the sandbox to this Network, by name. Undefined means the default. */
-  network?: string;
-  /** Key/value pairs a Service selector matches against. */
-  labels?: Readonly<Record<string, string>>;
-  /** Host ports bound to the sandbox. A replicated Pod should not set these. */
-  publish?: readonly PortMapping[];
-  containers: readonly ContainerSpec[];
-}
+export type ContainerTemplate = Omit<ContainerSpec, 'name'>;
 
 /**
- * An execution sandbox: a network namespace, shared volumes where applicable,
- * and one or more containers that share them. The Pod is the lifecycle
- * boundary — the unit a ReplicaSet counts and a Service routes to.
- *
- * `name` is the identity the runtime is addressed by.
- */
-export interface PodSpec extends PodTemplate {
-  name: string;
-}
-
-/**
- * A local bridge network: roughly a Docker user-defined network. Pods on the
- * same Network reach each other; the fields other than `name` are immutable
+ * A local bridge network: roughly a Docker user-defined network. Containers on
+ * the same Network reach each other by name; the fields other than `name` are immutable
  * once created, so changing one replaces the Network.
  */
 export interface NetworkSpec {
@@ -111,64 +100,65 @@ export interface NetworkSpec {
 }
 
 /**
- * A stable endpoint in front of whichever Pods currently match `selector`.
+ * A stable endpoint in front of whichever containers currently match
+ * `selector`.
  *
  * The set of backends is *not* in this spec: it is resolved from observed
- * state by the Service controller, because Pods come and go without the React
- * tree changing. That is the whole reason a Service exists rather than
- * publishing a host port on each Pod — several Pods cannot own one host port.
+ * state by the Service controller, because containers come and go without the
+ * React tree changing. That is also why a Service exists rather than
+ * publishing a host port on each replica — replicas would collide on it.
  */
 export interface ServiceSpec {
   name: string;
-  /** Matches a Pod when every entry here equals the Pod's label of that key. */
+  /** Matches a container when every entry here equals its label of that key. */
   selector: Readonly<Record<string, string>>;
-  /** Network the data plane sits on. Must be the one its backing Pods are on. */
+  /** Network the data plane sits on. Must be the one its backing containers are on. */
   network?: string;
   /** Port the Service listens on inside the network. */
   port: number;
-  /** Port on the backing Pods. Default: `port`. */
+  /** Port on the backing containers. Default: `port`. */
   targetPort?: number;
   /** Host port to bind, when the Service should be reachable from outside. */
   publish?: number;
 }
 
 /**
- * "Keep `replicas` Pods of this template alive."
+ * "Keep `replicas` containers of this template alive."
  *
- * A ReplicaSet names a *count*, not identities. When a Pod dies the desired
- * state has not changed — observed state has — so its controller, not React,
- * is what notices and replaces it.
+ * A ReplicaSet names a *count*, not identities. When a container dies the
+ * desired state has not changed — observed state has — so its controller, not
+ * React, is what notices and replaces it.
  */
 export interface ReplicaSetSpec {
   name: string;
   replicas: number;
-  template: PodTemplate;
+  template: ContainerTemplate;
 }
 
 /** How a Deployment moves from one template generation to the next. */
 export interface RolloutStrategy {
-  /** Extra Pods allowed above `replicas` while rolling. Default 1. */
+  /** Extra containers allowed above `replicas` while rolling. Default 1. */
   maxSurge?: number;
-  /** Pods allowed to be missing below `replicas` while rolling. Default 0. */
+  /** Containers allowed to be missing below `replicas` while rolling. Default 0. */
   maxUnavailable?: number;
 }
 
 /**
- * A rollout policy over ReplicaSets. Editing the template does not edit Pods
- * in place: it creates a new generation and the Deployment controller shifts
- * replicas from the old ReplicaSet to the new one.
+ * A rollout policy over ReplicaSets. Editing the template does not edit
+ * containers in place: it creates a new generation and the Deployment
+ * controller shifts replicas from the old ReplicaSet to the new one.
  */
 export interface DeploymentSpec {
   name: string;
   replicas: number;
-  template: PodTemplate;
+  template: ContainerTemplate;
   strategy?: RolloutStrategy;
 }
 
 /** Every resource kind React can commit, and the spec each carries. */
 export interface Specs {
   network: NetworkSpec;
-  pod: PodSpec;
+  container: ContainerSpec;
   service: ServiceSpec;
   replicaset: ReplicaSetSpec;
   deployment: DeploymentSpec;
@@ -194,7 +184,7 @@ export interface DesiredState {
 
 export const RESOURCE_KINDS: readonly ResourceKind[] = [
   'network',
-  'pod',
+  'container',
   'service',
   'replicaset',
   'deployment',
