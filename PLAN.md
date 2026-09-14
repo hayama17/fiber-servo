@@ -3,412 +3,321 @@
 ## Goal
 
 `fiber-servo` is an experiment in using React Fiber as the control plane for a
-**single-node container orchestrator**.
+container application on one machine.
 
-The important idea is not "JSX generates container configuration". The
-important idea is:
+It sits deliberately between Compose and Kubernetes:
+
+```text
+Compose
+  = describe a container application and apply it
+
+fiber-servo
+  = keep a Compose application under a continuous React-driven control loop
+
+Kubernetes
+  = a distributed control plane for a cluster
+```
+
+The important idea is not "JSX generates container configuration". It is:
 
 > **React reconciles management resources. Controllers reconcile runtime
 > resources.**
 
-React Fiber stays responsible for identity, component lifecycle, state, and
-detecting changes in the desired control-plane configuration. The runtime layer
-is responsible for realizing Pods and Containers.
+React Fiber owns identity, component lifecycle, state, and noticing that the
+desired configuration changed. Controllers own noticing that reality drifted
+from it. The two must not be mixed.
 
 ---
 
-## Overall architecture
+## Responsibility boundaries
+
+Three parties, and each owns something the others do not touch.
 
 ```text
-JSX
- ↓
-React Fiber
- ↓
-Management Resources
- ↓
-Controllers
- ↓
-Runtime Resources
- ↓
-Runtime Adapter
- ↓
+fiber-servo      orchestration semantics
+                 React tree, hooks, lifecycle
+                 ReplicaSet / Deployment / Service controllers
+                 replica reconciliation, rollout policy, restart policy
+                 observed state
+                 -> decides which Compose application should exist
+
+nerdctl compose  the actuator
+                 image pull, container create/recreate/delete,
+                 network create/attach, port publish, runtime configuration
+
+containerd       the source of truth for actual runtime state
+                 read over gRPC, never mutated by fiber-servo
+```
+
+The boundary that matters:
+
+> **Writes go through nerdctl Compose. Reads go directly to containerd over
+> gRPC.**
+
+The seam is **who owns the resource**, not read-versus-write for its own sake.
+Compose owns the application; containerd owns what is running. An earlier
+revision of this plan split writes and reads as a principle and ended up
+talking to one dependency three different ways — the CLI, gRPC, and nerdctl's
+private CNI files — with an exception in its own headline rule. That is
+recorded in `docs/decisions.md` rather than repeated here.
+
+---
+
+## Architecture
+
+```text
+                        desired path
+
+JSX / React
+     │
+     ▼
+React Fiber ─────────────► DesiredState        one snapshot per commit
+     │
+     ▼
+Controllers ─────────────► Containers + Networks
+     │
+     ▼
+Compose Application Model
+     │
+     ▼
+nerdctl compose
+     │
+     ▼
 containerd
+     │
+     │ gRPC: Containers / Tasks / Events
+     ▼
+ContainerdObserver
+     │
+     ▼
+ObservedStateStore ──────► Controllers
 
-containerd/runtime events
- ↓
-Observed State
- ↓
-Controllers
+                        observed path
 ```
 
-There are two different kinds of reconciliation:
+Two different kinds of reconciliation meet in the control loop, and only
+there:
 
 ```text
-React reconciliation
-  = desired control-plane configuration changed
-
-Controller reconciliation
-  = actual runtime state differs from desired state
+React reconciliation      = the desired configuration changed
+Controller reconciliation = actual runtime state differs from it
 ```
 
-These must not be mixed.
+The loop is **level-triggered**: every pass reads the current desired state
+and the current observed state and recomputes from scratch. A missed event
+costs a late reconcile, never a wrong one.
 
 ---
 
-## Core principle
+## Why a container dying is not a React render
 
-Do not translate React commits directly into low-level runtime operations such
-as:
+```tsx
+<ReplicaSet name="api" replicas={3}>
+  <Container image="api:v1" />
+</ReplicaSet>
+```
+
+One container dies.
 
 ```text
-STOP
-DELETE
-CREATE
-START
+desired = 3   <- unchanged. The JSX still says 3, and it is still correct.
+actual  = 2   <- changed.
 ```
 
-React should not know how a runtime applies a resource change. React and
-controllers operate on declarative resource specifications instead:
+Nothing React can see is different. Making React notice would mean inventing a
+prop — a restart generation, a nonce — and changing it _because_ something
+died. That prop encodes an observation as if it were an intention, and once it
+exists there are two records of the same fact.
 
-```ts
-type ContainerSpec = {
-  image: string;
-  command?: string[];
-  env?: Record<string, string>;
-  resources?: Resources;
-};
-```
-
-The runtime adapter decides whether a change means:
-
-```text
-noop
-update in place
-replace container
-replace pod
-```
-
-The low-level operation sequence remains an implementation detail of the
-runtime adapter.
+So the death is recorded in observed state, and a controller compares 3
+against 2. React renders zero times. `examples/replicaset.tsx` prints the
+render count so the claim can be checked rather than believed.
 
 ---
 
 ## Resource model
 
-### Management resources
-
-These represent policies and controllers rather than concrete runtime objects.
-Initially:
+**Management resources** — policies, turned into containers by controllers:
 
 ```text
 Deployment
 ReplicaSet
 ```
 
-They are normally implemented as React components plus controller logic:
-
-```tsx
-<ReplicaSet replicas={3}>
-  <Pod network="backend">
-    <Container image="api:v1" />
-  </Pod>
-</ReplicaSet>
-```
-
-A ReplicaSet represents:
-
-```text
-desired replicas = 3
-pod template = ...
-```
-
-It does **not** represent three fixed container identities. If one runtime Pod
-disappears:
-
-```text
-desired = 3
-actual = 2
-```
-
-the ReplicaSet controller creates another Pod. The React tree itself does not
-need to change.
-
-### Host resources
-
-Host resources are materialized outside React. Initially:
+**Runtime resources** — things that exist on the machine:
 
 ```text
 Network
-Pod
 Container
 Service
 ```
 
-Ownership runs:
+A container is the unit. A ReplicaSet counts containers, a Service routes to
+containers, and one container becomes exactly one Compose service.
 
-```text
-Deployment / ReplicaSet
-        ↓
-       Pod
-        ↓
-    Container
+There is no Pod. An earlier revision made Pod a first-class sandbox, emulated
+from an infra container plus members sharing its network namespace — building
+by hand a thing neither containerd nor Compose provides. It bought sidecars,
+which nothing used. If sidecars are wanted later, the honest way to get them
+is CRI, which has sandboxes natively, and that is a different project.
+
+### Ownership is a tree; relationships are a graph
+
+```tsx
+<Network name="backend" />
+
+<ReplicaSet name="api" replicas={3}>
+  <Container image="api:v1" network="backend" labels={{ app: 'api' }} />
+</ReplicaSet>
+
+<Service name="api" selector={{ app: 'api' }} port={80} targetPort={8080} />
 ```
 
-Network and Service are graph relationships rather than ownership
-relationships.
+Nesting is ownership and nothing else. A Network is joined by name; a Service
+selects by label. Wrapping the ReplicaSet in the `<Network>` would read as
+though the Network owned it, which it does not.
 
 ---
 
-## Ownership vs references
+## Write path
 
-> **Ownership is a tree. Resource relationships are a graph.**
-
-```tsx
-<>
-  <Network name="backend" />
-
-  <ReplicaSet replicas={3}>
-    <Pod network="backend">
-      <Container image="api:v1" />
-    </Pod>
-  </ReplicaSet>
-</>
-```
-
-The ownership relationship is:
+fiber-servo decides _which Compose application should exist_, and stops there.
 
 ```text
-ReplicaSet
-  └─ Pod
-      └─ Container
+Controllers
+   ↓
+Compose Application Model
+   ↓
+nerdctl compose
+   ↓
+containerd
 ```
 
-The network relationship is:
+`<ReplicaSet name="api" replicas={3}>` becomes, conceptually:
+
+```yaml
+services:
+  api-0: { image: api:v1 }
+  api-1: { image: api:v1 }
+  api-2: { image: api:v1 }
+```
+
+Image pulling, container creation, network attachment and starting are the
+actuator's. fiber-servo holds no `CREATE_CONTAINER` / `START_TASK` vocabulary
+in its control-plane model.
+
+### What applying actually does
+
+`nerdctl compose up` is **not** idempotent — it recreates every container even
+when the model has not changed, which in a level-triggered loop would churn
+the application for ever. Measured against nerdctl 2.1.2, applying is
+therefore two steps:
 
 ```text
-Pod ───────→ Network backend
+1. for each service whose recorded spec digest differs from the model's:
+       nerdctl compose rm -f -s <service>
+2. nerdctl compose up -d --no-recreate
 ```
 
-Do not force all resource relationships into JSX parent/child nesting. Avoid:
+Step 2 alone creates what is missing and starts what has stopped — self-
+healing comes free. Step 1 is what makes a changed spec take effect.
 
-```tsx
-<Network name="backend">
-  <ReplicaSet ... />
-</Network>
-```
-
-because that makes the ReplicaSet look owned by the Network. This reverses the
-current implementation, where `<Network>` is a host element whose JSX ancestry
-means membership (see decision 14); membership becomes an explicit reference.
+Deciding step 1's list is the one piece of diffing fiber-servo keeps: it
+compares the desired spec's digest against the `fiber-servo.spec` label read
+back from containerd.
 
 ---
 
-## Pod model
+## Read path
 
-`Pod` is a first-class runtime boundary: an execution sandbox containing one or
-more Containers.
-
-```tsx
-<Pod name="api" network="backend">
-  <Container name="app" image="api:v1" />
-  <Container name="sidecar" image="proxy:v1" />
-</Pod>
-```
+`nerdctl ps`, `nerdctl inspect` and `nerdctl events` are not used to observe.
+A `ContainerdObserver` connects to containerd's gRPC API directly:
 
 ```text
-Pod
-├─ sandbox
-├─ network namespace
-├─ shared networking
-├─ shared volumes where applicable
-├─ lifecycle boundary
-│
-├─ Container
-└─ Container
+containerd
+   │ unix socket / gRPC
+   ▼
+ContainerdObserver
+   ▼
+ObservedStateStore
+   ▼
+controllers
 ```
 
-Pod-level properties determine the sandbox. Container-level properties
-determine processes and root filesystems inside that sandbox.
-
----
-
-## Immutability model
-
-Containers and Pods are treated as mostly immutable resources. Do not model
-every runtime property as an in-place mutation:
+Services used, all read-only:
 
 ```text
-CPU / memory
-  → potentially update in place
-
-image / command / environment / rootfs
-  → replace Container
-
-sandbox/network namespace properties
-  → replace Pod
+Containers.List / Containers.Get     identity, image, labels
+Tasks.List / Tasks.Get               running state, exit status
+Events.Subscribe                     lifecycle events
 ```
 
-The runtime adapter owns this decision:
+Why the API rather than the CLI: there is no text to parse, no process spawn
+per read, and events arrive as typed messages with a container id and an exit
+status in fields rather than as lines to interpret.
+
+### containerd is read-only
+
+fiber-servo must never call a containerd mutation RPC:
 
 ```text
-old ContainerSpec
-      ↓
-planner
-  ┌───┴────┐
-update   replace
+Containers.Create / Update / Delete
+Tasks.Create / Start / Kill / Delete / Update
+image pull, snapshot creation, namespace creation
 ```
 
-Replacement strategy belongs above the individual runtime object:
+Anything that needs one goes through the Compose model instead.
 
-```text
-Container
-  = replaceable execution unit
+### Namespace and socket
 
-ReplicaSet
-  = maintains a number of Pods
-
-Deployment
-  = manages rollout between Pod template generations
-```
-
-This avoids leaking runtime-specific `stop/delete/create/start` sequences into
-React.
+The containerd namespace that `nerdctl compose` writes into and the one the
+observer reads from **must be the same**, and must come from one place in the
+configuration. The write and read paths never derive it separately. The socket
+path is configurable and never hardcoded — rootless containerd puts it
+elsewhere.
 
 ---
 
 ## Observed state
 
-Runtime changes are not React diffs. Given:
-
-```tsx
-<ReplicaSet replicas={3} />
-```
-
-if one Pod dies:
-
-```text
-desired = 3
-actual = 2
-```
-
-the JSX and the fiber props have not changed. So do **not** force a React
-update by artificially changing values such as a restart generation purely to
-trigger `commitUpdate`. Instead:
+Runtime changes are not React diffs.
 
 ```text
 runtime event
  ↓
-Observed State / StatusStore
+ObservedStateStore
  ↓
-ReplicaSet controller
+controllers
  ↓
 desired 3 vs actual 2
  ↓
-create one Pod
+a new Compose model, applied
 ```
 
-Observed state feeds controller logic; it is not converted into fake
-desired-state mutations. This supersedes the `restarts` host prop and the
-`START` op that `useSelfHeal` drives today (decision 6).
-
----
-
-## Runtime layer
-
-The runtime layer receives declarative Pod/Container specifications and
-realizes them. Roughly:
-
-```ts
-interface Runtime {
-  createPod(spec: PodSpec): Promise<PodHandle>;
-  removePod(id: string): Promise<void>;
-
-  createContainer(podId: string, spec: ContainerSpec): Promise<ContainerHandle>;
-  removeContainer(id: string): Promise<void>;
-
-  inspect(): Promise<ObservedState>;
-  subscribe(listener: RuntimeEventListener): Unsubscribe;
-}
-```
-
-The exact API is not fixed. The constraint is:
-
-> **React does not emit runtime command sequences.**
-
----
-
-## containerd / CRI direction
-
-Pod support makes CRI a potentially useful runtime boundary. CRI already has:
-
-```text
-RunPodSandbox
-StopPodSandbox
-RemovePodSandbox
-
-CreateContainer
-StartContainer
-StopContainer
-RemoveContainer
-```
-
-Using CRI could avoid implementing Pod sandbox and network lifecycle directly
-on top of raw containerd. This decision stays behind the Runtime abstraction;
-the React resource model must not depend on CRI. Possible implementations:
-
-```text
-CriRuntime
-RawContainerdRuntime
-```
-
-Start with whichever gives the smallest correct implementation.
+Observed state feeds controllers. It is never converted into a fake
+desired-state mutation.
 
 ---
 
 ## Networking
 
-Networking is intentionally limited to single-node behavior, roughly at the
-feature level of a Docker user-defined bridge network.
+Single node, bridge only, at roughly the feature level of a Docker
+user-defined network.
 
 ```tsx
 <Network name="backend" />
 ```
 
-A Network represents approximately:
-
-```text
-local bridge
-subnet
-gateway
-IP allocation
-Pod attachments
-```
-
-Do not implement, for the first version:
-
-```text
-overlay networking
-multi-node routing
-NetworkPolicy
-cluster-wide CNI control plane
-```
-
-A Pod references a Network:
-
-```tsx
-<Pod network="backend">...</Pod>
-```
-
-Networking belongs to the Pod sandbox, not to individual Containers by
-default.
+Networks are Compose's to create, attach and remove; fiber-servo only declares
+them in the model. Not in scope: overlay networking, multi-node routing,
+NetworkPolicy, a cluster-wide CNI control plane.
 
 ---
 
-## External exposure / Service
+## Service
 
-External exposure is needed. Direct host-port publishing on a Pod may be
-supported as a minimal mechanism, but it does not solve the ReplicaSet case:
-several Pods cannot all own the same host port. Hence a Service abstraction:
+Several replicas cannot share a host port, so external exposure needs a
+Service:
 
 ```tsx
 <Service name="api" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
@@ -419,160 +328,22 @@ host :8080
     ↓
 Service
     ↓
-Pod A :8080
-Pod B :8080
-Pod C :8080
+api-0  api-1  api-2
 ```
-
-Responsibilities:
 
 ```text
-ReplicaSet
-  = compute reconciliation
-
-Service
-  = network endpoint reconciliation
+ReplicaSet  = compute reconciliation
+Service     = network endpoint reconciliation
 ```
 
-A Service observes the current Pods matching its selector and maintains the
-backend set. Note the difference from today's `<Service>`, which takes an
-explicit `targets` list computed by `<Deployment>` at render time (decision
-16): selection becomes an observed-state query, not a render-time array.
-
-### Service data plane
-
-Separate the Service API from its implementation. React exposes:
-
-```tsx
-<Service ... />
-```
-
-but the backing implementation is replaceable:
-
-```text
-proxy container
-host userspace proxy
-nftables
-```
-
-For the first implementation, a proxy container or a small proxy daemon is
-acceptable:
-
-```text
-React Service resource
-        ↓
-Service Controller
-        ↓
-proxy configuration
-        ↓
-fiber-servo proxy
-        ↓
-matching Pod IPs
-```
-
-Do not make React itself responsible for packet forwarding. The Service is
-control plane; the proxy is data plane.
-
----
-
-## React host components
-
-The likely initial split:
-
-```text
-React Components / Controllers
-├─ Deployment
-└─ ReplicaSet
-
-Host Resources
-├─ Network
-├─ Service
-├─ Pod
-└─ Container
-```
-
-This may evolve during implementation. The key distinction:
-
-```text
-normal React Component
-  = policy / abstraction / controller logic
-
-Host Component
-  = resource materialized outside React
-```
-
----
-
-## Why not Compose
-
-Compose was considered as an intermediate representation. It is useful as a
-container application model, but making Compose the primary runtime boundary
-introduces another diff/application layer:
-
-```text
-React diff
- ↓
-Compose model
- ↓
-compose up
- ↓
-Compose performs another diff
-```
-
-That weakens the value of using React reconciliation. `fiber-servo` should not
-become:
-
-```text
-JSX → Compose YAML generator
-```
-
-React must remain meaningful as the control-plane reconciler. Compose may still
-be supported later as an export format or an optional backend, but it is not
-the core architecture. This replaces the previous revision of this plan, which
-made Compose the execution boundary.
-
----
-
-## Initial scope
-
-A React-based single-node container orchestrator.
-
-Initial concepts:
-
-```text
-Network
-Pod
-Container
-ReplicaSet
-Deployment
-Service
-```
-
-Initial runtime:
-
-```text
-containerd
-```
-
-potentially through CRI.
-
-Initial networking:
-
-```text
-local bridge only
-```
-
-Initial Service implementation:
-
-```text
-simple proxy / host forwarding backend
-```
+The backend set is resolved from observed state, not from a prop, because
+containers come and go without the tree changing. Control plane and data plane
+are separate: today the data plane is a small proxy container in the same
+model, and replacing it with nftables would change one function.
 
 ---
 
 ## Explicit non-goals
-
-For now, do not implement:
 
 ```text
 multi-node scheduling
@@ -583,7 +354,7 @@ overlay networking
 NetworkPolicy
 Kubernetes API compatibility
 full Kubernetes semantics
-Swarm compatibility
+Pod semantics and sidecars
 ```
 
 The project should stay small enough that the React/Fiber experiment remains
@@ -591,40 +362,7 @@ visible.
 
 ---
 
-## Implementation order
-
-1. Refactor the current runtime boundary so React no longer emits low-level
-   lifecycle command sequences. Today `src/hostConfig.ts` pushes
-   `CREATE`/`UPDATE`/`DELETE`/`START` ops directly from commit; the boundary
-   becomes a declarative desired-resource set instead.
-2. Introduce declarative `PodSpec` / `ContainerSpec` types, alongside the
-   existing `ContainerSpec` in `src/ops.ts`.
-3. Introduce a Runtime abstraction that accepts specs rather than ops. The
-   current `Runtime`/`RuntimeHandle` in `src/serve.ts` is an op sink; it grows
-   an apply/inspect/subscribe shape.
-4. Implement Pod and Container as runtime resources, with the Pod as the
-   sandbox boundary and the Container inside it.
-5. Move actual-state feedback into an explicit observed-state path. The status
-   store (`src/status.ts`) is already outside the tree; what changes is that
-   controllers, not `useSelfHeal`, consume it — retiring the `restarts` prop
-   and the `START` op.
-6. Implement ReplicaSet as a controller using desired replicas plus observed
-   Pods, replacing the render-time replica expansion in `<Deployment>`.
-7. Implement the local bridge Network, with Pod attachment as an explicit
-   reference rather than JSX ancestry.
-8. Implement Deployment rollout semantics on top of ReplicaSet.
-9. Introduce Service as a stable endpoint over matching Pods, selected from
-   observed state.
-10. Implement the first Service data plane using the simplest practical proxy
-    mechanism.
-
-Keep working behavior covered by tests at each step.
-
----
-
 ## Design rules
-
-Keep these rules while implementing:
 
 ```text
 React reconciles management resources.
@@ -633,15 +371,17 @@ Controllers reconcile runtime resources.
 
 Runtime events are observed state, not React diffs.
 
-Containers and Pods are immutable-ish.
+Writes go through nerdctl Compose. Reads go directly to containerd.
 
-Replacement strategy belongs to controllers/runtime adapters.
+containerd is an observed-state API, never a mutation API.
 
-Ownership is a tree.
+fiber-servo does not decompose work into low-level runtime operations.
 
-Resource relationships are a graph.
+A container is the unit. One container is one Compose service.
 
-Networking is Pod-scoped.
+Ownership is a tree. Resource relationships are a graph.
+
+Namespace is configured once and shared by both paths.
 
 Service control plane and data plane are separate.
 
@@ -650,5 +390,5 @@ Do not recreate Kubernetes unless the experiment requires it.
 
 The project should remain understandable as:
 
-> React Fiber used as the control plane for a small single-node container
-> orchestrator.
+> React Fiber used as the control plane for a Compose application on one
+> machine.
