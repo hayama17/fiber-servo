@@ -27,7 +27,13 @@
  * parses a JSON document handed to `compose -f` and round-trips `"yes"` and
  * `"1.0"` as the strings they are.
  */
-import { digest, type ContainerSpec, type NetworkSpec, type ResourceLimits } from './resources.js';
+import {
+  digest,
+  type ContainerSpec,
+  type NetworkSpec,
+  type ReadinessProbe,
+  type ResourceLimits,
+} from './resources.js';
 
 /** Label marking every container fiber-servo owns. Anything without it is left alone. */
 export const MANAGED_LABEL = 'fiber-servo.managed';
@@ -51,6 +57,40 @@ export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project';
 
 /** Where nerdctl records a container's networks. Read back through the containerd observer. */
 export const NERDCTL_NETWORKS_LABEL = 'nerdctl/networks';
+
+/**
+ * The readiness probe, as percent-encoded JSON.
+ *
+ * Compose has a `healthcheck` field, but nerdctl does not implement it, so a
+ * probe cannot be delegated to the actuator — fiber-servo has to run it
+ * itself. That leaves a gap: `apply()` receives a `ComposeApplication` and
+ * nothing else, so without this label the adapter never learns there is
+ * anything to probe and `<Ready until="ready">` would wait for ever.
+ *
+ * A label is the right channel rather than a hack: Compose passes a service's
+ * labels through to the container unchanged, so the probe is readable back
+ * off a *running* container. After a fiber-servo restart the prober recovers
+ * its schedule from the runtime, exactly as `SPEC_LABEL` recovers which spec
+ * a container was created from. Percent-encoded because a raw JSON object in
+ * a label does not survive every tool that prints labels as a comma-joined
+ * list.
+ */
+export const READINESS_LABEL = 'fiber-servo.readiness';
+
+export function encodeReadiness(probe: ReadinessProbe): string {
+  return encodeURIComponent(JSON.stringify(probe));
+}
+
+/** Inverse of `encodeReadiness`. A foreign or corrupt value reads as "no probe", never as a crash. */
+export function decodeReadiness(value: string | undefined): ReadinessProbe | undefined {
+  if (!value) return undefined;
+  try {
+    const probe = JSON.parse(decodeURIComponent(value)) as ReadinessProbe;
+    return Array.isArray(probe?.exec) ? probe : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ---- the model --------------------------------------------------------------
 
@@ -120,6 +160,7 @@ export function toComposeService(spec: ContainerSpec): ComposeService {
     [MANAGED_LABEL]: 'true',
     [SPEC_LABEL]: digest(spec),
   };
+  if (spec.readiness) labels[READINESS_LABEL] = encodeReadiness(spec.readiness);
   const service: ComposeService = { image: spec.image, labels };
   if (spec.command?.length) Object.assign(service, { command: [...spec.command] });
   if (spec.env && Object.keys(spec.env).length > 0) Object.assign(service, { environment: { ...spec.env } });

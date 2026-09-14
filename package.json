@@ -1,13 +1,14 @@
 {
   "name": "fiber-servo",
   "version": "0.1.0",
-  "description": "React Fiber as the control plane for a single-node container orchestrator: Pods, ReplicaSets and Services reconciled against containerd.",
+  "description": "React Fiber as the control plane for a single-node container orchestrator: containers, ReplicaSets and Services, applied through nerdctl compose and observed through containerd.",
   "keywords": [
     "react",
     "react-reconciler",
     "containers",
     "containerd",
     "nerdctl",
+    "compose",
     "orchestration",
     "reconciler",
     "declarative",

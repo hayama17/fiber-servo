@@ -1,21 +1,25 @@
 /**
  * containerd, wired up as a `RuntimeFactory` for `serve()`. See `runtime.ts`
- * for what actually happens; this file only builds the two seams --
- * `nerdctl` for writes, `api` (a gRPC client) plus `cni` (CNI config reads)
- * for reads -- and hands them, plus the calling `RuntimeContext`, to
- * `createContainerdRuntime`.
+ * for what actually happens; this file only builds the two seams -- `nerdctl`
+ * for the write path (`compose`), `api` (a gRPC client) for the read path --
+ * and hands them, plus the calling `RuntimeContext`, to `createContainerdRuntime`.
  */
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { RuntimeContext, RuntimeFactory } from '../types.js';
+import { DEFAULT_PROJECT } from '../../compose.js';
 import { createNerdctl, type NerdctlOptions } from './nerdctl.js';
-import { createContainerdApi } from './api.js';
-import { DEFAULT_CNI_PATH } from './cni.js';
+import { createContainerdApi, DEFAULT_ADDRESS, DEFAULT_NAMESPACE } from './api.js';
 import { createContainerdRuntime } from './runtime.js';
 
+/** Where `apply` renders the model, and `down` reads it back from, if `composeFile` is not given. */
+export const DEFAULT_COMPOSE_FILE = join(tmpdir(), 'fiber-servo', 'compose.json');
+
 export interface ContainerdOptions extends NerdctlOptions {
-  /** Image for every Pod's sandbox container. Default: `DEFAULT_SANDBOX_IMAGE`. */
-  sandboxImage?: string;
-  /** Root of the CNI configuration tree networks are read from. Default `/etc/cni/net.d` (`cni.ts`'s own default). */
-  cniPath?: string;
+  /** The Compose project this adapter manages. Default `compose.ts`'s `DEFAULT_PROJECT`. */
+  project?: string;
+  /** Stable path the rendered model is written to and `down` is applied against. Default `DEFAULT_COMPOSE_FILE`. */
+  composeFile?: string;
   /** How often the readiness prober looks for containers due for a check. Default 250. */
   probeTickMs?: number;
   /** Delay before reattaching a dead event stream, and the spacing of the resync fallback while it stays down. Default 1000. */
@@ -24,12 +28,19 @@ export interface ContainerdOptions extends NerdctlOptions {
 
 /** containerd as a `Runtime` for `serve()`. */
 export function containerd(options: ContainerdOptions = {}): RuntimeFactory {
+  // Namespace scopes both halves of this adapter -- nerdctl's `--namespace`
+  // flag and containerd's own gRPC metadata (`api.ts`) -- and it has to be
+  // the exact same string on both sides, or writes and reads would silently
+  // talk to two different containerd namespaces. Computing it once here,
+  // rather than letting each seam fall back to its own default independently,
+  // is what guarantees that.
+  const namespace = options.namespace ?? DEFAULT_NAMESPACE;
   return (ctx: RuntimeContext) =>
     createContainerdRuntime({
-      nerdctl: createNerdctl(options),
-      api: createContainerdApi({ address: options.address, namespace: options.namespace }),
-      cni: { cniPath: options.cniPath ?? DEFAULT_CNI_PATH, namespace: options.namespace },
-      sandboxImage: options.sandboxImage,
+      nerdctl: createNerdctl({ bin: options.bin, namespace, address: options.address }),
+      api: createContainerdApi({ address: options.address, namespace }),
+      project: options.project ?? DEFAULT_PROJECT,
+      composeFile: options.composeFile ?? DEFAULT_COMPOSE_FILE,
       probeTickMs: options.probeTickMs,
       reconnectDelayMs: options.reconnectDelayMs,
       log: ctx.log,
@@ -40,35 +51,10 @@ export function containerd(options: ContainerdOptions = {}): RuntimeFactory {
 export { createContainerdRuntime } from './runtime.js';
 export type { ContainerdRuntimeOptions } from './runtime.js';
 
-export {
-  createNerdctl,
-  CONTAINER_LABEL,
-  MANAGED_LABEL,
-  POD_LABEL,
-  ROLE_LABEL,
-  SPEC_JSON_LABEL,
-  SPEC_LABEL,
-} from './nerdctl.js';
+export { createNerdctl } from './nerdctl.js';
 export type { ExecResult, Nerdctl, NerdctlOptions } from './nerdctl.js';
 
-export {
-  DEFAULT_SANDBOX_IMAGE,
-  encodeSpecLabel,
-  infraName,
-  infraRunArgs,
-  memberName,
-  memberRunArgs,
-  networkCreateArgs,
-  updateResourcesArgs,
-} from './naming.js';
-
-export {
-  decodeSpecLabel,
-  derivePodPhase,
-  phaseFromTask,
-  reconstructPodSpec,
-  toObservedContainer,
-} from './parse.js';
+export { phaseFromTask, READINESS_LABEL, toObservedContainer } from './parse.js';
 
 export { createContainerdApi, DEFAULT_ADDRESS, DEFAULT_NAMESPACE } from './api.js';
 export type {
@@ -79,6 +65,3 @@ export type {
   ContainerdApi,
   ContainerdApiOptions,
 } from './api.js';
-
-export { listNetworks, DEFAULT_CNI_PATH, BUILT_IN_NETWORKS } from './cni.js';
-export type { CniOptions } from './cni.js';

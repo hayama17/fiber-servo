@@ -5,20 +5,18 @@ container runtime is. Everything above it speaks specs (see
 [`docs/architecture.md`](architecture.md)); this is where a spec becomes a
 process.
 
-It talks to containerd two different ways, on purpose.
+It talks to two different things, and the seam between them is **who owns the
+resource**:
 
 ```text
-writes  ──> nerdctl CLI            run, rm, update, network create/rm
-reads   ──> containerd gRPC API    containers, tasks, phases, exit codes, events
-networks ─> CNI config files       because containerd has no idea what a network is
+writes  ──> nerdctl compose      up / rm / down. Owns images, networks, running
+reads   ──> containerd gRPC      Containers, Tasks, Events. Owns what is alive
 ```
 
-Writing needs what nerdctl brings: image resolution and unpacking, OCI spec
-generation, CNI attachment, port publishing. Reading needs none of it, and
-paid for the CLI three times over — parsing `--format` output, a process spawn
-per read, and a line-oriented parse of `nerdctl events`. Decision 29 in
-[`docs/decisions.md`](decisions.md) records the split and the bug that forced
-it.
+fiber-servo never assembles a `nerdctl run` command line, and it never mutates
+containerd — no `Containers.Create`, no `Tasks.Start`, no image pull, no
+snapshot. Decisions 30 and 33 in [`docs/decisions.md`](decisions.md) record why
+the seam moved here from an earlier read-versus-write split.
 
 ## Requirements
 
@@ -40,77 +38,109 @@ const served = serve(<App />, {
 
 `containerd(options)`:
 
-| Option             | Default                           |                                                                                  |
-| ------------------ | --------------------------------- | -------------------------------------------------------------------------------- |
-| `namespace`        | `default`                         | containerd namespace. Also the CNI config subdirectory.                          |
-| `address`          | `/run/containerd/containerd.sock` | containerd's socket.                                                             |
-| `sandboxImage`     | `registry.k8s.io/pause:3.9`       | What a Pod's sandbox runs. Point it at a mirror if that registry is unreachable. |
-| `cniPath`          | `/etc/cni/net.d`                  | Where networks are read from.                                                    |
-| `probeTickMs`      | `250`                             | How often the readiness prober looks for work.                                   |
-| `reconnectDelayMs` | `1000`                            | Backoff before reattaching a dead event stream.                                  |
+| Option             | Default                            |                                                                        |
+| ------------------ | ---------------------------------- | ---------------------------------------------------------------------- |
+| `namespace`        | `default`                          | containerd namespace. Reaches **both** seams; see below.               |
+| `address`          | `/run/containerd/containerd.sock`  | containerd's socket. Rootless containerd puts it elsewhere.            |
+| `bin`              | `nerdctl`                          | The actuator binary.                                                   |
+| `project`          | `fiber-servo`                      | The Compose project every container belongs to.                        |
+| `composeFile`      | `$TMPDIR/fiber-servo/compose.json` | Where the rendered model is written. Must be stable — `down` reads it. |
+| `probeTickMs`      | `250`                              | How often the readiness prober looks for work.                         |
+| `reconnectDelayMs` | `1000`                             | Backoff before reattaching a dead event stream.                        |
 
-## How a Pod is faked
+**`namespace` is computed once and handed to both seams.** It becomes
+`nerdctl --namespace <ns> compose …` and containerd's `containerd-namespace`
+gRPC metadata. If the two ever disagreed, the write path would create
+containers the read path could not see, and the loop would create them again
+for ever. `index.ts` is the only place it is resolved.
 
-containerd has no Pod. This adapter builds one the way CRI does:
+## What `apply()` does
+
+The control plane hands the adapter a whole `ComposeApplication` — never a
+sequence of operations. Turning that into a running machine is three steps,
+and the reason it is not one is measured, not assumed:
 
 ```text
-Pod "api"
-├─ api            infra/sandbox container — owns the network namespace,
-│                 runs `pause`, holds the published ports
-├─ api-app        --network=container:api
-└─ api-sidecar    --network=container:api
+1. render the model to composeFile
+2. nerdctl compose -f <file> rm -f -s <changed…> <orphaned…>
+3. nerdctl compose -f <file> up -d --no-recreate
 ```
 
-The infra container is named after the Pod, so `nerdctl ps` reads as one row
-per Pod, and members are `<pod>-<container>`. `naming.ts` owns that mapping and
-is the only place a runtime name is assembled.
+`compose up -d` on its own recreates **every** container on every invocation,
+even when nothing changed — nerdctl does not implement the config-hash check
+Docker Compose has. Under a level-triggered loop that would churn the whole
+application for ever. `--no-recreate` makes `up` idempotent (ids stay stable)
+and self-healing (a killed container is simply started again), but it also
+means literally that: a changed service is left alone. So step 2 evicts what
+changed, and step 3 creates it back, creates what is new, and restarts what
+merely stopped. One command, three jobs, and nothing in the adapter has to
+tell them apart.
 
-**Published ports belong to the infra container.** Once a container joins a
-namespace with `--network=container:X`, nerdctl refuses `-p` on it: the port
-table belongs to X. So `PodTemplate.publish` is applied to the sandbox,
-whichever member's process actually listens.
+**Which services changed** comes from comparing the desired digest against the
+`fiber-servo.spec` label read back off the running container. That is the same
+recorded-spec mechanism the pre-Compose adapter used (decision 26), now
+carrying the write path too.
+
+**A wrinkle, verified against a real daemon.** `compose rm -s <service>`
+validates its target against the file passed with `-f`, and fails with
+`no such service` if the key is missing — it does not fall back to finding the
+container by label. An orphaned service is by definition no longer in the
+model, so step 1 writes the model _plus a bare `{ image }` stub_ for each
+orphan, and rewrites the file as the true model immediately afterwards, before
+`up` ever reads it.
+
+`down()` is `compose -f <file> down`, guarded by the file existing — `down`
+against a missing file is an error, not a no-op.
 
 ## Labels, and how a restart recovers
 
 Every container carries:
 
-| Label                   |                                                                                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `fiber-servo.managed`   | Ours. Anything without it is left strictly alone.                                                                                                                                                      |
-| `fiber-servo.pod`       | Which Pod it belongs to.                                                                                                                                                                               |
-| `fiber-servo.container` | Which member it is.                                                                                                                                                                                    |
-| `fiber-servo.role`      | `infra` or `member`.                                                                                                                                                                                   |
-| `fiber-servo.spec`      | `digest()` of the spec it was created from.                                                                                                                                                            |
-| `fiber-servo.spec-json` | The spec itself, percent-encoded JSON — `PodSpec` on the sandbox, `ContainerSpec` on a member. Percent-encoded because a raw JSON object does not survive `nerdctl ps`'s comma-joined `Labels` column. |
+| Label                        |                                                                    |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `fiber-servo.managed`        | Ours. Anything without it is left strictly alone.                  |
+| `fiber-servo.spec`           | `digest()` of the `ContainerSpec` it was created from.             |
+| `fiber-servo.readiness`      | The readiness probe, percent-encoded JSON. Only when there is one. |
+| `com.docker.compose.service` | Compose's own — and it is the name our controllers chose.          |
+| `com.docker.compose.project` | Compose's own.                                                     |
+| `nerdctl/networks`           | nerdctl's own. Network membership, without reading a CNI file.     |
 
-The last two are what make the immutability model work across a restart: the
-planner compares a desired spec against the spec a Pod was _created_ with, not
-against what is running, because only that tells it which field changed (see
-decision 26). A container with no fiber-servo labels is adopted, never
-removed — fiber-servo shares a machine, it does not own one.
+Identity needs no label of fiber-servo's invention: Compose mangles the
+container name to `<project>-<service>-<index>` but records the service name,
+which is the name the controllers chose (`api-0`, `web-43bfee23-1`). Two of
+the six labels above are ours; the rest were already there.
+
+A container with no `fiber-servo.managed` label is adopted, never removed —
+fiber-servo shares a machine, it does not own one. And because the digest and
+the probe live on the resource rather than in the process, a fiber-servo
+restart recovers both: what each container was created from, and what to probe
+it with.
+
+## Readiness
+
+Compose has a `healthcheck` field. **nerdctl does not implement it** — `up`
+accepts one and silently ignores it — so readiness cannot be delegated and
+fiber-servo runs the probe itself, with `nerdctl compose exec <service>`.
+
+The probe has to reach the adapter somehow, and `apply()` receives a
+`ComposeApplication` and nothing else. So it rides in the service's labels
+under `fiber-servo.readiness`, written by `toComposeService` in
+`src/compose.ts` and read back by the adapter — off the model for a service
+about to be applied, and off a running container when rebuilding the schedule
+after a restart.
 
 ## Files
 
-| File         |                                                                    |
-| ------------ | ------------------------------------------------------------------ |
-| `index.ts`   | `containerd()`: wires the three seams together.                    |
-| `nerdctl.ts` | The write seam: `exec`. Tests inject a fake.                       |
-| `api.ts`     | The read seam: containerd gRPC over vendored protos.               |
-| `cni.ts`     | Networks, read from `nerdctl-*.conflist`.                          |
-| `naming.ts`  | Spec → argv, and Pod → runtime names. Pure.                        |
-| `parse.ts`   | What little decoding is left: the spec label, task status → phase. |
-| `runtime.ts` | The `Runtime` implementation itself.                               |
+| File         |                                                                                    |
+| ------------ | ---------------------------------------------------------------------------------- |
+| `index.ts`   | `containerd()`: builds the two seams and resolves the namespace.                   |
+| `nerdctl.ts` | The write seam: `exec`. Tests inject a fake.                                       |
+| `api.ts`     | The read seam: containerd gRPC over vendored protos.                               |
+| `parse.ts`   | Pure decoding: task status → phase, labels → `ObservedContainer`.                  |
+| `runtime.ts` | The `Runtime` implementation: `apply`, `down`, `inspect`, `subscribe`, the prober. |
 
-`api.ts` and `cni.ts` are separately testable against a live daemon without
-creating a single container, which is how the network path and the event
-decoding were verified.
-
-## The one read still on nerdctl
-
-A Pod's IP. It is a CNI result, not containerd state, and `ApiContainer`
-carries nothing about networking, so it is still
-`nerdctl inspect --format '{{.NetworkSettings.IPAddress}}'`. It is marked as
-the exception in `runtime.ts`.
+`api.ts` is separately testable against a live daemon without creating a
+single container, which is how the event decoding was verified.
 
 ## Events
 
@@ -129,17 +159,17 @@ caught against a live daemon.
 
 If the stream dies, the adapter emits a `resync` from a full `inspect()` and
 reattaches with backoff, so a missed event costs a late reconcile rather than
-a wrong one.
+a wrong one. It also resyncs when a subscriber first attaches, so nothing has
+to have been watching from the start.
 
 ## Known limitations
 
-- **Resource values are what was asked for, not what the cgroup says.**
-  `ObservedPod.spec` reports the recorded spec. containerd's API exposes no
-  cgroup limits, and the previous nerdctl-based overlay read a field
-  (`HostConfig.NanoCpus`) that nerdctl 2.1.2 does not emit, so it was already
-  doing nothing.
-- **Single writer.** One fiber-servo per machine per namespace. Two would each
-  hold their own idea of desired state and fight.
-- **No image pulling policy.** `--pull=missing`; there is no periodic refresh.
-- **The sandbox image must be reachable.** `registry.k8s.io/pause:3.9` by
-  default, which is blocked on some networks; use `sandboxImage`.
+- **Single writer.** One fiber-servo per machine per namespace, per project.
+  Two would each hold their own idea of desired state and fight.
+- **No image pulling policy.** Compose pulls what is missing; there is no
+  periodic refresh.
+- **Resource limits are what was asked for**, not what the cgroup reports.
+  containerd's API exposes no cgroup limits.
+- **No sidecars.** A container is the unit (decision 32). Several containers
+  sharing a network namespace would be a Compose feature
+  (`network_mode: service:<name>`), not a fiber-servo resource kind.
