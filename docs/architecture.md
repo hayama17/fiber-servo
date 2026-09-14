@@ -108,7 +108,7 @@ halves.
 | `planner.ts`          | Desired vs observed becomes actions. Pure. Owns the immutability model. |
 | `runtime/types.ts`    | The adapter contract.                                                   |
 | `runtime/memory.ts`   | The reference adapter: the whole system runs without containerd.        |
-| `runtime/containerd/` | The real adapter, over nerdctl.                                         |
+| `runtime/containerd/` | The real adapter: nerdctl writes, containerd API reads, CNI networks.   |
 | `serve.ts`            | The control loop, plus restart backoff.                                 |
 
 ## Ownership is a tree; relationships are a graph
