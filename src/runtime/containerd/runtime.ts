@@ -25,36 +25,66 @@
  * the same logic: it is the infra container's address, because that address
  * is the Pod's address -- every member answers on it too, by construction.
  *
+ * ---- Reads on the API, writes on the CLI --------------------------------
+ *
+ * Creating, removing and updating containers still goes through `nerdctl`
+ * (`nerdctl.ts`, `naming.ts`) -- it carries image resolution, CNI attachment
+ * and port publishing that would otherwise have to be reimplemented. But
+ * *reading back* what exists goes straight to containerd's own gRPC API
+ * (`api.ts`), for the reasons laid out in that file's doc: no text to parse,
+ * no process per read, typed events. Concretely, everywhere this file used to
+ * run `nerdctl inspect --format '...'` or `nerdctl ps --format '{{json .}}'`
+ * now calls `api.listContainers()` / `api.listTasks()` / `api.getContainer()`
+ * instead, and `nerdctl events` is replaced by `api.subscribe`. Networks are
+ * CNI configuration files, which containerd has no notion of at all, so they
+ * come from `cni.ts` instead of either.
+ *
+ * One read stays on nerdctl regardless: a Pod's IP. See the comment above
+ * `infraIp` for why -- it is a CNI result, not containerd state, and `cni.ts`
+ * has no way to attribute an address to a *specific running container*.
+ *
+ * `ApiContainer.id` is containerd's own container id -- a generated 64-hex
+ * string -- **not** the `--name` this adapter gave it at `run` time (that
+ * name is just another label, `nerdctl/name`, among everything else nerdctl
+ * stores as labels). So nothing here can look a container up by its runtime
+ * name the way `nerdctl inspect <name>` used to; every read instead finds a
+ * container by *label* (`POD_LABEL`/`ROLE_LABEL`/`CONTAINER_LABEL`, all from
+ * `nerdctl.ts`) out of `api.listContainers()`'s full list. `classify` is the
+ * one place that turns a container's labels into "which Pod, which role" --
+ * inspecting a single Pod, inspecting one member, grouping a full resync, and
+ * resolving an event's id all go through it.
+ *
  * Everything else follows from having two kinds of container instead of one:
  *
  *   - `createPod` creates the sandbox, then every member, in that order (a
  *     member cannot join a namespace that does not exist yet); `removePod`
  *     removes every container carrying the Pod's `POD_LABEL`, sandbox
- *     included, found with one `ps --filter` rather than a remembered list.
+ *     included, found the same way `inspectPod` finds them.
  *   - Adoption is by spec digest (decision 10 in `docs/decisions.md`), same
  *     as everywhere else in this project: every resource this adapter
  *     creates is labelled with `digest(spec)` of *that resource's own*
  *     spec -- the whole `PodSpec` on the sandbox, one `ContainerSpec` per
  *     member -- so a restarted process recognises what it already made
- *     instead of recreating it. `MANAGED_LABEL`/`POD_LABEL`/`ROLE_LABEL`
- *     (all defined in `nerdctl.ts`) are what let `inspect()` tell "ours" from
- *     "not ours" and "sandbox" from "member" out of a flat `ps -a` listing,
- *     and group members back under their Pod.
+ *     instead of recreating it.
  *   - `ObservedPod.spec` is reconstructed from labels too, but *not* simply
  *     read back from one label -- see the comment above `reconstructPodSpec`
- *     in `parse.ts` for why (labels cannot be rewritten once a container
- *     exists, so a per-resource label plus a live cgroup read stands in for
- *     that instead).
+ *     in `parse.ts` for why, and for a live-resources caveat that reading
+ *     from the API (rather than `nerdctl inspect`) introduces.
  *
  * ---- Staying observable without trusting one source forever ------------
  *
- * `subscribe()` streams `nerdctl events` and translates lines as they
+ * `subscribe()` streams `api.subscribe` and translates events as they
  * arrive, but a process that only ever streamed would go blind the moment
  * that stream ends (containerd restarting, the socket dropping) without
- * knowing what it missed. So the event loop, on any such end, resyncs fully
- * with one `inspect()` and emits it as a `resync` event before it tries to
- * reattach -- see `runEventLoop`. The readiness prober runs alongside it,
- * `nerdctl exec`-ing each container's probe until it exits 0 (decision 15).
+ * knowing what it missed. So the event loop resyncs fully with one
+ * `inspect()` and emits it as a `resync` event both when a subscriber first
+ * attaches and on any such end, before it tries to reattach -- see
+ * `runEventLoop`. `api.subscribe`'s only signal that the stream is over is
+ * `onError` (there is no separate "ended cleanly" callback), so that is what
+ * reattachment keys off. The readiness prober runs alongside it, `nerdctl
+ * exec`-ing each container's probe until it exits 0 (decision 15) -- probing
+ * is not a state read, it is asking the container a question, which is not
+ * something containerd's API does on this project's behalf.
  */
 import type { ContainerSpec, NetworkSpec, PodSpec, ResourceLimits } from '../../resources.js';
 import { digest } from '../../resources.js';
@@ -73,6 +103,7 @@ import {
   MANAGED_LABEL,
   POD_LABEL,
   ROLE_LABEL,
+  SPEC_JSON_LABEL,
   SPEC_LABEL,
   type ExecResult,
   type Nerdctl,
@@ -86,25 +117,23 @@ import {
   networkCreateArgs,
   updateResourcesArgs,
 } from './naming.js';
+import type { ApiContainer, ApiEvent, ApiTask, ContainerdApi } from './api.js';
+import { listNetworks as listCniNetworks, type CniOptions } from './cni.js';
 import {
-  bytesToMemory,
   decodeSpecLabel,
   derivePodPhase,
-  interpretEventRow,
-  isManaged,
-  nanoCpusToCpu,
-  parseJsonSafe,
-  parsePsRow,
-  phaseFromStateStatus,
+  phaseFromTask,
   reconstructPodSpec,
   toObservedContainer,
-  type EventRow,
-  type ManagedRow,
 } from './parse.js';
 
 export interface ContainerdRuntimeOptions {
-  /** The process-execution seam; see `nerdctl.ts`. Tests inject a fake here. */
+  /** The process-execution seam for writes; see `nerdctl.ts`. Tests inject a fake here. */
   nerdctl: Nerdctl;
+  /** The gRPC read seam; see `api.ts`. Tests inject a fake here too. */
+  api: ContainerdApi;
+  /** Where networks are read from; see `cni.ts`. Default: `cni.ts`'s own defaults. */
+  cni?: CniOptions;
   /** Image for every Pod's sandbox container. Must do nothing but hold a network namespace open. Default: `DEFAULT_SANDBOX_IMAGE`. */
   sandboxImage?: string;
   log?: (line: string) => void;
@@ -116,7 +145,7 @@ export interface ContainerdRuntimeOptions {
   now?: () => number;
 }
 
-/** What the id index remembers about one containerd id, so an event can be resolved without an `inspect` on the hot path. */
+/** What the id index remembers about one containerd id, so an event can be resolved without a list call on the hot path. */
 type Tracked = { role: 'infra'; pod: string } | { role: 'member'; pod: string; container: string };
 
 interface ReadinessTarget {
@@ -127,13 +156,9 @@ interface ReadinessTarget {
   ready: boolean;
 }
 
-interface NetworkRow {
-  Name: string;
-  Labels?: string;
-}
-
 export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runtime {
-  const { nerdctl } = options;
+  const { nerdctl, api } = options;
+  const cniOptions = options.cni ?? {};
   const sandboxImage = options.sandboxImage ?? DEFAULT_SANDBOX_IMAGE;
   const log = options.log ?? (() => {});
   const onError = options.onError ?? ((e: Error) => console.error(e));
@@ -141,9 +166,9 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   const reconnectDelayMs = options.reconnectDelayMs ?? 1000;
   const now = options.now ?? (() => Date.now());
 
-  /** containerd id -> what it is. Populated by every `run` this process does, and by every `ps`/`inspect` sync. */
+  /** containerd id -> what it is. Populated by every `run` this process does, and by every list/inspect sync. */
   const idIndex = new Map<string, Tracked>();
-  /** Ids confirmed to carry no fiber-servo label, cached so a foreign container is inspected at most once. */
+  /** Ids confirmed to carry no fiber-servo label, cached so a foreign container is looked up at most once. */
   const notOurs = new Set<string>();
   /** Runtime member name -> its readiness schedule. The only place probe config lives; see `parse.ts`'s recorded-spec note. */
   const readinessTargets = new Map<string, ReadinessTarget>();
@@ -151,7 +176,7 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   let controller: AbortController | undefined;
   let revision = 0;
 
-  // ---- process execution ---------------------------------------------------
+  // ---- process execution (writes only) ---------------------------------------
 
   async function call(args: readonly string[]): Promise<ExecResult> {
     log(`$ nerdctl ${args.join(' ')}`);
@@ -170,7 +195,6 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
    * These patterns are copied verbatim from nerdctl 2.x output, not guessed:
    *
    *   rm / stop / update    no such container: <name>
-   *   inspect               no such object <name>
    *   network rm            no network found matching: <name>
    *                         no network could be removed
    *
@@ -202,21 +226,63 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     }
   }
 
-  // ---- single-container inspection -----------------------------------------
+  // ---- reading containers -----------------------------------------------------
 
-  interface Inspected {
-    id: string;
-    specDigest: string;
+  /**
+   * What one `ApiContainer`'s labels say it is, or `undefined` for a
+   * container this adapter does not own (no `MANAGED_LABEL`) or whose labels
+   * do not describe a recognisable role -- foreign to fiber-servo either way.
+   * The one place a container's labels turn into "which Pod, which role":
+   * every lookup in this file goes through it rather than re-reading labels
+   * itself.
+   */
+  function classify(container: ApiContainer): Tracked | undefined {
+    if (container.labels[MANAGED_LABEL] !== 'true') return undefined;
+    const pod = container.labels[POD_LABEL];
+    const role = container.labels[ROLE_LABEL];
+    if (!pod) return undefined;
+    if (role === 'infra') return { role: 'infra', pod };
+    if (role === 'member') {
+      const memberOf = container.labels[CONTAINER_LABEL];
+      return memberOf ? { role: 'member', pod, container: memberOf } : undefined;
+    }
+    return undefined;
   }
 
-  /** Presence + the resource's own `SPEC_LABEL`. `specDigest` is `''` for a container that exists but carries no such label -- see `createPod`. */
-  async function inspectContainer(name: string): Promise<Inspected | null> {
-    const res = await call(['inspect', '--format', `{{.Id}} {{index .Config.Labels "${SPEC_LABEL}"}}`, name]);
-    if (res.code !== 0) return null;
-    const [id = '', specDigest = ''] = res.stdout.trim().split(/\s+/);
-    return { id, specDigest };
+  function findInfra(containers: readonly ApiContainer[], pod: string): ApiContainer | undefined {
+    return containers.find((c) => {
+      const t = classify(c);
+      return t?.role === 'infra' && t.pod === pod;
+    });
   }
 
+  function findMember(
+    containers: readonly ApiContainer[],
+    pod: string,
+    container: string,
+  ): ApiContainer | undefined {
+    return containers.find((c) => {
+      const t = classify(c);
+      return t?.role === 'member' && t.pod === pod && t.container === container;
+    });
+  }
+
+  function podRows(containers: readonly ApiContainer[], pod: string): ApiContainer[] {
+    return containers.filter((c) => classify(c)?.pod === pod);
+  }
+
+  /**
+   * The Pod's IP address -- the one read left on `nerdctl`, and the only one.
+   * Every other read in this file goes through `api.ts` because it is pure
+   * containerd state; an address is not. It is CNI's doing (the bridge plugin
+   * assigns it from the network's IPAM range when the sandbox's namespace is
+   * created), and while `cni.ts` can read a *network's* subnet from its
+   * conflist, nothing on disk records which address CNI actually handed to
+   * *this* container -- that fact only exists in nerdctl's own container
+   * state, which is exactly what `NetworkSettings.IPAddress` reports. There is
+   * no containerd API to ask instead, so this is not a shortcut: it is the
+   * only source there is.
+   */
   async function infraIp(name: string): Promise<string | undefined> {
     const res = await call(['inspect', '--format', '{{.NetworkSettings.IPAddress}}', name]);
     if (res.code !== 0) return undefined;
@@ -227,100 +293,61 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     pod: string,
     container: string,
   ): Promise<ObservedContainer | undefined> {
-    const name = memberName(pod, container);
-    const res = await call([
-      'inspect',
-      '--format',
-      '{{.Id}} {{.State.Status}} {{.State.ExitCode}} {{.Config.Image}}',
-      name,
-    ]);
-    if (res.code !== 0) return undefined;
-    const [id = '', status = '', exitCodeRaw = '', image = ''] = res.stdout.trim().split(/\s+/);
-    const phase = phaseFromStateStatus(status);
-    return {
-      name: container,
-      id,
-      phase,
-      exitCode: phase === 'exited' && exitCodeRaw !== '' ? Number(exitCodeRaw) : undefined,
-      ready: readinessTargets.get(name)?.ready,
-      image: image || undefined,
-    };
-  }
-
-  /** Live cgroup limits for a batch of member names, one `inspect` call for all of them (same trick `listNetworks` uses for subnets). */
-  async function liveResources(names: readonly string[]): Promise<Map<string, ResourceLimits>> {
-    const out = new Map<string, ResourceLimits>();
-    if (names.length === 0) return out;
-    const res = await call([
-      'inspect',
-      '--format',
-      '{{.Name}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}',
-      ...names,
-    ]);
-    if (res.code !== 0) return out; // best-effort: a Pod mid-removal must not fail the whole inspect
-    for (const line of res.stdout.trim().split('\n')) {
-      if (!line.trim()) continue;
-      const [rawName, cpuRaw, memRaw] = line.trim().split(/\s+/);
-      const name = (rawName ?? '').replace(/^\//, '');
-      const cpu = nanoCpusToCpu(cpuRaw);
-      const memory = bytesToMemory(memRaw);
-      if (name && (cpu !== undefined || memory !== undefined)) out.set(name, { cpu, memory });
-    }
-    return out;
+    const [containers, tasks] = await Promise.all([api.listContainers(), api.listTasks()]);
+    const row = findMember(containers, pod, container);
+    if (!row) return undefined;
+    const task = tasks.find((t) => t.id === row.id);
+    return toObservedContainer(row, task, readinessTargets.get(memberName(pod, container))?.ready);
   }
 
   // ---- whole-Pod inspection --------------------------------------------------
 
-  async function findPodRows(pod: string): Promise<ManagedRow[]> {
-    const res = await call([
-      'ps',
-      '-a',
-      '--no-trunc',
-      '--filter',
-      `label=${POD_LABEL}=${pod}`,
-      '--format',
-      '{{json .}}',
-    ]);
-    if (res.code !== 0) return [];
-    return res.stdout
-      .split('\n')
-      .map(parsePsRow)
-      .filter((r): r is ManagedRow => r !== null && r.pod === pod);
-  }
-
-  async function buildObservedPod(pod: string, rows: readonly ManagedRow[]): Promise<ObservedPod> {
-    const infraRow = rows.find((r) => r.role === 'infra');
-    const memberRows = rows.filter((r) => r.role === 'member');
-    const ip = infraRow ? await infraIp(infraRow.name) : undefined;
-    const resources = await liveResources(memberRows.map((r) => r.name));
-    const containers = memberRows.map((r) => toObservedContainer(r, readinessTargets.get(r.name)?.ready));
+  async function buildObservedPod(
+    pod: string,
+    rows: readonly ApiContainer[],
+    tasks: readonly ApiTask[],
+  ): Promise<ObservedPod> {
+    const infraRow = rows.find((r) => classify(r)?.role === 'infra');
+    const memberRows = rows.filter((r) => classify(r)?.role === 'member');
+    const taskById = new Map(tasks.map((t) => [t.id, t] as const));
+    const infraPhase = infraRow ? phaseFromTask(taskById.get(infraRow.id)).phase : 'exited';
+    const containers = memberRows.map((r) => {
+      const memberOf = classify(r);
+      const name = memberOf?.role === 'member' ? memberOf.container : r.id;
+      return toObservedContainer(r, taskById.get(r.id), readinessTargets.get(memberName(pod, name))?.ready);
+    });
+    const ip = infraRow ? await infraIp(infraName(pod)) : undefined;
+    const template = decodeSpecLabel<PodSpec>(infraRow?.labels[SPEC_JSON_LABEL]);
     return {
       name: pod,
       id: infraRow?.id,
-      phase: derivePodPhase(infraRow?.phase ?? 'exited', containers),
+      phase: derivePodPhase(infraPhase, containers),
       ip,
-      labels: infraRow?.labels ?? {},
-      specDigest: infraRow?.specDigest,
-      spec: reconstructPodSpec(infraRow, memberRows, resources),
+      labels: template?.labels ?? {},
+      specDigest: infraRow?.labels[SPEC_LABEL],
+      spec: reconstructPodSpec(template, memberRows),
       containers,
       at: now(),
     };
   }
 
   async function inspectPod(pod: string): Promise<ObservedPod | undefined> {
-    const rows = await findPodRows(pod);
-    return rows.length === 0 ? undefined : buildObservedPod(pod, rows);
+    const [containers, tasks] = await Promise.all([api.listContainers(), api.listTasks()]);
+    const rows = podRows(containers, pod);
+    return rows.length === 0 ? undefined : buildObservedPod(pod, rows, tasks);
   }
 
   /** Every container belonging to `pod` (sandbox and members alike), removed in one `rm -f`. Returns whether anything was there to remove. */
   async function removePodContainers(pod: string): Promise<boolean> {
-    const rows = await findPodRows(pod);
+    const containers = await api.listContainers();
+    const rows = podRows(containers, pod);
     if (rows.length === 0) return false;
-    const res = await call(['rm', '-f', ...rows.map((r) => r.name)]);
+    const res = await call(['rm', '-f', ...rows.map((r) => r.id)]);
     if (res.code !== 0 && !isNotFound(res)) throw fail(res, `rm ${pod}`);
     for (const r of rows) {
       idIndex.delete(r.id);
-      if (r.role === 'member') readinessTargets.delete(r.name);
+      const t = classify(r);
+      if (t?.role === 'member') readinessTargets.delete(memberName(pod, t.container));
     }
     return true;
   }
@@ -347,9 +374,10 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
 
   /** Creates whichever of `spec.containers` does not exist yet. Returns whether it created anything. */
   async function ensureMembers(spec: PodSpec): Promise<boolean> {
+    const containers = await api.listContainers();
     let created = false;
     for (const c of spec.containers) {
-      if (!(await inspectContainer(memberName(spec.name, c.name)))) {
+      if (!findMember(containers, spec.name, c.name)) {
         await runMember(spec.name, c);
         created = true;
       }
@@ -358,6 +386,11 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   // ---- the Runtime methods ---------------------------------------------------
+  //
+  // `createNetwork`/`removeNetwork` are writes and stay exactly as they were:
+  // still `nerdctl network create`/`rm`, existence still checked with
+  // `nerdctl network inspect`. containerd has no notion of a network at all,
+  // so there is no API read to move this to -- see the file doc.
 
   async function createNetwork(spec: NetworkSpec): Promise<void> {
     const res = await call(['network', 'inspect', '--format', '{{.Name}}', spec.name]);
@@ -376,9 +409,10 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
 
   async function createPod(spec: PodSpec): Promise<void> {
     const wanted = digest(spec);
-    const existing = await inspectContainer(infraName(spec.name));
+    const containers = await api.listContainers();
+    const existing = findInfra(containers, spec.name);
 
-    if (existing && existing.specDigest === wanted) {
+    if (existing && existing.labels[SPEC_LABEL] === wanted) {
       idIndex.set(existing.id, { role: 'infra', pod: spec.name });
       // The sandbox matches, but its digest covers the *whole* spec, not
       // just itself -- a crash between creating it and finishing its members
@@ -411,9 +445,9 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   async function createContainer(pod: string, spec: ContainerSpec): Promise<void> {
-    const name = memberName(pod, spec.name);
-    if (await inspectContainer(name)) return; // idempotent, by presence -- same discipline as memory.ts
-    if (!(await inspectContainer(infraName(pod)))) {
+    const containers = await api.listContainers();
+    if (findMember(containers, pod, spec.name)) return; // idempotent, by presence -- same discipline as memory.ts
+    if (!findInfra(containers, pod)) {
       throw new Error(`fiber-servo: cannot create container "${spec.name}": Pod "${pod}" does not exist`);
     }
     await runMember(pod, spec);
@@ -422,10 +456,11 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   async function removeContainer(pod: string, name: string): Promise<void> {
-    const runtimeName = memberName(pod, name);
-    const existing = await inspectContainer(runtimeName);
+    const containers = await api.listContainers();
+    const existing = findMember(containers, pod, name);
     if (!existing) return; // idempotent: nothing to remove
-    const res = await call(['rm', '-f', runtimeName]);
+    const runtimeName = memberName(pod, name);
+    const res = await call(['rm', '-f', existing.id]);
     if (res.code !== 0 && !isNotFound(res)) throw fail(res, `rm ${runtimeName}`);
     idIndex.delete(existing.id);
     readinessTargets.delete(runtimeName);
@@ -445,78 +480,51 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     if (res.code !== 0) throw fail(res, `update ${memberName(pod, container)}`);
     // Resources are not part of ObservedContainer -- nothing here changes --
     // but a mutation happened, so subscribers still hear about it, the same
-    // as a real runtime firing an update event. The next inspect() sees the
-    // new limits live; see `reconstructPodSpec` in parse.ts.
+    // as a real runtime firing an update event. See `reconstructPodSpec` in
+    // parse.ts for why the *next* inspect() does not see the new limits live.
     const observed = await inspectMemberContainer(pod, container);
     if (observed) notify({ type: 'container', pod, container: observed });
   }
 
-  async function listNetworks(): Promise<Map<string, ObservedNetwork>> {
-    const res = await call(['network', 'ls', '--format', '{{json .}}']);
-    if (res.code !== 0) throw fail(res, 'network ls');
-    const names = res.stdout
-      .split('\n')
-      .map((line) => parseJsonSafe<NetworkRow>(line))
-      .filter((r): r is NetworkRow => r !== null && Boolean(r.Name) && isManaged(r.Labels))
-      .map((r) => r.Name);
-    const networks = new Map<string, ObservedNetwork>();
-    if (names.length === 0) return networks;
-    // One batched call for every network's subnet, same trick as `liveResources`.
-    const inspected = await call([
-      'network',
-      'inspect',
-      '--format',
-      '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}',
-      ...names,
-    ]);
-    if (inspected.code !== 0) return networks; // best-effort, same reasoning as liveResources
-    for (const line of inspected.stdout.trim().split('\n')) {
-      const [name, subnet] = line.trim().split(/\s+/);
-      if (name) networks.set(name, { name, subnet: subnet || undefined });
-    }
-    return networks;
-  }
-
   async function inspect(): Promise<ObservedState> {
-    const res = await call(['ps', '-a', '--no-trunc', '--format', '{{json .}}']);
-    if (res.code !== 0) throw fail(res, 'ps -a');
-    const rows = res.stdout
-      .split('\n')
-      .map(parsePsRow)
-      .filter((r): r is ManagedRow => r !== null);
+    const [allContainers, tasks, networks] = await Promise.all([
+      api.listContainers(),
+      api.listTasks(),
+      listCniNetworks(cniOptions),
+    ]);
 
-    const byPod = new Map<string, ManagedRow[]>();
-    for (const r of rows) {
-      idIndex.set(
-        r.id,
-        r.role === 'infra'
-          ? { role: 'infra', pod: r.pod }
-          : { role: 'member', pod: r.pod, container: r.container! },
-      );
+    const byPod = new Map<string, ApiContainer[]>();
+    for (const c of allContainers) {
+      const target = classify(c);
+      if (!target) continue;
+      idIndex.set(c.id, target);
       // Recover a probe schedule this process never saw created: readiness
-      // config lives nowhere in containerd except inside `SPEC_JSON_LABEL`
-      // (see `parse.ts`), decoded here so a restart resumes probing instead
-      // of leaving a container un-probed forever.
-      if (r.role === 'member' && !readinessTargets.has(r.name)) {
-        const spec = decodeSpecLabel<ContainerSpec>(r.specJson);
-        if (spec?.readiness) {
-          readinessTargets.set(r.name, {
-            pod: r.pod,
-            container: r.container!,
-            probe: spec.readiness,
-            ready: false,
-          });
+      // config lives nowhere in containerd except inside `SPEC_JSON_LABEL`,
+      // decoded here so a restart resumes probing instead of leaving a
+      // container un-probed forever.
+      if (target.role === 'member') {
+        const name = memberName(target.pod, target.container);
+        if (!readinessTargets.has(name)) {
+          const spec = decodeSpecLabel<ContainerSpec>(c.labels[SPEC_JSON_LABEL]);
+          if (spec?.readiness) {
+            readinessTargets.set(name, {
+              pod: target.pod,
+              container: target.container,
+              probe: spec.readiness,
+              ready: false,
+            });
+          }
         }
       }
-      const list = byPod.get(r.pod);
-      if (list) list.push(r);
-      else byPod.set(r.pod, [r]);
+      const list = byPod.get(target.pod);
+      if (list) list.push(c);
+      else byPod.set(target.pod, [c]);
     }
 
     const pods = new Map<string, ObservedPod>();
-    for (const [name, podRows] of byPod) pods.set(name, await buildObservedPod(name, podRows));
+    for (const [name, rows] of byPod) pods.set(name, await buildObservedPod(name, rows, tasks));
 
-    return { pods, networks: await listNetworks(), revision };
+    return { pods, networks, revision };
   }
 
   // ---- events -----------------------------------------------------------------
@@ -525,58 +533,93 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     const known = idIndex.get(id);
     if (known) return known;
     if (notOurs.has(id)) return undefined;
-    const res = await call([
-      'inspect',
-      '--format',
-      `{{index .Config.Labels "${MANAGED_LABEL}"}} {{index .Config.Labels "${POD_LABEL}"}} {{index .Config.Labels "${CONTAINER_LABEL}"}} {{index .Config.Labels "${ROLE_LABEL}"}}`,
-      id,
-    ]);
-    if (res.code !== 0) {
+    const container = await api.getContainer(id);
+    const target = container ? classify(container) : undefined;
+    if (!target) {
       notOurs.add(id);
       return undefined;
     }
-    const [managed = '', pod = '', container = '', role = ''] = res.stdout.trim().split(/\s+/);
-    if (managed !== 'true' || !pod || (role !== 'infra' && role !== 'member')) {
-      notOurs.add(id);
-      return undefined;
-    }
-    const target: Tracked = role === 'infra' ? { role: 'infra', pod } : { role: 'member', pod, container };
     idIndex.set(id, target);
     return target;
   }
 
-  async function handleEventLine(line: string): Promise<void> {
-    const row = parseJsonSafe<EventRow>(line);
-    if (!row?.Topic) return;
-    const event = interpretEventRow(row);
-    if (!event) return;
-    const target = await resolveId(event.id);
+  /**
+   * `/tasks/start`, `/tasks/exit` and `/tasks/delete` all concern one
+   * container's task, and all three are handled the same way: find out what
+   * the container is now, and say so. There is no "deleted" branch for a task
+   * event, because a task being gone does not mean the *container* is --
+   * `no task -> exited` (`phaseFromTask` in parse.ts) covers that case as
+   * just another phase, and if the container really is gone too, `inspectPod`
+   * simply will not find it and this falls through to `pod-removed`.
+   */
+  async function handleTaskEvent(containerId: string): Promise<void> {
+    const target = await resolveId(containerId);
     if (!target) return; // not ours
-
     if (target.role === 'infra') {
-      if (event.kind === 'deleted') {
-        idIndex.delete(event.id);
-        notify({ type: 'pod-removed', name: target.pod });
-        return;
-      }
-      // A start or exit on the sandbox changes the whole Pod's phase (see
-      // `derivePodPhase`), not one field of it, so re-derive rather than patch.
       const pod = await inspectPod(target.pod);
       if (pod) notify({ type: 'pod', pod });
       else notify({ type: 'pod-removed', name: target.pod });
       return;
     }
-
-    if (event.kind === 'deleted') {
-      idIndex.delete(event.id);
-      readinessTargets.delete(memberName(target.pod, target.container));
-      // Same "no container-removed event" rule as removeContainer.
-      const pod = await inspectPod(target.pod);
-      if (pod) notify({ type: 'pod', pod });
-      return;
-    }
     const container = await inspectMemberContainer(target.pod, target.container);
     if (container) notify({ type: 'container', pod: target.pod, container });
+  }
+
+  /**
+   * `/containers/delete` means a container is gone, but -- verified against a
+   * real daemon -- `api.ts`'s event decoder cannot actually tell us *which*
+   * one: `ContainerDelete`'s field is named `id` (see `protos/events/container.proto`),
+   * while the decoder only ever reads `container_id`, so `event.containerId`
+   * is unconditionally `undefined` for this topic. There is no id to resolve
+   * through the id index because the event never carries one.
+   *
+   * What is still true is the id *index* itself: every container this
+   * process still thinks is live was put there by a `run` or a list call, so
+   * a fresh `listContainers()` diffed against it tells us precisely which of
+   * *our* containers just disappeared -- no guessing, no broad resync of
+   * things that did not change. (Foreign containers this process never
+   * tracked are correctly not reported; it never knew about them either way.)
+   */
+  async function reconcileDeletion(): Promise<void> {
+    const containers = await api.listContainers();
+    const present = new Set(containers.map((c) => c.id));
+    const removedInfraPods = new Set<string>();
+    const removedMembers: { pod: string; container: string }[] = [];
+    for (const [id, target] of idIndex) {
+      if (present.has(id)) continue;
+      idIndex.delete(id);
+      if (target.role === 'infra') removedInfraPods.add(target.pod);
+      else removedMembers.push({ pod: target.pod, container: target.container });
+    }
+    for (const [name, target] of readinessTargets) {
+      if (removedInfraPods.has(target.pod)) readinessTargets.delete(name);
+    }
+    for (const pod of removedInfraPods) notify({ type: 'pod-removed', name: pod });
+    for (const { pod, container } of removedMembers) {
+      if (removedInfraPods.has(pod)) continue; // already reported as pod-removed
+      readinessTargets.delete(memberName(pod, container));
+      const observed = await inspectPod(pod);
+      if (observed) notify({ type: 'pod', pod: observed });
+    }
+  }
+
+  async function handleApiEvent(event: ApiEvent): Promise<void> {
+    switch (event.topic) {
+      case '/tasks/start':
+      case '/tasks/exit':
+      case '/tasks/delete':
+        // An event whose payload this process could not decode (see api.ts's
+        // own comment on that) is still worth acting on by resyncing fully,
+        // the same fallback a dead stream gets below.
+        if (event.containerId) await handleTaskEvent(event.containerId);
+        else await resyncOnce();
+        return;
+      case '/containers/delete':
+        await reconcileDeletion();
+        return;
+      default:
+        return; // containers/create, containers/update, snapshot/*, ... -- nothing this adapter acts on
+    }
   }
 
   async function resyncOnce(): Promise<void> {
@@ -588,22 +631,53 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     }
   }
 
+  /**
+   * Attach to the event stream once, and resolve when it ends or is aborted.
+   *
+   * Events arrive already serialised: `api.subscribe` waits for each handler
+   * to settle before delivering the next (see its contract in `api.ts`, and
+   * the out-of-order teardown it was added to prevent). All this has to do is
+   * route a handler failure to `finish`, which tears the attachment down so
+   * `runEventLoop` can resync and reattach.
+   */
+  function attachOnce(signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (error?: Error): void => {
+        if (done) return;
+        done = true;
+        if (error) onError(error);
+        signal.removeEventListener('abort', onAbort);
+        unsubscribe();
+        resolve();
+      };
+      const onAbort = (): void => finish();
+      const unsubscribe = api.subscribe(
+        // Returning the promise is what lets `api.subscribe` hold the next
+        // event back until this one is done.
+        (event) =>
+          handleApiEvent(event).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e)))),
+        (error) => finish(error),
+      );
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   async function runEventLoop(signal: AbortSignal): Promise<void> {
+    // Resync once up front: whatever happened while nobody was subscribed
+    // (or before this process existed) has to be caught up before trusting
+    // events alone, same as after any later reattach.
+    await resyncOnce();
     while (!signal.aborted) {
-      try {
-        for await (const line of nerdctl.stream(['events', '--format', '{{json .}}'], signal)) {
-          await handleEventLine(line);
-        }
-      } catch (e) {
-        onError(e instanceof Error ? e : new Error(String(e)));
-      }
+      await attachOnce(signal);
       if (signal.aborted) return;
-      // The stream ended on its own -- containerd restarted, nerdctl exited,
-      // the socket dropped. Nothing guarantees we saw everything up to that
-      // point, so resync fully and announce it before trying to reattach:
-      // this is the fallback the Runtime contract asks `subscribe` for, not
-      // merely a reconnect. If the stream keeps failing, this repeats, so the
-      // resync is genuinely periodic for as long as it stays down.
+      // The stream ended -- containerd restarted, the socket dropped, or
+      // handling an event threw. Nothing guarantees we saw everything up to
+      // that point, so resync fully and announce it before trying to
+      // reattach: this is the fallback the Runtime contract asks `subscribe`
+      // for, not merely a reconnect. If the stream keeps failing, this
+      // repeats, so the resync is genuinely periodic for as long as it stays
+      // down.
       await resyncOnce();
       await sleep(reconnectDelayMs, signal);
     }
@@ -657,6 +731,7 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     controller?.abort();
     controller = undefined;
     listeners.clear();
+    api.close();
   }
 
   return {

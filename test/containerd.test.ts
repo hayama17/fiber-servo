@@ -1,16 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import { digest, type ContainerSpec, type PodSpec } from '../src/resources.js';
 import {
-  CONTAINER_LABEL,
-  MANAGED_LABEL,
-  POD_LABEL,
-  ROLE_LABEL,
-  SPEC_LABEL,
   createContainerdRuntime,
   encodeSpecLabel,
   infraRunArgs,
   memberRunArgs,
   updateResourcesArgs,
+  type ApiContainer,
+  type ApiEvent,
+  type ApiTask,
+  type ContainerdApi,
+  type ContainerdRuntimeOptions,
   type ExecResult,
   type Nerdctl,
 } from '../src/runtime/containerd/index.js';
@@ -23,24 +26,28 @@ function podSpec(overrides: Partial<PodSpec> = {}): PodSpec {
   return { name: 'api', containers: [{ name: 'app', image: 'app:1' }], ...overrides };
 }
 
-function memoryStringToBytes(s: string): number {
-  const m = /^(\d+(?:\.\d+)?)([kmg])?$/i.exec(s.trim());
-  if (!m) return Number(s) || 0;
-  const unit = (m[2] ?? '').toLowerCase();
-  const mult = unit === 'g' ? 1024 ** 3 : unit === 'm' ? 1024 ** 2 : unit === 'k' ? 1024 : 1;
-  return Math.round(Number(m[1]) * mult);
-}
-
-// ---- a fake containerd -------------------------------------------------------
+// ---- a fake containerd --------------------------------------------------------
 //
-// Not a script of canned responses (the old adapter's test used one, keyed by
-// subcommand -- fine for a container-only, op-based world). Realising a Pod
-// takes several *different* nerdctl calls in sequence (run, inspect, ps,
-// rm...) that all have to agree on the same state, so this fake actually
-// keeps that state -- a map of containers and networks -- and answers each
-// call the way real nerdctl would, by reading the same `--format` strings
-// `runtime.ts` sends. Tests below drive the `Runtime` methods directly and
-// assert on what came out, the same way `test/memory-runtime.test.ts` does.
+// Two seams, one shared state. `nerdctl` (writes) and `api` (reads) both
+// answer out of the same `containers`/`networks` maps, the way a real
+// nerdctl CLI call and a real gRPC read both answer out of the one daemon.
+// Realising a Pod still takes several calls across both seams that all have
+// to agree, so this stays a state machine rather than a script of canned
+// responses (see the original version of this comment, kept in git history,
+// for why: fine for a container-only, op-based world; not for this one).
+//
+// The one rule that matters most here (see runtime.ts's file doc and
+// nerdctl.ts's `isNotFound`): every response this fake gives is something
+// real nerdctl 2.1.2 / containerd v2.2.2 was actually observed to produce,
+// not a plausible guess. Three things below were checked against a real
+// daemon specifically because they are easy to get wrong by guessing:
+//
+//   - a container's id is a generated 64-hex string, unrelated to its
+//     `--name` (`handleRun`);
+//   - `nerdctl rm` resolves its target by name *or* id (`handleRm`);
+//   - a `ContainerDelete` event's `containerId` is unconditionally
+//     `undefined` through `api.ts`'s decoder, because that message's field is
+//     named `id`, not `container_id` (`removeAndEmit`).
 
 interface FakeContainer {
   id: string;
@@ -48,9 +55,9 @@ interface FakeContainer {
   labels: Record<string, string>;
   image: string;
   running: boolean;
+  /** False models "no task at all": never started (`nerdctl create`), or a task already deleted. */
+  hasTask: boolean;
   exitCode?: number;
-  cpu?: number;
-  memory?: string;
   ip?: string;
 }
 
@@ -58,19 +65,26 @@ function createFakeContainerd() {
   const containers = new Map<string, FakeContainer>();
   const networks = new Map<string, { labels: Record<string, string>; subnet?: string }>();
   const probeResults = new Map<string, ExecResult>();
-  const eventLines: string[] = [];
   const calls: string[] = [];
   let counter = 0;
+  let subscriber: { onEvent: (e: ApiEvent) => void; onError?: (e: Error) => void } | undefined;
 
   const findByNameOrId = (t: string): FakeContainer | undefined =>
     containers.get(t) ?? [...containers.values()].find((c) => c.id === t);
 
-  function parseRun(rest: string[]) {
+  function emit(event: ApiEvent): void {
+    subscriber?.onEvent(event);
+  }
+
+  function parseRun(rest: string[]): {
+    name: string;
+    labels: Record<string, string>;
+    network?: string;
+    image: string;
+  } {
     const labels: Record<string, string> = {};
     let name = '';
     let network: string | undefined;
-    let cpu: number | undefined;
-    let memory: string | undefined;
     const positional: string[] = [];
     for (let i = 0; i < rest.length; i++) {
       const a = rest[i]!;
@@ -93,25 +107,13 @@ function createFakeContainerd() {
         network = a.slice('--network='.length);
         continue;
       }
-      if (a === '-p') {
+      if (a === '-p' || a === '-e' || a === '--cpus' || a === '--memory') {
         i++;
-        continue;
-      } // publish: recorded via calls.join, not fake state
-      if (a === '-e') {
-        i++;
-        continue;
-      }
-      if (a === '--cpus') {
-        cpu = Number(rest[++i]);
-        continue;
-      }
-      if (a === '--memory') {
-        memory = rest[++i];
         continue;
       }
       positional.push(a);
     }
-    return { name, labels, network, cpu, memory, image: positional[0] ?? '' };
+    return { name, labels, network, image: positional[0] ?? '' };
   }
 
   function handleRun(rest: string[]): ExecResult {
@@ -126,75 +128,44 @@ function createFakeContainerd() {
       labels: parsed.labels,
       image: parsed.image,
       running: true,
-      cpu: parsed.cpu,
-      memory: parsed.memory,
+      hasTask: true,
       ip: parsed.network && !parsed.network.startsWith('container:') ? `10.88.0.${counter + 1}` : undefined,
     });
+    emit({ topic: '/tasks/start', type: 'containerd.events.TaskStart', containerId: id });
     return ok(`${id}\n`);
   }
 
+  /** What `nerdctl rm` does to one container: gone, task-delete then container-delete. Shared with `externalRemove` below. */
+  function removeAndEmit(c: FakeContainer): void {
+    containers.delete(c.name);
+    emit({
+      topic: '/tasks/delete',
+      type: 'containerd.events.TaskDelete',
+      containerId: c.id,
+      exitStatus: c.exitCode ?? 0,
+    });
+    // No `containerId` here -- see the file doc above.
+    emit({ topic: '/containers/delete', type: 'containerd.events.ContainerDelete' });
+  }
+
   function handleRm(rest: string[]): ExecResult {
-    for (const name of rest) if (name !== '-f') containers.delete(name);
+    for (const t of rest) {
+      if (t === '-f') continue;
+      const c = findByNameOrId(t); // nerdctl resolves either; the runtime now removes by id
+      if (c) removeAndEmit(c);
+    }
     return ok();
   }
 
   function handleInspect(rest: string[]): ExecResult {
     const format = rest[1] ?? '';
-    const targets = rest.slice(2);
+    const target = rest[2] ?? '';
+    // The only `nerdctl inspect` left in the runtime is the Pod-IP read.
     if (format.includes('NetworkSettings.IPAddress')) {
-      const c = findByNameOrId(targets[0]!);
+      const c = findByNameOrId(target);
       return c ? ok(`${c.ip ?? ''}\n`) : fail('no such container');
     }
-    if (format.includes('HostConfig.NanoCpus')) {
-      const lines = targets.map((t) => {
-        const c = findByNameOrId(t);
-        if (!c) return '';
-        const nano = c.cpu !== undefined ? Math.round(c.cpu * 1e9) : 0;
-        const bytes = c.memory !== undefined ? memoryStringToBytes(c.memory) : 0;
-        return `/${c.name} ${nano} ${bytes}`;
-      });
-      return ok(lines.join('\n') + '\n');
-    }
-    if (format.includes('State.Status')) {
-      const c = findByNameOrId(targets[0]!);
-      if (!c) return fail('no such container');
-      return ok(`${c.id} ${c.running ? 'running' : 'exited'} ${c.exitCode ?? 0} ${c.image}\n`);
-    }
-    if (format.includes(MANAGED_LABEL) && format.includes(ROLE_LABEL)) {
-      const c = findByNameOrId(targets[0]!);
-      if (!c) return fail('no such container');
-      return ok(
-        `${c.labels[MANAGED_LABEL] ?? ''} ${c.labels[POD_LABEL] ?? ''} ${c.labels[CONTAINER_LABEL] ?? ''} ${c.labels[ROLE_LABEL] ?? ''}\n`,
-      );
-    }
-    // inspectContainer: {{.Id}} {{SPEC_LABEL}}
-    const c = findByNameOrId(targets[0]!);
-    if (!c) return fail('no such container');
-    return ok(`${c.id} ${c.labels[SPEC_LABEL] ?? ''}\n`);
-  }
-
-  function handlePs(rest: string[]): ExecResult {
-    let podFilter: string | undefined;
-    const fi = rest.indexOf('--filter');
-    if (fi !== -1) {
-      const m = /^label=fiber-servo\.pod=(.*)$/.exec(rest[fi + 1] ?? '');
-      if (m) podFilter = m[1];
-    }
-    const rows = [...containers.values()]
-      .filter((c) => c.labels[MANAGED_LABEL] === 'true')
-      .filter((c) => !podFilter || c.labels[POD_LABEL] === podFilter)
-      .map((c) =>
-        JSON.stringify({
-          ID: c.id,
-          Names: c.name,
-          Image: c.image,
-          Status: c.running ? 'Up 1 second' : `Exited (${c.exitCode ?? 0}) 1 second ago`,
-          Labels: Object.entries(c.labels)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(','),
-        }),
-      );
-    return ok(rows.join('\n') + '\n');
+    return fail('no such container');
   }
 
   function handleNetwork(rest: string[]): ExecResult {
@@ -224,34 +195,8 @@ function createFakeContainerd() {
         : fail(`no network found matching: ${more[0]}\nno network could be removed`);
     }
     if (sub === 'inspect') {
-      const fmt = more[1] ?? '';
       const names = more.slice(2);
-      if (fmt.includes('IPAM')) {
-        return ok(names.map((n) => `${n} ${networks.get(n)?.subnet ?? ''}`).join('\n') + '\n');
-      }
       return networks.has(names[0]!) ? ok(`${names[0]}\n`) : fail(`no network found matching: ${names[0]}`);
-    }
-    if (sub === 'ls') {
-      const rows = [...networks.entries()].map(([name, n]) =>
-        JSON.stringify({
-          Name: name,
-          Labels: Object.entries(n.labels)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(','),
-        }),
-      );
-      return ok(rows.join('\n') + '\n');
-    }
-    return ok();
-  }
-
-  function handleUpdate(rest: string[]): ExecResult {
-    const name = rest[rest.length - 1]!;
-    const c = containers.get(name);
-    if (!c) return fail('no such container');
-    for (let i = 0; i < rest.length - 1; i++) {
-      if (rest[i] === '--cpus') c.cpu = Number(rest[++i]);
-      if (rest[i] === '--memory') c.memory = rest[++i];
     }
     return ok();
   }
@@ -267,37 +212,144 @@ function createFakeContainerd() {
           return handleRm(rest);
         case 'inspect':
           return handleInspect(rest);
-        case 'ps':
-          return handlePs(rest);
         case 'network':
           return handleNetwork(rest);
         case 'update':
-          return handleUpdate(rest);
+          return ok();
         case 'exec':
           return probeResults.get(rest[0]!) ?? ok();
         default:
           return ok();
       }
     },
-    async *stream(args) {
-      calls.push(args.join(' '));
-      for (const line of eventLines.splice(0)) yield line;
+    // The write seam's own event stream retires along with the rest of the
+    // nerdctl-based read path -- nothing in runtime.ts calls this any more.
+    // Kept only so `Nerdctl` stays satisfied.
+    async *stream() {},
+  };
+
+  const api: ContainerdApi = {
+    async listContainers(): Promise<ApiContainer[]> {
+      calls.push('api.listContainers');
+      return [...containers.values()].map((c) => ({ id: c.id, image: c.image, labels: { ...c.labels } }));
+    },
+    async getContainer(id) {
+      calls.push(`api.getContainer ${id}`);
+      const c = [...containers.values()].find((x) => x.id === id);
+      return c ? { id: c.id, image: c.image, labels: { ...c.labels } } : undefined;
+    },
+    async listTasks(): Promise<ApiTask[]> {
+      calls.push('api.listTasks');
+      const tasks: ApiTask[] = [];
+      for (const c of containers.values()) {
+        if (!c.hasTask) continue;
+        tasks.push({
+          id: c.id,
+          status: c.running ? 'running' : 'stopped',
+          ...(c.running ? {} : { exitStatus: c.exitCode ?? 0 }),
+        });
+      }
+      return tasks;
+    },
+    subscribe(onEvent, onError) {
+      calls.push('api.subscribe');
+      subscriber = { onEvent, onError };
+      return () => {
+        if (subscriber?.onEvent === onEvent) subscriber = undefined;
+      };
+    },
+    close() {
+      calls.push('api.close');
     },
   };
 
   return {
     nerdctl,
+    api,
     calls,
     containers,
     networks,
-    eventLines,
     probeResults,
+    /** A process inside the container exiting on its own -- fires `/tasks/exit`, same as a real daemon noticing. */
+    setExited: (name: string, exitCode: number): void => {
+      const c = containers.get(name);
+      if (!c) throw new Error(`fake containerd: no container named "${name}"`);
+      c.running = false;
+      c.exitCode = exitCode;
+      emit({
+        topic: '/tasks/exit',
+        type: 'containerd.events.TaskExit',
+        containerId: c.id,
+        exitStatus: exitCode,
+      });
+    },
+    /** The task alone gone, container still present -- same shape `nerdctl create` leaves a container in, verified against a real daemon. No event: this is direct state setup for `inspect()`, not a simulated live transition. */
+    deleteTaskOnly: (name: string): void => {
+      const c = containers.get(name);
+      if (!c) throw new Error(`fake containerd: no container named "${name}"`);
+      c.hasTask = false;
+    },
+    /** Something outside this process's own `removePod`/`removeContainer` removed a container -- e.g. an operator running `nerdctl rm` by hand. Exercises the event-driven removal path in isolation from the imperative one. */
+    externalRemove: (name: string): void => {
+      const c = containers.get(name);
+      if (!c) throw new Error(`fake containerd: no container named "${name}"`);
+      removeAndEmit(c);
+    },
+    /** Fails the live subscription the way a dropped gRPC stream would: `api.subscribe` gives no other signal that a stream has ended (see runtime.ts's file doc). */
+    killStream: (error = new Error('stream dropped')): void => {
+      const s = subscriber;
+      subscriber = undefined;
+      s?.onError?.(error);
+    },
     idOf: (name: string): string => {
       const c = containers.get(name);
       if (!c) throw new Error(`fake containerd: no container named "${name}"`);
       return c.id;
     },
   };
+}
+
+function runtimeFor(
+  fc: ReturnType<typeof createFakeContainerd>,
+  extra: Partial<ContainerdRuntimeOptions> = {},
+) {
+  return createContainerdRuntime({ nerdctl: fc.nerdctl, api: fc.api, ...extra });
+}
+
+// ---- a CNI fixture on disk ----------------------------------------------------
+//
+// `cni.ts` is fixed and already verified against real nerdctl 2.1.2 (see its
+// own file doc); these tests exercise the runtime reading through it against
+// real conflist files, not a fake of `listNetworks` itself.
+
+const cniDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of cniDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function makeCniFixture(
+  namespace: string,
+  networks: Record<string, { subnet?: string; labels?: Record<string, string> }>,
+): string {
+  const root = mkdtempSync(join(tmpdir(), 'fiber-servo-cni-'));
+  cniDirs.push(root);
+  const dir = join(root, namespace);
+  mkdirSync(dir, { recursive: true });
+  for (const [name, { subnet, labels }] of Object.entries(networks)) {
+    writeFileSync(
+      join(dir, `nerdctl-${name}.conflist`),
+      JSON.stringify({
+        cniVersion: '1.0.0',
+        name,
+        nerdctlLabels: labels ?? {},
+        plugins: subnet
+          ? [{ type: 'bridge', ipam: { ranges: [[{ subnet, gateway: subnet.replace(/0\/\d+$/, '1') }]] } }]
+          : [{ type: 'bridge' }],
+      }),
+    );
+  }
+  return root;
 }
 
 // ---- argv: the sandbox, a member joining it, and the one in-place update ----
@@ -405,9 +457,9 @@ describe('containerd runtime: argv', () => {
 // ---- creating and removing Pods ---------------------------------------------
 
 describe('containerd runtime: creating and removing Pods', () => {
-  it('createPod runs the sandbox then each member, and is idempotent for the same spec', async () => {
+  it('createPod runs the sandbox then each member, and is idempotent for the same spec (adoption by digest)', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     const spec = podSpec();
 
     await runtime.createPod(spec);
@@ -419,7 +471,7 @@ describe('containerd runtime: creating and removing Pods', () => {
     expect(runCalls[1]).toContain('--network=container:api');
 
     const callsBefore = fc.calls.length;
-    await runtime.createPod(spec); // same spec: idempotent
+    await runtime.createPod(spec); // same spec, same digest: idempotent
     expect(fc.calls.filter((c) => c.startsWith('run ')).length).toBe(2); // no new run
     expect(fc.calls.filter((c) => c.startsWith('rm ')).length).toBe(0);
     expect(fc.calls.length).toBeGreaterThan(callsBefore); // it still checked, just did not act
@@ -427,7 +479,7 @@ describe('containerd runtime: creating and removing Pods', () => {
 
   it('createPod replaces the whole Pod when the spec digest changes', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     await runtime.createPod(podSpec());
     await runtime.createPod(podSpec({ containers: [{ name: 'app', image: 'app:2' }] }));
 
@@ -438,7 +490,7 @@ describe('containerd runtime: creating and removing Pods', () => {
 
   it('createPod heals a member a crash left missing, without recreating the sandbox', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     const spec = podSpec({
       containers: [
         { name: 'app', image: 'app:1' },
@@ -456,7 +508,7 @@ describe('containerd runtime: creating and removing Pods', () => {
 
   it('removePod removes the sandbox and every member together, and is idempotent', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     await runtime.createPod(
       podSpec({
         containers: [
@@ -478,7 +530,7 @@ describe('containerd runtime: creating and removing Pods', () => {
 
   it('createContainer adds a member to a live sandbox, and throws for a Pod that does not exist', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     await runtime.createPod(podSpec());
 
     await runtime.createContainer('api', { name: 'sidecar', image: 'proxy:1' });
@@ -489,7 +541,7 @@ describe('containerd runtime: creating and removing Pods', () => {
 
   it('removeContainer removes one member and leaves the rest, and is idempotent', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     await runtime.createPod(
       podSpec({
         containers: [
@@ -508,12 +560,12 @@ describe('containerd runtime: creating and removing Pods', () => {
   });
 });
 
-// ---- inspect(): the resync path ----------------------------------------------
+// ---- inspect(): the resync path, now over the API ----------------------------
 
 describe('containerd runtime: inspect()', () => {
-  it('groups members under their Pod and fills ip, specDigest, spec and phase', async () => {
+  it('groups members under their Pod and fills ip, specDigest, spec and phase, from task status', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     const spec = podSpec({
       network: 'backend',
       containers: [
@@ -533,112 +585,153 @@ describe('containerd runtime: inspect()', () => {
     expect(pod?.spec).toEqual(spec); // reconstructed from labels, across the whole Pod
   });
 
-  it('reflects a live nerdctl update in the reconstructed spec, without any label ever being rewritten', async () => {
+  it('a stopped task reads as exited with its exit code', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     await runtime.createPod(podSpec());
-
-    await runtime.updateContainerResources('api', 'app', { cpu: 0.5, memory: '512m' });
+    fc.setExited('api-app', 7);
 
     const pod = (await runtime.inspect()).pods.get('api');
-    expect(pod?.spec?.containers[0]).toMatchObject({ name: 'app', resources: { cpu: 0.5, memory: '512m' } });
+    expect(pod?.containers[0]).toMatchObject({ name: 'app', phase: 'exited', exitCode: 7 });
+  });
+
+  it('a container with no task at all -- never started, or its task already cleaned up -- reads as exited with no exit code', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    await runtime.createPod(podSpec());
+    fc.deleteTaskOnly('api-app');
+
+    const pod = (await runtime.inspect()).pods.get('api');
+    expect(pod?.containers[0]).toMatchObject({ name: 'app', phase: 'exited', exitCode: undefined });
   });
 
   it('a Pod with no fiber-servo label at all reports specDigest and spec as undefined, not a crash', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
     fc.containers.set('stray', {
       id: 'f'.repeat(64),
       name: 'stray',
       labels: {}, // not managed at all: inspect() must not even surface it
       image: 'whatever',
       running: true,
+      hasTask: true,
     });
 
     const state = await runtime.inspect();
     expect(state.pods.size).toBe(0);
+  });
+
+  it('recovers specDigest, spec and the readiness schedule purely from labels -- across a fresh runtime instance', async () => {
+    const fc = createFakeContainerd();
+    const runtime1 = runtimeFor(fc);
+    const spec = podSpec({ containers: [{ name: 'app', image: 'app:1', readiness: { exec: ['true'] } }] });
+    await runtime1.createPod(spec);
+
+    // A second runtime over the same containerd state simulates a process
+    // restart: its idIndex and readinessTargets start empty and can only be
+    // rebuilt from labels, exactly as a genuinely fresh process would have to.
+    const runtime2 = runtimeFor(fc);
+    const pod = (await runtime2.inspect()).pods.get('api');
+    expect(pod?.specDigest).toBe(digest(spec));
+    expect(pod?.spec).toEqual(spec);
   });
 });
 
 // ---- events -> RuntimeEvent ---------------------------------------------------
 
 describe('containerd runtime: events -> RuntimeEvent', () => {
-  it('translates a member exit, a sandbox start, and a sandbox delete', async () => {
+  it('translates a task start into a running Pod, and a member task exit into a container event with its exit code', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
-    await runtime.createPod(podSpec());
-    const infraId = fc.idOf('api');
-    const appId = fc.idOf('api-app');
-
-    fc.eventLines.push(
-      JSON.stringify({
-        ID: appId,
-        Topic: '/tasks/exit',
-        Event: JSON.stringify({ container_id: appId, id: appId, exit_status: 1 }),
-      }),
-      JSON.stringify({
-        ID: infraId,
-        Topic: '/tasks/start',
-        Event: JSON.stringify({ container_id: infraId }),
-      }),
-    );
-    fc.containers.get('api-app')!.running = false;
-    fc.containers.get('api-app')!.exitCode = 1;
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
 
     const events: RuntimeEvent[] = [];
     const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 20));
-    unsubscribe();
+    await new Promise((r) => setTimeout(r, 10)); // let the initial (empty) resync land
 
+    await runtime.createPod(podSpec()); // run -> /tasks/start, observed live since we're already subscribed
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events).toContainEqual({
+      type: 'pod',
+      pod: expect.objectContaining({ name: 'api', phase: 'running' }),
+    });
+
+    fc.setExited('api-app', 3); // -> /tasks/exit
+    await new Promise((r) => setTimeout(r, 10));
     expect(events).toContainEqual({
       type: 'container',
       pod: 'api',
-      container: expect.objectContaining({ name: 'app', phase: 'exited', exitCode: 1 }),
+      container: expect.objectContaining({ name: 'app', phase: 'exited', exitCode: 3 }),
     });
-    // The sandbox starting does NOT make the Pod running: its only member has
-    // exited, and a Pod's phase is derived from its containers, not from the
-    // sandbox. Asserting `exited` here is the point of the case.
-    expect(events).toContainEqual({
-      type: 'pod',
-      pod: expect.objectContaining({ name: 'api', phase: 'exited' }),
-    });
+
+    unsubscribe();
   });
 
-  it('translates a sandbox delete as the whole Pod disappearing', async () => {
+  it('a /containers/delete for the whole Pod is attributed by diffing the id index, not by an id the event never carries', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
     await runtime.createPod(podSpec());
-    const infraId = fc.idOf('api');
-
-    fc.eventLines.push(
-      JSON.stringify({ ID: infraId, Topic: '/containers/delete', Event: JSON.stringify({ id: infraId }) }),
-    );
+    await runtime.inspect(); // populate the id index the way a resync at subscribe time also would
 
     const events: RuntimeEvent[] = [];
     const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 20));
-    unsubscribe();
+    await new Promise((r) => setTimeout(r, 10));
+
+    fc.externalRemove('api-app'); // a member gone from outside this process
+    fc.externalRemove('api'); // ... and now the sandbox too: the whole Pod
+    await new Promise((r) => setTimeout(r, 15));
 
     expect(events).toContainEqual({ type: 'pod-removed', name: 'api' });
+    unsubscribe();
   });
 
-  it('falls back to a periodic inspect() resync once the event stream ends', async () => {
+  it('an externally removed member alone (Pod still up) re-announces the Pod with that member gone, not pod-removed', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
-    await runtime.createPod(podSpec());
-    // No lines queued: the fake's `stream` ends immediately, every time it is opened.
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
+    await runtime.createPod(
+      podSpec({
+        containers: [
+          { name: 'app', image: 'app:1' },
+          { name: 'sidecar', image: 'proxy:1' },
+        ],
+      }),
+    );
+    await runtime.inspect();
 
     const events: RuntimeEvent[] = [];
     const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 30));
-    unsubscribe();
+    await new Promise((r) => setTimeout(r, 10));
 
-    const resyncs = events.filter((e) => e.type === 'resync');
-    expect(resyncs.length).toBeGreaterThan(0);
-    expect(resyncs[0]).toMatchObject({
+    fc.externalRemove('api-sidecar');
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'pod-removed' }));
+    expect(events).toContainEqual({
+      type: 'pod',
+      pod: expect.objectContaining({ name: 'api', containers: [expect.objectContaining({ name: 'app' })] }),
+    });
+    unsubscribe();
+  });
+
+  it('emits a resync from a full inspect() when a subscriber attaches, and again once the stream dies', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
+    await runtime.createPod(podSpec());
+
+    const events: RuntimeEvent[] = [];
+    const unsubscribe = runtime.subscribe((e) => events.push(e));
+    await new Promise((r) => setTimeout(r, 10));
+    const afterAttach = events.filter((e) => e.type === 'resync').length;
+    expect(afterAttach).toBeGreaterThan(0);
+    expect(events.find((e) => e.type === 'resync')).toMatchObject({
       type: 'resync',
       state: { pods: expect.any(Map), networks: expect.any(Map) },
     });
+
+    fc.killStream(); // the only signal a real dropped gRPC stream gives, too -- see runtime.ts's file doc
+    await new Promise((r) => setTimeout(r, 20));
+    expect(events.filter((e) => e.type === 'resync').length).toBeGreaterThan(afterAttach);
+
+    unsubscribe();
   });
 });
 
@@ -647,7 +740,7 @@ describe('containerd runtime: events -> RuntimeEvent', () => {
 describe('containerd runtime: readiness prober', () => {
   it('execs the probe until it exits 0, then reports ready via a container event', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, probeTickMs: 5 });
+    const runtime = runtimeFor(fc, { probeTickMs: 5 });
     fc.probeResults.set('api-app', fail('not ready yet'));
     await runtime.createPod(
       // `intervalMs` matters: it defaults to 2000, which would put the second
@@ -675,25 +768,46 @@ describe('containerd runtime: readiness prober', () => {
   });
 });
 
-// ---- networks --------------------------------------------------------------------
+// ---- networks: writes on nerdctl, reads from CNI config files ---------------
 
 describe('containerd runtime: networks', () => {
-  it('creates and removes networks idempotently, and lists subnets back through inspect()', async () => {
+  it('creates and removes networks idempotently through nerdctl, by presence alone', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
 
     await runtime.createNetwork({ name: 'backend', subnet: '10.9.0.0/24' });
-    expect((await runtime.inspect()).networks.get('backend')).toEqual({
-      name: 'backend',
-      subnet: '10.9.0.0/24',
-    });
+    expect(fc.networks.has('backend')).toBe(true);
 
     await expect(runtime.createNetwork({ name: 'backend', subnet: '10.9.0.0/24' })).resolves.toBeUndefined();
-    expect(fc.calls.filter((c) => c.startsWith('network create')).length).toBe(1);
+    expect(fc.calls.filter((c) => c.startsWith('network create')).length).toBe(1); // already there: no second create
 
     await runtime.removeNetwork('backend');
-    expect((await runtime.inspect()).networks.has('backend')).toBe(false);
+    expect(fc.networks.has('backend')).toBe(false);
     await expect(runtime.removeNetwork('backend')).resolves.toBeUndefined();
     await expect(runtime.removeNetwork('never-existed')).resolves.toBeUndefined();
+  });
+
+  it('inspect() reads networks from CNI conflist files, including the always-present built-ins', async () => {
+    const fc = createFakeContainerd();
+    const cniPath = makeCniFixture('default', {
+      backend: { subnet: '10.9.0.0/24' },
+      frontend: { subnet: '10.10.0.0/24', labels: { tier: 'web' } },
+    });
+    const runtime = runtimeFor(fc, { cni: { cniPath, namespace: 'default' } });
+
+    const state = await runtime.inspect();
+    expect(state.networks.get('host')).toEqual({ name: 'host' });
+    expect(state.networks.get('none')).toEqual({ name: 'none' });
+    expect(state.networks.get('backend')).toEqual({ name: 'backend', subnet: '10.9.0.0/24' });
+    expect(state.networks.get('frontend')).toEqual({ name: 'frontend', subnet: '10.10.0.0/24' });
+  });
+
+  it('a namespace with no CNI directory yet still reports the built-ins, not an error', async () => {
+    const fc = createFakeContainerd();
+    const cniPath = makeCniFixture('default', {}); // creates the "default" dir but nothing in "other"
+    const runtime = runtimeFor(fc, { cni: { cniPath, namespace: 'other' } });
+
+    const state = await runtime.inspect();
+    expect([...state.networks.keys()].sort()).toEqual(['host', 'none']);
   });
 });

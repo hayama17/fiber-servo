@@ -76,8 +76,18 @@ export interface ContainerdApi {
   listContainers(): Promise<ApiContainer[]>;
   getContainer(id: string): Promise<ApiContainer | undefined>;
   listTasks(): Promise<ApiTask[]>;
-  /** Stream events until the returned function is called. */
-  subscribe(onEvent: (event: ApiEvent) => void, onError?: (error: Error) => void): () => void;
+  /**
+   * Stream events until the returned function is called.
+   *
+   * Deliveries are serialised: if `onEvent` returns a promise, the next event
+   * waits for it. grpc-js applies no back-pressure of its own, so without
+   * this two events are handled concurrently and the async work of an earlier
+   * one can finish after a later one's — observed against a real daemon as a
+   * Pod's mid-teardown state landing after its removal and resurrecting it.
+   * Ordering is a property of the stream, so it is guaranteed here rather
+   * than rebuilt by each consumer.
+   */
+  subscribe(onEvent: (event: ApiEvent) => void | Promise<void>, onError?: (error: Error) => void): () => void;
   close(): void;
 }
 
@@ -249,6 +259,9 @@ export function createContainerdApi(options: ContainerdApiOptions = {}): Contain
         md: Metadata,
       ) => ClientReadableStream<{ topic: string; event?: { type_url?: string; value?: Uint8Array } }>;
       const call = stream.call(events, { filters: [] }, metadata);
+      // See `subscribe` in the interface above: each delivery waits for the
+      // previous one to settle.
+      let inOrder: Promise<void> = Promise.resolve();
       call.on('data', (envelope) => {
         const typeUrl = envelope.event?.type_url ?? '';
         const type = typeUrl.split('/').pop() ?? '';
@@ -258,9 +271,16 @@ export function createContainerdApi(options: ContainerdApiOptions = {}): Contain
           try {
             const decoded = eventTypes.lookupType(type).decode(envelope.event.value) as unknown as {
               container_id?: string;
+              id?: string;
               exit_status?: number;
             };
-            containerId = decoded.container_id;
+            // Task events name the container `container_id`; container events
+            // name it `id` (see events/container.proto: `ContainerDelete`
+            // carries `string id = 1`). Reading only the first made
+            // `containerId` silently undefined for every /containers/delete,
+            // which is worse than an error: the field looks supported and is
+            // not.
+            containerId = decoded.container_id ?? decoded.id;
             exitStatus = decoded.exit_status;
           } catch {
             // An event whose payload we cannot decode is still worth
@@ -269,7 +289,12 @@ export function createContainerdApi(options: ContainerdApiOptions = {}): Contain
             // silently would not be.
           }
         }
-        onEvent({ topic: envelope.topic, type, containerId, exitStatus });
+        const event: ApiEvent = { topic: envelope.topic, type, containerId, exitStatus };
+        inOrder = inOrder
+          .then(() => onEvent(event))
+          .catch((error: unknown) => {
+            onError?.(error instanceof Error ? error : new Error(String(error)));
+          });
       });
       call.on('error', (error: Error) => onError?.(error));
       return () => call.cancel();
