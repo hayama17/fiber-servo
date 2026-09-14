@@ -162,8 +162,25 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     return new Error(`nerdctl ${what} failed (exit ${res.code}): ${res.stderr.trim() || res.stdout.trim()}`);
   }
 
+  /**
+   * "It is already gone" versus "it failed". Removing something absent has to
+   * be a no-op (see `Runtime` in types.ts: crash recovery depends on it), and
+   * nerdctl signals that only by exiting non-zero with a particular message.
+   *
+   * These patterns are copied verbatim from nerdctl 2.x output, not guessed:
+   *
+   *   rm / stop / update    no such container: <name>
+   *   inspect               no such object <name>
+   *   network rm            no network found matching: <name>
+   *                         no network could be removed
+   *
+   * The network wording shares no substring with the container ones, which is
+   * exactly how this was first got wrong: a fake that made up "no such
+   * network" matched a pattern real nerdctl never emits, so the test passed
+   * and `removeNetwork` threw the first time it met a real daemon.
+   */
   function isNotFound(res: ExecResult): boolean {
-    return /no such|not found/i.test(res.stderr);
+    return /no such |not found|no network found matching|no network could be removed/i.test(res.stderr);
   }
 
   function lastLine(text: string): string {

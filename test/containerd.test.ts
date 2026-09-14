@@ -213,14 +213,23 @@ function createFakeContainerd() {
       networks.set(name, { labels, subnet: si !== -1 ? more[si + 1] : undefined });
       return ok();
     }
-    if (sub === 'rm') return networks.delete(more[0]!) ? ok() : fail('no such network');
+    // Wordings below are copied from real nerdctl 2.x, not invented. An
+    // earlier version of this fake answered "no such network" here, which
+    // nerdctl never says -- it matched `isNotFound`'s pattern, so the
+    // idempotent-remove test passed while the real adapter threw against a
+    // real daemon. A fake may be simple, but it may not be fictional.
+    if (sub === 'rm') {
+      return networks.delete(more[0]!)
+        ? ok()
+        : fail(`no network found matching: ${more[0]}\nno network could be removed`);
+    }
     if (sub === 'inspect') {
       const fmt = more[1] ?? '';
       const names = more.slice(2);
       if (fmt.includes('IPAM')) {
         return ok(names.map((n) => `${n} ${networks.get(n)?.subnet ?? ''}`).join('\n') + '\n');
       }
-      return networks.has(names[0]!) ? ok(`${names[0]}\n`) : fail('no such network');
+      return networks.has(names[0]!) ? ok(`${names[0]}\n`) : fail(`no network found matching: ${names[0]}`);
     }
     if (sub === 'ls') {
       const rows = [...networks.entries()].map(([name, n]) =>
