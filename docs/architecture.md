@@ -1,274 +1,201 @@
 # Architecture
 
-fiber-servo is a custom React renderer. Instead of DOM nodes, the host
-elements are containers and networks; instead of painting, a commit produces
-a list of operations for a container runtime.
+fiber-servo uses React Fiber as the control plane of a single-node container
+orchestrator. This document explains the shape of the system and, more
+importantly, **why there are two reconcilers in it and not one**.
 
-```
-  JSX  ──render──▶  fiber tree  ──commit──▶  ops  ──sink──▶  runtime (containerd)
-   ▲                                                              │
-   └────────── useSyncExternalStore ◀── StatusStore ◀── events ───┘
-```
-
-## What we are reusing from React
-
-It is tempting to describe React's value here as "the Virtual DOM diff, but for
-containers." That is how the current renderer happens to reach the runtime,
-but it is not the architectural idea we want to preserve.
-
-The DOM renderer needs an incremental diff because DOM mutation is the way its
-external world is updated. That requirement is important to React's origin, but
-it is not the most useful abstraction for fiber-servo. A container runtime, and
-especially Compose, already has its own rules for turning a desired application
-model into concrete runtime changes.
-
-The part we want from React is the live, stateful, declarative tree:
+## The one idea
 
 ```text
-state + props + observed state
-            ↓
-      React component tree
-            ↓
-     desired resource tree
-            ↓
-       materialization
-            ↓
-       external system
+React reconciles management resources.
+Controllers reconcile runtime resources.
 ```
 
-Fiber gives that tree component identity, hooks, state, lifecycle, composition,
-Suspense, and repeated evaluation as inputs change. Those properties remain
-useful even when React is not the component that computes the final runtime
-diff.
-
-In other words, fiber-servo does not require this invariant:
+Those are different jobs and they answer to different events:
 
 ```text
-Fiber diff = runtime diff
+React reconciliation      = the desired configuration changed
+                            (you edited the JSX, a hook returned something new)
+
+Controller reconciliation = reality drifted from the desired configuration
+                            (a Pod died, a machine rebooted, a container OOMed)
 ```
 
-A backend such as Compose may own the final application diff instead:
+The temptation, when you have a reconciler as good as React's, is to make it do
+both — to feed runtime failures back into the tree as props so that
+`commitUpdate` fires and "React handles it". fiber-servo deliberately does not,
+and the reason is in the next section.
+
+## Why a Pod dying is not a React render
+
+Consider:
+
+```tsx
+<ReplicaSet name="api" replicas={3}>
+  <Pod labels={{ app: 'api' }}>
+    <Container name="app" image="api:v1" />
+  </Pod>
+</ReplicaSet>
+```
+
+One Pod dies. What changed?
 
 ```text
-observations / state
-        ↓
-React reconciliation
-        ↓
-live control-plane tree
-        ↓
-desired Compose application
-        ↓
-Compose reconciliation
-        ↓
-runtime
+desired = 3   <- unchanged. The JSX still says 3, and it is still correct.
+actual  = 2   <- changed.
 ```
 
-React reconciliation still matters: it preserves the continuity and state of
-the control-plane program. What we are willing to give up is using React's host
-mutation diff as an optimization for the runtime itself.
+Nothing React can see is different. To make React notice, you would have to
+invent a prop — a restart generation, a nonce — and change it _because_ a Pod
+died. That prop is a lie: it encodes an observation as if it were an intention,
+and once you have it you have two sources of truth about the same fact.
 
-A useful way to think about the experiment is therefore not "Virtual DOM for
-containers", but "virtual desired-state tree". The DOM was React's original
-external system; it does not have to be ours.
+So instead the death is recorded in an **observed state** store, and a
+**controller** compares 3 against 2 and creates one Pod. React renders zero
+times. `examples/replicaset.tsx` prints the render count so you can watch this
+happen.
 
-The current op-based renderer predates this distinction and may evolve toward a
-Compose-backed materialization model. The important property to preserve is the
-live React control plane, not a particular mapping from host commits to runtime
-commands.
+This is also why the component is called `ReplicaSet` and takes `replicas`
+rather than rendering three `<Pod>` children: it declares a _count_, not three
+identities. A count stays true when a Pod dies.
 
-## The two rules
-
-Everything in the codebase follows from two decisions.
-
-### 1. spec = fiber tree, status = external store
-
-Host instances (`container`, `network`) are the desired state and nothing
-else. Whether a container is actually running is a separate concern that lives
-in a `StatusStore` outside the tree and is read with `useSyncExternalStore`.
-
-- The tree never writes status. `<Container>` reads its own status to decide
-  on a restart, but expresses that decision as a prop (`restarts`), which is
-  desired state.
-- The hostConfig never reads status. It only diffs props.
-
-Mixing the two would turn every runtime event into a tree mutation and make
-the reconciler impossible to test without a runtime.
-
-### 2. commit executes nothing
-
-Every hostConfig method is synchronous and only appends an op to the root's
-`pending` list. `resetAfterCommit` hands that list to a sink. The sink is the
-only place a side effect may happen.
-
-- React's commit stays atomic and fast.
-- Reconciliation is verified in tests by asserting op sequences.
-- Swapping runtimes means writing a new sink, nothing else.
-
-### Where state lives
-
-The fiber tree does hold state: the state it last committed. Render compares
-the new desired tree with that record and emits the difference. This is how
-React works for the DOM too: it never reads the DOM back, it diffs against
-its own memoized props and assumes the DOM is what it wrote.
-
-The part that plays the real DOM here is containerd. The difference is that
-a DOM only changes when React changes it, while a container can die on its
-own. React has no mechanism to re-verify its host, so containerd's actual
-state is tracked separately, in the status store, and fed back into the tree
-as an input next to props. The tree turns that observation into a new
-intention (`restarts={n + 1}`), and React diffs the intention against its
-record as usual.
-
-| Place                         | Holds                                                                          | Who reads it                           |
-| ----------------------------- | ------------------------------------------------------------------------------ | -------------------------------------- |
-| Fiber tree and host instances | What was last committed, plus policy state (restart counters, `Ready` latches) | Render, to diff                        |
-| containerd                    | What actually exists                                                           | Nobody in the tree                     |
-| Status store                  | The observation of containerd                                                  | Components, via `useSyncExternalStore` |
-
-A process restart loses the first row. The runtime's `fiber-servo.spec`
-labels let `CREATE` adopt what exists, the watcher's initial `ps -a` refills
-the store, and the restart counters start over. One fiber-servo process per
-set of containers is assumed; two would each keep their own record and
-fight.
-
-## Layers
-
-| Layer      | Files                                                  | Knows about             |
-| ---------- | ------------------------------------------------------ | ----------------------- |
-| Components | `src/components.tsx`, `src/hooks.ts`                   | React, the status store |
-| Reconciler | `src/hostConfig.ts`, `src/reconciler.ts`, `src/ops.ts` | Props and ops           |
-| Status     | `src/status.ts`                                        | Nothing else            |
-| Runtime    | `src/runtime/containerd/*`, `src/runtime/dummy.ts`     | Ops, the store, nerdctl |
-
-The reconciler layer has no import from the runtime layer, and the runtime
-layer has no import from the components layer.
-
-## Data flow, step by step
-
-### Mount
-
-1. `root.render(<Deployment name="web" replicas={2}>…)` schedules a sync
-   update and flushes it.
-2. `Deployment` clones its template twice with keys `web-0`, `web-1`.
-3. Each `Container` renders the `container` host element; `createInstance`
-   builds an `Instance` with the spec extracted from props. No op yet: the
-   render phase can be discarded.
-4. Commit: `appendChildToContainer` places the instance and `mountSubtree`
-   emits `CREATE` for it and any children, parents first.
-5. `resetAfterCommit` passes the batch to the sink.
-
-### Update
-
-`commitUpdate` receives the new props, extracts the spec, diffs it against
-the instance's spec and emits one `UPDATE` with the changed keys, or nothing.
-If `name` changed, the instance is a different resource for the runtime:
-`DELETE` old, `CREATE` new.
-
-If the `restarts` prop advanced, one `START` is emitted with the new
-generation as `attempt`.
-
-### Self-healing
-
-1. The runtime (or a test) calls `status.set('web-1', 'dead')`.
-2. `useContainerStatus('web-1')` inside that container re-renders it.
-3. `useSelfHeal` sees a death event it has not answered, arms a timer for
-   `min(base × factor^n, max)`.
-4. The timer sets state: generation `n + 1`, and records the event's `seq` as
-   handled.
-5. Re-render, `commitUpdate`, `START attempt=n+1`.
-6. The runtime starts the container; the event watcher reports `running`.
-
-A death is answered at most once. A second `START` waits for the store to
-report another event.
-
-### Dependency ordering
-
-`useReady('db')` calls React's `use` on a thenable cached per store, id and
-condition. The thenable settles the first time the store reports `db`
-running (or `ready`, when the dependent asks for it). Until then the
-component suspends and its `<Suspense>` boundary (wrapped by `<Ready>`)
-shows nothing: no `CREATE` for the gated subtree. Once settled it stays
-settled: ordering is a startup concern, liveness is self-healing's.
-
-`<Container>` applies this to its own children: they are rendered inside a
-`<Ready on={name}>` ahead of the host element, so the tree shape expresses
-the dependency, dependents mount after the container is up, and React
-deletes them before it on unmount. A container with a `readiness` probe
-gates on `ready`; the containerd runtime's prober runs the probe with
-`nerdctl exec` and `mark()`s the store.
-
-### Entry point
-
-`serve(element, { runtime })` binds a runtime to a fresh status store,
-starts its watcher, renders, and gives back `idle()` and `stop()`.
-`plan` evaluates against the dummy runtime, so gated subtrees expand without
-containerd. `up` owns a session and its live React tree until shutdown.
-`apply` requests a fresh evaluation through local IPC. `up --watch` triggers
-that same operation when the entry file is saved (decision 20).
+## The pipeline
 
 ```text
-app.tsx + local imports ──load──▶ React tree ──commit──▶ ops ──▶ runtime
-                            ▲                                  │
-apply CLI ──local IPC──▶ session queue                           │
-watch save ───────────▶ same queue       status store ◀──────────┘
+   JSX
+    │
+    ▼
+  React Fiber ──────────────► DesiredState        one snapshot per commit
+    │                          (resources.ts)
+    ▼
+  controllers.ts ───────────► Pods + Networks     Deployment → ReplicaSet → Pod
+    │                                              Service → proxy Pod
+    ▼
+  planner.ts ───────────────► Actions             noop / update / replace
+    │
+    ▼
+  Runtime adapter ──────────► containerd          the only layer that knows
+    │                                              stop/delete/create/start
+    ▼
+  runtime events
+    │
+    ▼
+  observed.ts ──────────────► ObservedState ──────┐
+                                                  │
+                    controllers and planner read ─┘
 ```
 
-`src/control.ts` handles bounded local requests and responses. Session identity
-is the canonical entry path and OS user; Unix sockets live in a private 0700
-directory, and Windows uses named pipes. No client-supplied program is executed:
-the request is just `apply`, and the owner reloads its own entry file. There is
-no network listener, desired-state database, or detached daemon. One session
-per file is enforced before mounting resources; different files must still
-use disjoint resource names/namespaces.
+Every stage is a pure function of its inputs except the last two, and the loop
+is **level-triggered**: each pass reads the current desired state and the
+current observed state and recomputes the difference from scratch. There is no
+incremental diff being maintained, so there is nothing to get out of sync. A
+missed event costs a late reconcile, never a wrong one.
 
-`src/session.ts` serializes initial evaluation, explicit applies, and watch
-reloads. Shutdown refuses new requests, drains accepted evaluations, unmounts,
-drains runtime operations, and stops observers. `src/load.ts` bundles local
-modules afresh with esbuild; package dependencies remain shared to preserve
-React and context identity. The temporary module is removed after import.
+`serve.ts` is the loop, and it is the only file that needs to understand both
+halves.
 
-Editing changes the source for the next evaluation; the running tree remains
-the last evaluated version until apply (or watch). This is an explicit timing
-boundary, not a second independently editable desired-state store.
+## What each file is for
 
-### Apply acknowledgement and failure
+| File                  | Job                                                                     |
+| --------------------- | ----------------------------------------------------------------------- |
+| `resources.ts`        | The vocabulary. Specs — what should exist. No verbs.                    |
+| `components.tsx`      | Six components, each a thin wrapper over one host element.              |
+| `hostConfig.ts`       | React's commit becomes a `DesiredState` snapshot. No ops.               |
+| `reconciler.ts`       | `createRoot`: render a tree, publish snapshots.                         |
+| `hooks.ts`            | The read path from observed state into the tree.                        |
+| `observed.ts`         | What is actually running. Written by adapters, read by controllers.     |
+| `controllers.ts`      | Management resources become runtime resources. Pure.                    |
+| `planner.ts`          | Desired vs observed becomes actions. Pure. Owns the immutability model. |
+| `runtime/types.ts`    | The adapter contract.                                                   |
+| `runtime/memory.ts`   | The reference adapter: the whole system runs without containerd.        |
+| `runtime/containerd/` | The real adapter, over nerdctl.                                         |
+| `serve.ts`            | The control loop, plus restart backoff.                                 |
 
-The session records ops and errors while evaluating, flushes currently available
-React work, and drains queued runtime operations before replying. Exit code 0
-means this evaluation reported no errors; it is not a readiness or future-health
-guarantee. Suspended dependencies may become ready later, and hooks continue
-running after the response. Background errors observed during apply are included
-conservatively; operations are not tagged with distributed transaction IDs.
+## Ownership is a tree; relationships are a graph
 
-Build/import errors occur before render and leave the previous tree intact.
-Render errors may unmount the tree, and runtime failures may leave partial changes;
-both return failure without rollback. A disconnected/timed-out client does not
-cancel an accepted apply. Source edits during evaluation are not an atomic file
-snapshot: finish the edit before applying. Loaded programs are trusted code;
-module top-level side effects cannot be rolled back either.
+Nesting in the JSX means **ownership**, and nothing else:
 
-A reloaded file exports a new component function, so React remounts the
-subtree: DELETE then CREATE for every name in it. `resetAfterCommit` reduces
-each commit to its net effect per `kind:name` before handing it to the sink
-(`normalizeBatch`), so the runtime sees an `UPDATE` where the spec changed
-and nothing where it did not (decision 19).
+```text
+Deployment
+  └─ ReplicaSet          (created by the controller, not written by you)
+      └─ Pod
+          └─ Container
+```
 
-## Scheduling
+Everything else is a reference by name:
 
-All updates resolve to React's `SyncLane` (`resolveUpdatePriority` returns
-the discrete priority), so a store event commits in the next microtask on its
-own, and `root.flush()` commits it immediately. Suspense retries are the
-exception: React picks a retry lane and goes through the Scheduler.
-`root.settle()` waits for those.
+```tsx
+<Network name="backend" />
 
-React throttles the commit that replaces a Suspense fallback by about 300ms to
-avoid flashing UI. The hostConfig's `scheduleTimeout` runs that on the next
-microtask instead; there is nothing to flash.
+<ReplicaSet name="api" replicas={3}>
+  <Pod network="backend" labels={{ app: 'api' }}>   {/* joins by name */}
+    <Container name="app" image="api:v1" />
+  </Pod>
+</ReplicaSet>
 
-## Ordering guarantees
+<Service name="api" selector={{ app: 'api' }} port={80} />  {/* selects by label */}
+```
 
-- One batch per commit, delivered after the commit. Nothing is observable
-  mid-render.
-- Within a batch: deletions before placements (React's order), parents before
-  children on `CREATE`, children before parents on `DELETE`.
-- Across batches: the containerd executor runs them strictly in sequence.
+Writing `<Network><ReplicaSet/></Network>` would read as though the Network
+owned the ReplicaSet, which it does not — it would also mean a Pod could only be
+on a network its ancestors chose. (This reverses an earlier design where
+`<Network>` ancestry _was_ membership; see decision 14.)
+
+## The immutability model
+
+Containers and Pods are mostly immutable. `planner.ts` owns the decision:
+
+```text
+container resources (cpu, memory)     → update in place
+container image / command / env / …   → replace the container
+pod network / publish / labels        → replace the Pod
+network anything                      → replace the Network
+pod observed as exited                → replace the Pod
+```
+
+Note the last line. A crash and an image change produce the _same_ action,
+`replace-pod`, from the same function — which is what it looks like when
+"desired state changed" and "reality drifted" are genuinely handled by one
+mechanism instead of two.
+
+Nothing above the adapter ever says `stop`, `delete` or `start`. The action is
+`replace-pod`; that a replacement means remove-then-create is decided in
+`serve.ts`'s `execute()` and carried out by the adapter, and that is the only
+place the sequence exists.
+
+## Where state lives
+
+Four places, and the rule is which goes where:
+
+1. **The fiber tree** — React's record of what it last committed, plus policy
+   state (a `Ready` latch). React diffs against this, exactly as the DOM
+   renderer diffs against memoized props and never re-reads the DOM.
+2. **The runtime** — containerd. React never looks at it and assumes nothing
+   about it.
+3. **`observed.ts`** — the observation of 2. Because React cannot re-verify the
+   host, drift has to come back as an _input_, and this is where it arrives.
+4. **`serve.ts`'s restart gate** — how many times a Pod has already failed. The
+   one piece of state the controllers and planner cannot hold, because they are
+   pure functions of (desired, observed) and this is neither.
+
+In Kubernetes terms, React plus the controllers are the part of a controller
+that compares desired state against a cache, and `observed.ts` is the informer.
+
+## Dependency ordering
+
+`<Ready on="db" until="ready">` suspends its children until the `db` Pod is
+observed running (or ready). This is the one place the tree reads observed
+state, and it reads it to decide what to _want_ — which is legitimate, and
+different from restating an observation as an intention.
+
+It latches: a dependency that later dies does not retract what depends on it.
+The planner will bring the dependency back, and unmounting its dependents in
+the meantime would turn a blip into an outage.
+
+## Running it without containerd
+
+`runtime/memory.ts` implements the full adapter contract in memory. Because the
+runtime boundary is declarative, the entire control plane — controllers,
+planner, backoff, rollouts, Service endpoint resolution — runs against it
+unchanged. That is what `fiber-servo plan` uses, and it is why almost the whole
+test suite needs no container runtime at all.

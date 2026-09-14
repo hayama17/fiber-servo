@@ -1,231 +1,255 @@
 # fiber-servo
 
-A React reconciler for containers. You write the desired state as JSX; React's
-reconciliation turns changes into a list of operations; containerd runs them.
+**React Fiber as the control plane for a single-node container orchestrator.**
 
-[![CI](https://github.com/hayama17/fiber-servo/actions/workflows/ci.yml/badge.svg)](https://github.com/hayama17/fiber-servo/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/fiber-servo)](https://www.npmjs.com/package/fiber-servo)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-[日本語](README.ja.md)
+You describe Pods, ReplicaSets and Services in JSX. React works out what should
+exist. Controllers work out what to do about it. containerd runs it.
 
 ```tsx
-// app.tsx
-import { Container, Deployment, Network } from 'fiber-servo';
+import { Container, Network, Pod, ReplicaSet, Service, containerd, serve } from 'fiber-servo';
 
-export default function App() {
-  return (
-    <Network name="app">
-      <Container name="db" image="postgres:16" readiness={{ exec: ['pg_isready'] }}>
-        <Deployment name="web" replicas={2} service={{ port: 80, publish: 8080 }}>
-          <Container image="nginx:alpine" env={{ DATABASE_HOST: 'db' }} />
-        </Deployment>
-      </Container>
-    </Network>
-  );
-}
+serve(
+  <>
+    <Network name="backend" />
+
+    <ReplicaSet name="api" replicas={3}>
+      <Pod network="backend" labels={{ app: 'api' }}>
+        <Container name="app" image="api:v1" ports={[8080]} />
+      </Pod>
+    </ReplicaSet>
+
+    <Service
+      name="api"
+      network="backend"
+      selector={{ app: 'api' }}
+      port={80}
+      targetPort={8080}
+      publish={8080}
+    />
+  </>,
+  { runtime: containerd() },
+);
 ```
 
-The tree shape is the topology: inside `<Network>` means membership, inside
-`<Container>` means dependency. `fiber-servo plan app.tsx` shows what it
-expands to without running anything:
+> **Status: an experiment.** Single node, no API server, no clustering. It is
+> small on purpose — small enough that you can read it and see what React Fiber
+> is actually contributing.
 
+## The idea
+
+There are two reconcilers here, and keeping them apart is the whole design:
+
+```text
+React reconciles management resources.      "I want three replicas of this."
+Controllers reconcile runtime resources.    "There are two. Make another."
 ```
-CREATE network app
-CREATE container db image=postgres:16 network=app
-                                        (db reported ready)
-CREATE container web-0 image=nginx:alpine network=app
-CREATE container web-1 image=nginx:alpine network=app
-CREATE container web image=docker.io/library/caddy:2-alpine network=app
+
+They answer to different events:
+
+```text
+React reconciliation      = the desired configuration changed
+Controller reconciliation = reality drifted from it
 ```
 
-`fiber-servo up app.tsx` runs it on containerd. Change `replicas` from 2 to
-5 and exactly three `CREATE`s follow, plus an `UPDATE` of the proxy. Change
-`image` and each replica gets one `UPDATE`. Kill `web-1` and, after a backoff,
-`START container web-1 attempt=1`. Everything you know about React state,
-composition and hooks applies to infrastructure.
+Why that matters: suppose a Pod dies under `<ReplicaSet replicas={3}>`.
 
-> **Status: experimental.** The reconciler is covered by tests that never
-> touch a runtime. The containerd runtime has been exercised on a real host
-> but has not been through many hands yet. APIs may change before 1.0.
+```text
+desired = 3   <- unchanged. The JSX still says 3, and it is still right.
+actual  = 2   <- changed.
+```
 
-## Why
+React has nothing to re-render. The honest place to notice is a controller
+comparing 3 against 2, and that is what happens — a dead Pod is replaced with
+**zero React renders**. `examples/replicaset.tsx` prints the render count so you
+can watch it not move:
 
-Container orchestrators reconcile a desired state against an observed state.
-React does exactly that for UI, and its reconciler is pluggable. fiber-servo
-plugs it into containerd, so the "control loop" is `render()`, composition is
-a function call, and dependency ordering is Suspense.
+```console
+$ npm run example:replicaset
+bringing up three replicas:
+  create-pod api-0
+  create-pod api-1
+  create-pod api-2
+  -> api-0:running api-1:running api-2:running
+  React commits so far: 1
+
+killing api-1 behind the control plane’s back:
+  replace-pod api-1 because [phase]
+  -> api-0:running api-2:running api-1:running
+  React commits caused by the failure: 0 (the tree never changed)
+```
+
+The alternative — feeding the failure back into the tree as a changed prop so
+`commitUpdate` fires — is what an earlier version of this project did, and it is
+a lie: it encodes an observation as if it were an intention. Removing it is what
+this architecture is for.
 
 ## Install
 
-```sh
+```console
 npm install fiber-servo react
 ```
 
-Node 20 or later. For a real runtime you need containerd and
-[nerdctl](https://github.com/containerd/nerdctl) on the host; for development
-and tests you need neither.
+Node 20+. For the containerd runtime you need `nerdctl` on `PATH` and
+permission to talk to containerd (usually `sudo`).
 
-## Quick start without a runtime
+## Try it without containerd
+
+The runtime boundary is declarative, so the entire control plane runs against an
+in-memory adapter — controllers, rollouts, backoff, Service endpoints and all:
+
+```console
+npm run example            # one network, one pod
+npm run example:replicaset # kill a pod, watch a controller replace it
+npm run example:webapp     # database, rolled-out API, service in front
+```
+
+`fiber-servo plan` does the same thing for your own file, printing every action
+and touching nothing:
+
+```console
+npx fiber-servo plan examples/app.tsx
+```
+
+## CLI
+
+```console
+fiber-servo plan  <app.tsx>                     print the actions, execute nothing
+fiber-servo up    <app.tsx> [--watch]           run it on containerd until Ctrl-C
+fiber-servo apply <app.tsx>                     re-evaluate the running session
+```
+
+`app.tsx` default-exports an element or a component. The file is the source of
+truth — there is no API server to `apply` into. `--watch` re-evaluates on save;
+`apply` does it on demand.
+
+## The model
+
+Six components. Two rules for reading them:
+
+**Nesting is ownership.**
+
+```text
+Deployment
+  └─ ReplicaSet     created by the controller; you never write one
+      └─ Pod
+          └─ Container
+```
+
+**Props are references.**
 
 ```tsx
-import { Container, Deployment, createDummyRuntime, createRoot } from 'fiber-servo';
-
-const root = createRoot({ sink: createDummyRuntime() });
-
-root.render(
-  <Deployment name="web" replicas={3}>
-    <Container image="nginx" />
-  </Deployment>,
-);
-// -- commit #1 (3 ops)
-//    CREATE container web-0 image=nginx
-//    CREATE container web-1 image=nginx
-//    CREATE container web-2 image=nginx
-
-root.render(
-  <Deployment name="web" replicas={5}>
-    <Container image="nginx" />
-  </Deployment>,
-);
-// -- commit #2 (2 ops)
-//    CREATE container web-3 image=nginx
-//    CREATE container web-4 image=nginx
-
-root.status.set('web-1', 'dead'); // what a runtime's event stream would do
-// ...1s of backoff later, on its own:
-// -- commit #3 (1 op)
-//    START container web-1 attempt=1
+<Pod network="backend">            {/* joins a Network by name  */}
+<Service selector={{ app: 'api' }}> {/* selects Pods by label   */}
 ```
 
-## Quick start on containerd
-
-With the CLI, an app file is the whole program:
-
-```sh
-npx fiber-servo plan app.tsx              # print the ops, execute nothing
-sudo npx fiber-servo up app.tsx           # run on containerd until Ctrl-C
-sudo npx fiber-servo apply app.tsx        # in another terminal, reflect edits explicitly
-sudo npx fiber-servo up app.tsx --watch   # optional: reflect each save instead
-```
-
-`up` owns a live session; editing files alone does not change its environment.
-`apply` asks that session to re-evaluate the app and its local imports, then
-prints the operations and errors. Containers that kept their name and spec
-are untouched. `--watch` is an optional automatic trigger for the same operation.
-Run `up` and `apply` as the same OS user, with the same entry file and temporary
-directory environment. Control stays local (Unix socket / Windows named pipe);
-there is no separate desired-state database or daemon to install.
-
-An apply succeeds after the current evaluation's queued operations complete;
-readiness-gated children and later self-healing can still produce operations.
-Load errors keep the previous tree. Render/runtime errors return failure, but
-do not roll back changes. See [CLI details](docs/api.md#cli) and
-[the design decision](docs/decisions.md#20-explicit-apply-controls-evaluation).
-
-From code, `serve()` is the same thing in one call:
+So this is right:
 
 ```tsx
-import { containerd, serve } from 'fiber-servo';
-
-const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) });
-process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
+<Network name="backend" />
+<ReplicaSet name="api" replicas={3}>
+  <Pod network="backend">…</Pod>
+</ReplicaSet>
 ```
 
-`examples/containerd.tsx` is this with logging; `examples/app.tsx` is the
-tree it serves. The pieces behind `serve()` (`createRoot`,
-`createContainerdRuntime`, `watchContainerd`) are exported for anything it
-does not cover. See [docs/containerd.md](docs/containerd.md) for what the
-runtime does with each op and what it assumes about nerdctl.
+and wrapping the ReplicaSet inside the `<Network>` would not be — a Network does
+not own the Pods that attach to it.
 
-## Concepts
+| Component      | What it is                                                            |
+| -------------- | --------------------------------------------------------------------- |
+| `<Network>`    | A local bridge network.                                               |
+| `<Pod>`        | An execution sandbox: a network namespace and one or more containers. |
+| `<Container>`  | One process and root filesystem inside a Pod.                         |
+| `<ReplicaSet>` | "Keep N Pods of this template alive."                                 |
+| `<Deployment>` | Rollout policy over ReplicaSets.                                      |
+| `<Service>`    | A stable endpoint in front of whichever Pods match a selector.        |
+| `<Ready>`      | Ordering: declare nothing inside until a Pod is up.                   |
 
-**Two rules hold everything together.**
+### Pods
 
-1. **spec = fiber tree, status = external store.** Host elements are the
-   desired state. Whether a container is running lives in a `StatusStore`
-   outside the tree, read with `useSyncExternalStore`. The tree never writes
-   status; the hostConfig never reads it.
-2. **commit executes nothing.** Every hostConfig method is synchronous and
-   only appends an op. A runtime consumes the batch after the commit. This is
-   why the reconciler is testable without docker and why swapping runtimes is
-   two files.
-
-**Self-healing** is a desired restart generation. `<Container>` reads its
-status, and when it sees a death it waits out an exponential backoff and
-renders `restarts={n + 1}`; the reconciler emits `START`. Restart count,
-`maxRestarts` and the reset after a stable run are component state.
+A Pod is the lifecycle boundary — the thing a ReplicaSet counts and a Service
+routes to. Containers inside one share its network namespace and address:
 
 ```tsx
-<Container name="db" image="postgres" restart={{ baseDelayMs: 500, maxDelayMs: 60_000, maxRestarts: 10 }} />
-<Container name="job" image="batch" restart="never" />
+<Pod name="api" network="backend">
+  <Container name="app" image="api:v1" />
+  <Container name="sidecar" image="proxy:v1" />
+</Pod>
 ```
 
-**Networks** are the second host element. Containers inside a `<Network>`
-attach to it and resolve each other by name. Tree nesting gives ordering.
+Pod-level props define the sandbox, so they are immutable: changing `network`
+replaces the Pod rather than moving it.
 
-**Dependency ordering** is nesting. Children of a `<Container>` emit no
-`CREATE` until it has been reported running, or `ready` when it declares a
-`readiness={{ exec }}` probe that the runtime runs inside it. `<Ready
-on="db">` does the same for dependencies that are not the parent. Under the
-hood it is `use()` on a thenable that settles from the status store, inside
-a `<Suspense>` boundary.
+### Immutability
 
-**Services** are composition. `<Service name="web" port={80} targets={[…]}>`
-renders a caddy reverse proxy in front of its targets;
-`<Deployment service={{ port, publish }}>` renders one for its replicas and
-keeps its command in step with scaling. Host ports are published on the
-proxy, so replicas never collide.
-
-**Composition** is a function. `<App/>` is a component like any other.
-
-More in [docs/architecture.md](docs/architecture.md) and
-[docs/decisions.md](docs/decisions.md).
-
-## API
-
-See [docs/api.md](docs/api.md). The short version:
-
-| Export                                                        | Role                                              |
-| ------------------------------------------------------------- | ------------------------------------------------- |
-| `serve(element, { runtime })`                                 | The one-call entry point; `stop()` tears down     |
-| `containerd(options)`, `dummy(options)`                       | Runtimes for `serve()`                            |
-| `Container`, `Deployment`, `Network`, `Service`, `Ready`      | The components                                    |
-| `useContainerStatus`, `useReady`, `useSelfHeal`               | The hooks behind them                             |
-| `createRoot({ sink, status })`                                | `render`, `flush`, `settle`, `unmount`, `liveIds` |
-| `createStatusStore`                                           | The external store                                |
-| `createNerdctl`, `createContainerdRuntime`, `watchContainerd` | containerd, piece by piece                        |
-| `collectOps`, `formatOp`, `createDummyRuntime`                | Testing helpers                                   |
-
-## Development
-
-```sh
-npm install
-npm test                   # vitest, no runtime needed
-npm run typecheck
-npm run build              # dist/
-npm run check              # everything CI runs
-npm run example            # scale / update / teardown
-npm run example:self-heal  # death -> START with backoff
-npm run example:webapp     # network + gated deployment
-npx tsx src/cli.ts plan examples/app.tsx   # the CLI against the full example
-sudo npm run example:containerd  # real containerd; kill a replica and watch it return
+```text
+container cpu / memory                → updated in place
+container image / command / env / …   → the container is replaced
+pod network / publish / labels        → the Pod is replaced
+pod observed as exited                → the Pod is replaced
 ```
 
-## Roadmap
+A crash and an image change produce the same action from the same function.
+Nothing above the runtime adapter ever says `stop`, `delete` or `start`.
 
-- HTTP and TCP readiness probes, once there is a network path from the host
-  into the CNI network.
-- Volumes and resource limits as spec fields.
-- A direct containerd gRPC client behind the same `Nerdctl` interface.
+### Services
 
-## Contributing
+A Service takes a **selector**, not a list of targets:
 
-Issues and pull requests are welcome. Please read
-[CONTRIBUTING.md](CONTRIBUTING.md) first; the two rules above are enforced in
-review. Reports from real containerd hosts are the most useful thing right
-now.
+```tsx
+<Service name="api" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+```
+
+The backend set is resolved from observed state, which is what lets replicas
+come and go. It is also the answer to "why not publish a host port on the Pod":
+three replicas cannot each own port 8080, but one Service in front of them can.
+The control plane and the data plane are separate — today the data plane is a
+small proxy Pod, and replacing it with nftables would change one function.
+
+### Ordering
+
+```tsx
+<Pod name="db">
+  <Container name="postgres" image="postgres:16"
+             readiness={{ exec: ['pg_isready', '-U', 'postgres'] }} />
+</Pod>
+
+<Ready on="db" until="ready">
+  <Pod name="migrate">…</Pod>
+</Ready>
+```
+
+Nothing inside `<Ready>` is declared until `db` reports ready. It latches: a
+dependency that later dies does not retract what depends on it.
+
+## How it fits together
+
+```text
+JSX → React Fiber → DesiredState → controllers → planner → Runtime adapter → containerd
+                                        ▲                                        │
+                                        └────────── observed state ◄─────────────┘
+```
+
+The loop is level-triggered: every pass reads the current desired state and the
+current observed state and recomputes the difference. A missed event costs a
+late reconcile, never a wrong one.
+
+[`docs/architecture.md`](docs/architecture.md) walks through it properly, and
+[`docs/decisions.md`](docs/decisions.md) records why each choice was made.
+
+## Non-goals
+
+Multi-node scheduling, cluster membership, distributed consensus, API-server
+persistence, overlay networking, NetworkPolicy, Kubernetes API compatibility.
+See [`PLAN.md`](PLAN.md).
+
+## Docs
+
+- [`PLAN.md`](PLAN.md) — the architecture plan and what is still to build
+- [`docs/architecture.md`](docs/architecture.md) — how the pieces fit
+- [`docs/decisions.md`](docs/decisions.md) — why, one decision at a time
+- [`docs/api.md`](docs/api.md) — the exported API
+- [`docs/containerd.md`](docs/containerd.md) — the containerd adapter
 
 ## License
 
-[MIT](LICENSE)
+MIT

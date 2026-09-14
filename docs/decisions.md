@@ -62,6 +62,9 @@ containers by name.
 
 ## 4. Deployment replicas are keyed by index
 
+**Amended by decision 28.** The naming discipline survives; the expansion
+moved from render time into the ReplicaSet controller.
+
 **Decision.** `<Deployment>` clones its template with key and name
 `${name}-${i}`.
 
@@ -78,6 +81,9 @@ are immutable and stable between events.
 identity.
 
 ## 6. Restart bookkeeping is component state
+
+**Superseded by decisions 22 and 27.** `useSelfHeal` is gone; restarts are a
+controller's business and the backoff lives in the control loop.
 
 **Decision.** Restart count, backoff, `maxRestarts` and the reset timer live in
 `useSelfHeal`, not in the store or the runtime.
@@ -157,6 +163,9 @@ only use of `scheduleTimeout`.
 
 ## 14. Nesting is dependency
 
+**Superseded by decision 24.** Nesting now means ownership only. Dependency is
+`<Ready on="...">` and network membership is a `network=` reference.
+
 **Decision.** Children of a `<Container>` mount once it is running (or
 `ready`, when it has a probe) and unmount before it. At the host level they
 are siblings; `<Container>` wraps them in `<Ready>` itself.
@@ -192,6 +201,9 @@ first result.
 it probed against, so a death during a probe wins.
 
 ## 16. Service is a proxy container built by composition
+
+**Superseded by decision 25.** A proxy is still the data plane, but its
+backends come from observed state rather than a render-time target list.
 
 **Decision.** `<Service>` renders a `<Container>` running caddy with
 `reverse-proxy --from :port --to target:port ...`. `<Deployment service>`
@@ -256,6 +268,10 @@ question of which copy is true.
 
 ## 19. Identity is the name, not the fiber
 
+**Superseded by decision 21.** The conclusion holds and is now structural: a
+snapshot has no way to express "deleted then created", so there is no batch
+left to normalise.
+
 **Decision.** `resetAfterCommit` reduces a commit's ops to their net effect
 per `kind:name`. DELETE followed by CREATE of the same name becomes an UPDATE
 when the spec changed and nothing when it did not; CREATE followed by DELETE
@@ -307,3 +323,150 @@ and, on Unix, a stale socket; never unlink another live owner's endpoint.
 **Scope.** This is a local trusted-user control channel, not a remote multi-user
 API, durable scheduler, or security sandbox. No automatic adoption of another
 session or replacement of a live listener is attempted.
+
+## 21. A commit is a snapshot, not a list of operations
+
+**Decision.** `resetAfterCommit` serialises the whole instance tree into a
+`DesiredState` and publishes it. The hostConfig emits no ops and performs no
+mount bookkeeping.
+
+**Why.** An op stream is a diff, and a diff is only correct relative to a
+state you are sure of. React is sure of what it last committed, but not of
+what the runtime holds — a container can die, a process can restart, someone
+can `nerdctl rm` by hand. So the op stream needed increasingly careful repair
+to stay honest: `mountSubtree`/`unmountSubtree` tracking, `normalizeBatch`
+collapsing delete-then-create back into an update, a `rename` path. Every one
+of those was React compensating for not being able to see the host.
+
+A snapshot makes the question go away. React states what should exist; the
+control loop, which _can_ see observed state, works out the difference. All
+the repair machinery deleted itself.
+
+**Consequences.** Re-serialising the tree on every commit is O(tree) where the op
+stream was O(changes). At one machine's worth of containers that is nothing,
+and it buys a renderer with no hidden state. `collectSnapshots()` replaces
+`collectOps()` as the test surface, and an assertion is now "these resources
+should exist", which is easier to read than a sequence.
+
+## 22. Runtime failures never re-enter the tree
+
+**Decision.** A Pod dying is written to `observed.ts` and read by controllers.
+Nothing about it reaches React. `useSelfHeal` and the `restarts` prop are
+deleted.
+
+**Why.** The old design answered a death by incrementing a restart generation
+and passing it down as a prop, purely so React would see a changed value and
+emit `commitUpdate`. That prop encoded an observation as an intention. Once it
+existed there were two records of the same fact — what the tree said about
+restarts and what the runtime had actually done — and keeping them agreeing
+was work with no upside.
+
+Under `<ReplicaSet replicas={3}>` the point is sharper: after a Pod dies the
+JSX still says 3, and it is still _correct_. There is genuinely nothing for
+React to re-render.
+
+**Consequences.** Replacing a dead Pod costs zero React renders, which
+`test/control-loop.test.tsx` asserts directly and `examples/replicaset.tsx`
+prints. Restart policy is a `serve()` option rather than a prop, so it is set
+per control loop instead of per container — a real loss of granularity,
+accepted because per-container restart policy was never exercised.
+
+## 23. A Pod is an infra container plus its members
+
+**Decision.** `<Pod>` is the sandbox and the lifecycle boundary. On containerd
+it is emulated CRI-style: an infra container owns the network namespace and
+the published ports, and members join it with `--network=container:<pod>`.
+
+**Why.** Pods are what makes the rest of the model coherent — a ReplicaSet
+counts Pods, a Service routes to Pods, a sidecar shares its main container's
+address. containerd has no Pod, but CRI's emulation is well understood and
+costs one extra container per Pod.
+
+**Consequences.** Published ports belong to the Pod, not the container, since
+a container sharing a namespace cannot publish. Container-level networking is
+not offered at all.
+
+## 24. Ownership is nesting; everything else is a reference
+
+**Decision.** JSX nesting means ownership only. A Pod joins a Network with
+`network="backend"` and a Service finds Pods with `selector={{...}}`.
+
+**Why.** Decision 14 made nesting mean membership _and_ dependency, which read
+well until the graph stopped being a tree. A Pod owned by a ReplicaSet cannot
+also be nested inside its Network, so one of the two relationships had to
+become a reference anyway — and choosing by which is structurally an
+ownership edge is the rule that stays consistent as more resource kinds
+appear.
+
+**Consequences.** `<Network>` no longer wraps anything, and a typo in a
+`network=` or a selector is a runtime miss rather than a compile error. That
+is the price of modelling a graph.
+
+## 25. A Service selects; it does not list
+
+**Decision.** `<Service selector={{ app: 'api' }}>`. Backends are resolved
+from observed state by the Service controller.
+
+**Why.** The previous `<Service targets={[...]}>` was computed at render time
+by `<Deployment>`, which meant the backend set could only change when React
+re-rendered. Pods appear and disappear without the tree changing, so the set
+was wrong exactly when it mattered.
+
+**Consequences.** A Service with nothing matching renders no proxy at all,
+which is better than a proxy answering with 502. Control plane and data plane
+are separable: replacing the caddy Pod with nftables changes one function.
+
+The endpoint set is part of the proxy container's command, so every change to
+it is a `replace-container` — visible as churn while replicas are still coming
+up one by one. That is the immutability model behaving exactly as specified
+rather than a bug, but it is also the clearest argument for a data plane that
+can be reconfigured instead of recreated, and it is where the next Service
+implementation should start.
+
+## 26. The adapter records the spec it created from
+
+**Decision.** `ObservedPod` carries `spec` (and `specDigest`), written into a
+label by the adapter and read back by `inspect()`.
+
+**Why.** Observation tells you what is running, not what was asked for. Given
+only a live Pod and a desired spec you can tell _that_ they differ but not
+_which field_ — and the whole immutability model turns on that distinction,
+because a cpu change is an in-place update and an image change is a
+replacement. Keeping the answer in the process would lose it on restart, so it
+lives on the resource, which is also what makes adopting existing containers
+possible (extending decision 10 from a digest to the spec itself).
+
+**Consequences.** Any adapter mutation that changes a Pod's real spec must
+rewrite the record, or the next reconcile sees a difference that is not there.
+A Pod with no record is adopted rather than replaced: we do not delete what we
+cannot prove we made.
+
+## 27. Backoff lives in the control loop
+
+**Decision.** The restart gate is state in `serve()`. Controllers and the
+planner are pure functions of (desired, observed).
+
+**Why.** "How many times has this already failed" is neither desired state nor
+observed state, so it has no home in either. Keeping it out of them is what
+lets both be tested as plain functions over literals, which is most of the
+test suite.
+
+**Consequences.** The gate resets when a Pod stays up for `resetAfterMs`, and
+it is lost on process restart — a crash-looping Pod gets a fresh budget after
+a restart of fiber-servo. Acceptable, and the alternative is persisting
+control-plane state, which decision 18 rules out.
+
+## 28. Generation digest, then index
+
+**Decision.** A Deployment's ReplicaSet is `${deployment}-${digest(template)}`
+and its Pods are `${replicaSet}-${index}`.
+
+**Why.** The digest makes a template generation self-identifying: an unchanged
+template keeps its ReplicaSet, an edited one gets a new one, and no separate
+revision counter has to be stored or incremented. The index keeps decision 4's
+property that scaling 3 to 5 touches only the two new Pods.
+
+**Consequences.** Names are deterministic, so a restarted fiber-servo computes
+the same ones and adopts its own Pods. A trivial template edit (reordering
+env keys is normalised away, but a whitespace change in a command is not)
+triggers a rollout, which is the honest reading of "the template changed".

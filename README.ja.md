@@ -1,126 +1,227 @@
 # fiber-servo
 
-コンテナのための React reconciler です。望ましい状態を JSX で書くと、React のリコンサイルが差分を操作（ops）の列に変換し、containerd がそれを実行します。
+**React Fiber を、単一ノード向けコンテナオーケストレータの制御プレーンとして使う。**
 
-[English](README.md)
+Pod・ReplicaSet・Service を JSX で書きます。React が「何が存在すべきか」を決め、コントローラが「そのために何をするか」を決め、containerd が実行します。
 
 ```tsx
-// app.tsx
-import { Container, Deployment, Network } from 'fiber-servo';
+import { Container, Network, Pod, ReplicaSet, Service, containerd, serve } from 'fiber-servo';
 
-export default function App() {
-  return (
-    <Network name="app">
-      <Container name="db" image="postgres:16" readiness={{ exec: ['pg_isready'] }}>
-        <Deployment name="web" replicas={2} service={{ port: 80, publish: 8080 }}>
-          <Container image="nginx:alpine" env={{ DATABASE_HOST: 'db' }} />
-        </Deployment>
-      </Container>
-    </Network>
-  );
-}
+serve(
+  <>
+    <Network name="backend" />
+
+    <ReplicaSet name="api" replicas={3}>
+      <Pod network="backend" labels={{ app: 'api' }}>
+        <Container name="app" image="api:v1" ports={[8080]} />
+      </Pod>
+    </ReplicaSet>
+
+    <Service
+      name="api"
+      network="backend"
+      selector={{ app: 'api' }}
+      port={80}
+      targetPort={8080}
+      publish={8080}
+    />
+  </>,
+  { runtime: containerd() },
+);
 ```
 
-ツリーの形がそのままトポロジです。`<Network>` の中は所属、`<Container>` の中は依存。`fiber-servo plan app.tsx` で、何も実行せずに展開結果を見られます。
+> **位置づけ: 実験プロジェクトです。** 単一ノード、API サーバなし、クラスタリングなし。意図的に小さく保っています——React Fiber が実際に何を担っているかを、読んで確かめられる程度に。
 
+## 中心にある考え
+
+リコンサイラが2つあり、それらを混ぜないことが設計のすべてです。
+
+```text
+React は管理リソースをリコンサイルする。        「これを3つ動かしたい」
+コントローラは実行時リソースをリコンサイルする。  「2つしかない。もう1つ作る」
 ```
-CREATE network app
-CREATE container db image=postgres:16 network=app
-                                        (db が ready と報告される)
-CREATE container web-0 image=nginx:alpine network=app
-CREATE container web-1 image=nginx:alpine network=app
-CREATE container web image=docker.io/library/caddy:2-alpine network=app
+
+両者は反応する対象が違います。
+
+```text
+React のリコンサイル      = 望ましい構成が変わった
+コントローラのリコンサイル = 現実が望ましい構成からずれた
 ```
 
-`fiber-servo up app.tsx` で containerd 上に実体化します。`replicas` を 2 から 5 にすると CREATE がちょうど 3 つとプロキシの UPDATE が 1 つ、`image` を変えると各 replica に UPDATE が 1 つ、`web-1` を kill するとバックオフの後に `START container web-1 attempt=1` が出ます。React の state・合成・hooks の知識がそのままインフラに使えます。
+なぜこれが重要か。`<ReplicaSet replicas={3}>` の下で Pod が1つ落ちたとします。
 
-> **ステータス: 実験段階です。** reconciler はランタイムに触れないテストで固定されています。containerd ランタイムは実機で動作確認していますが、まだ利用者が少ない段階です。1.0 までは API が変わることがあります。
+```text
+desired = 3   <- 変わっていない。JSX は今も 3 と言っており、それは正しい。
+actual  = 2   <- 変わった。
+```
 
-## なぜ
+React には再レンダリングすべきものが何もありません。気づくべき正しい場所は「3 と 2 を比べるコントローラ」であり、実際そうなっています——落ちた Pod は **React のレンダリング 0 回** で置き換えられます。`examples/replicaset.tsx` はそのカウンタを表示するので、動かないことを目で確認できます。
 
-コンテナオーケストレータは「望ましい状態」と「観測した状態」をリコンサイルします。React は UI に対して同じことをしていて、しかも reconciler が差し替え可能です。fiber-servo はそれを containerd に繋ぎます。制御ループは `render()`、合成は関数呼び出し、依存順序は Suspense です。
+```console
+$ npm run example:replicaset
+bringing up three replicas:
+  create-pod api-0
+  create-pod api-1
+  create-pod api-2
+  -> api-0:running api-1:running api-2:running
+  React commits so far: 1
+
+killing api-1 behind the control plane’s back:
+  replace-pod api-1 because [phase]
+  -> api-0:running api-2:running api-1:running
+  React commits caused by the failure: 0 (the tree never changed)
+```
+
+もう一方のやり方——失敗を prop の変化としてツリーに戻し `commitUpdate` を発火させる——は本プロジェクトの以前の版がやっていたことで、それは嘘です。観測を意図であるかのように符号化しているからです。これを取り除くことが、このアーキテクチャの目的です。
 
 ## インストール
 
-```sh
+```console
 npm install fiber-servo react
 ```
 
-Node 20 以上。実際に動かすには containerd と [nerdctl](https://github.com/containerd/nerdctl) がホストに必要です。開発とテストにはどちらも要りません。
+Node 20 以上。containerd ランタイムには `nerdctl` が `PATH` にあり、containerd と通信できる権限（多くの場合 `sudo`）が必要です。
 
-## 設計の2つのルール
+## containerd なしで試す
 
-1. **spec = fiber ツリー、status = external store。** host element が望ましい状態です。コンテナが動いているかどうかはツリーの外の `StatusStore` にあり、`useSyncExternalStore` で読みます。ツリーは status を書かず、hostConfig は status を読みません。
-2. **commit は何も実行しない。** hostConfig のメソッドはすべて同期で、op を積むだけです。ランタイムが commit 後にバッチを消費します。docker なしで reconciler をテストできるのも、ランタイムの差し替えが 2 ファイルで済むのもこのためです。
+ランタイム境界が宣言的なので、制御プレーン全体——コントローラ、ロールアウト、バックオフ、Service のエンドポイント解決まで——がインメモリのアダプタ上でそのまま動きます。
 
-**自己修復**は「望ましいリスタート世代」です。`<Container>` は自分の status を読み、死亡を観測すると指数バックオフの後に `restarts={n + 1}` を render し、reconciler が `START` を出します。リスタート回数、`maxRestarts`、安定稼働後のリセットは component の state です。
-
-**ネットワーク**は 2 つ目の host element です。`<Network>` の中のコンテナはそこに接続され、名前で互いを解決できます。ツリーのネストが作成・削除の順序を保証します。
-
-**依存順序**はネストです。`<Container>` の子は、その container が running（`readiness={{ exec }}` の probe があれば ready）と報告されるまで `CREATE` を出しません。親以外への依存は `<Ready on="db">` で書けます。内部では status store から解決される thenable を `use()` し、`<Suspense>` で包んでいます。
-
-**Service**は合成です。`<Service name="web" port={80} targets={[…]}>` は caddy の reverse proxy コンテナを描画し、`<Deployment service={{ port, publish }}>` は replica の前にそれを置いて、scale に合わせてコマンドを更新します。ホストポートはプロキシ側で公開するので replica 同士が衝突しません。
-
-**合成**はただの関数です。
-
-詳細は [docs/architecture.md](docs/architecture.md) と [docs/decisions.md](docs/decisions.md)（英語）を参照してください。
-
-## containerd で動かす
-
-CLI なら app ファイルがプログラムそのものです。
-
-```sh
-npx fiber-servo plan app.tsx              # ops を表示するだけ。何も実行しない
-sudo npx fiber-servo up app.tsx           # containerd 上で Ctrl-C まで動かす
-sudo npx fiber-servo apply app.tsx        # 別の端末から、編集した構成を明示的に反映する
-sudo npx fiber-servo up app.tsx --watch   # 必要なら保存のたびに自動反映する
+```console
+npm run example            # ネットワーク1つ、Pod 1つ
+npm run example:replicaset # Pod を殺し、コントローラが戻すのを見る
+npm run example:webapp     # DB、ロールアウトされる API、その前段の Service
 ```
 
-`up` がセッションと React ツリーを保持します。通常はファイルを編集するだけでは反映されず、
-`apply` が実行中のセッションに再評価を要求します。ローカルの import 先も読み直し、
-名前と spec が同じコンテナは維持します。`--watch` は同じ反映処理を自動で呼ぶオプションです。
+`fiber-servo plan` は自分のファイルに対して同じことをし、全アクションを表示して何も実行しません。
 
-`up` と `apply` は同じ OS ユーザー・同じエントリーファイル・同じ一時ディレクトリ設定で実行します。
-通信はローカルの Unix ソケット（Windows は名前付きパイプ）だけで、別の構成 DB は持ちません。
-apply は今回キューに入った操作の実行結果を返します。全コンテナの readiness 完了は待ちません。
-読み込み失敗時は前のツリーを維持しますが、レンダーや実行中の失敗にはロールバックがありません。
-詳しくは [CLI](docs/api.md#cli) と [設計判断](docs/decisions.md#20-explicit-apply-controls-evaluation) を参照してください。
+```console
+npx fiber-servo plan examples/app.tsx
+```
 
-コードからは `serve()` の 1 行です。
+## CLI
+
+```console
+fiber-servo plan  <app.tsx>                     アクションを表示し、何も実行しない
+fiber-servo apply <app.tsx>                     動作中セッションに再評価させる
+fiber-servo up    <app.tsx> [--watch]           Ctrl-C まで containerd 上で動かす
+```
+
+`app.tsx` は React 要素かコンポーネントを default export します。真実の源はファイルであり、`apply` する先の API サーバは存在しません。`--watch` は保存のたびに再評価し、`apply` は任意のタイミングで再評価させます。
+
+## モデル
+
+コンポーネントは6つ。読み方の規則は2つです。
+
+**ネストは所有関係。**
+
+```text
+Deployment
+  └─ ReplicaSet     コントローラが作る。自分で書くことはない
+      └─ Pod
+          └─ Container
+```
+
+**props は参照。**
 
 ```tsx
-import { containerd, serve } from 'fiber-servo';
-
-const served = serve(<App />, { runtime: containerd({ namespace: 'default' }) });
-process.once('SIGINT', () => served.stop().then(() => process.exit(0)));
+<Pod network="backend">             {/* 名前で Network に参加 */}
+<Service selector={{ app: 'api' }}>  {/* ラベルで Pod を選択 */}
 ```
 
-`examples/containerd.tsx` はこれにログを足したもので、`examples/app.tsx` がそこで serve されるツリーです。`serve()` の裏にある部品（`createRoot`、`createContainerdRuntime`、`watchContainerd`）も export しています。各 op が nerdctl の何になるか、nerdctl の出力について何を仮定しているかは [docs/containerd.md](docs/containerd.md) にまとめています。
+したがってこれが正しく、
 
-## 開発
-
-```sh
-npm install
-npm test                   # vitest、ランタイム不要
-npm run typecheck
-npm run build              # dist/
-npm run check              # CI と同じ一式
-npm run example            # scale / update / teardown
-npm run example:self-heal  # 死亡 -> バックオフ付き START
-npm run example:webapp     # network + 依存順序付き deployment
-sudo npm run example:containerd  # 実機。replica を kill すると戻ってきます
+```tsx
+<Network name="backend" />
+<ReplicaSet name="api" replicas={3}>
+  <Pod network="backend">…</Pod>
+</ReplicaSet>
 ```
 
-## ロードマップ
+ReplicaSet を `<Network>` の中に入れるのは正しくありません——Network は、そこに接続する Pod を所有していないからです。
 
-- HTTP / TCP の readiness probe（ホストから CNI ネットワークへの経路ができてから）。
-- Volume とリソース制限を spec のフィールドとして追加する。
-- 同じ `Nerdctl` インターフェースの裏に containerd gRPC クライアントを置く。
+| コンポーネント | 意味                                                          |
+| -------------- | ------------------------------------------------------------- |
+| `<Network>`    | ローカルブリッジネットワーク。                                |
+| `<Pod>`        | 実行サンドボックス。ネットワーク名前空間と1つ以上のコンテナ。 |
+| `<Container>`  | Pod 内の1プロセスとルートファイルシステム。                   |
+| `<ReplicaSet>` | 「このテンプレートの Pod を N 個保つ」。                      |
+| `<Deployment>` | ReplicaSet 上のロールアウト方針。                             |
+| `<Service>`    | セレクタに一致する Pod 群の前に立つ安定したエンドポイント。   |
+| `<Ready>`      | 順序付け。Pod が起動するまで中身を宣言しない。                |
 
-## コントリビュート
+### Pod
 
-Issue と Pull Request を歓迎します。先に [CONTRIBUTING.md](CONTRIBUTING.md) を読んでください。上の 2 つのルールはレビューで守られます。実機の containerd での報告が今いちばん役に立ちます。
+Pod はライフサイクルの境界です——ReplicaSet が数え、Service がルーティングする単位。中のコンテナはネットワーク名前空間とアドレスを共有します。
+
+```tsx
+<Pod name="api" network="backend">
+  <Container name="app" image="api:v1" />
+  <Container name="sidecar" image="proxy:v1" />
+</Pod>
+```
+
+Pod レベルの props はサンドボックスを定義するため、すべて不変です。`network` を変えると Pod は「移動」ではなく「置き換え」になります。
+
+### 不変性モデル
+
+```text
+コンテナの cpu / memory                  → その場で更新
+コンテナの image / command / env / …     → コンテナを置き換え
+Pod の network / publish / labels        → Pod を置き換え
+Pod が exited と観測された               → Pod を置き換え
+```
+
+クラッシュとイメージ変更は、同じ関数から同じアクションを生みます。ランタイムアダプタより上で `stop` / `delete` / `start` と言う層は1つもありません。
+
+### Service
+
+Service が受け取るのはターゲット一覧ではなく **セレクタ** です。
+
+```tsx
+<Service name="api" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+```
+
+バックエンド集合は観測状態から解決されます。だからこそレプリカが増減できます。「Pod にホストポートを publish すればよいのでは」への答えでもあります——3つのレプリカが同じ 8080 番を持つことはできませんが、前段の Service 1つなら持てます。制御プレーンとデータプレーンは分離されており、今のデータプレーンは小さなプロキシ Pod です。nftables に差し替えるなら変更は1関数で済みます。
+
+### 順序付け
+
+```tsx
+<Pod name="db">
+  <Container name="postgres" image="postgres:16"
+             readiness={{ exec: ['pg_isready', '-U', 'postgres'] }} />
+</Pod>
+
+<Ready on="db" until="ready">
+  <Pod name="migrate">…</Pod>
+</Ready>
+```
+
+`db` が ready を報告するまで `<Ready>` の中身は宣言されません。ラッチ式なので、後から依存先が落ちても依存側は取り消されません。
+
+## 全体の流れ
+
+```text
+JSX → React Fiber → DesiredState → コントローラ → planner → Runtime アダプタ → containerd
+                                        ▲                                          │
+                                        └────────────── 観測状態 ◄─────────────────┘
+```
+
+ループはレベルトリガです。毎回、現在の desired と現在の observed を読んで差分を計算し直します。イベントを取りこぼしても、遅いリコンサイルになるだけで、誤ったリコンサイルにはなりません。
+
+詳細は [`docs/architecture.md`](docs/architecture.md)、判断の理由は [`docs/decisions.md`](docs/decisions.md) にあります。
+
+## やらないこと
+
+マルチノードスケジューリング、クラスタメンバーシップ、分散合意、API サーバによる永続化、オーバーレイネットワーク、NetworkPolicy、Kubernetes API 互換。[`PLAN.md`](PLAN.md) を参照してください。
+
+## ドキュメント
+
+- [`PLAN.md`](PLAN.md) — アーキテクチャ計画と未実装分
+- [`docs/architecture.md`](docs/architecture.md) — 各部品の噛み合い方
+- [`docs/decisions.md`](docs/decisions.md) — 判断の記録
+- [`docs/api.md`](docs/api.md) — 公開 API
+- [`docs/containerd.md`](docs/containerd.md) — containerd アダプタ
 
 ## ライセンス
 
-[MIT](LICENSE)
+MIT

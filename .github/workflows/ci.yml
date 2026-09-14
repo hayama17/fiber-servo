@@ -25,5 +25,6 @@ jobs:
       - name: Examples run without a runtime
         run: |
           npm run example
-          npm run example:self-heal
+          npm run example:replicaset
           npm run example:webapp
+          npm run example:plan

@@ -1,32 +1,36 @@
 /**
- * Phase-0 walkthrough: no docker, just the ops the tree produces.
+ * The smallest thing that works: one network, one Pod, one container.
  *
- *   npm run example
+ * Run it with `npm run example`. It uses the in-memory runtime, so nothing is
+ * installed and no containerd is contacted — what you see printed is exactly
+ * what the control plane decided to do.
  */
-import { Container, Deployment, createDummyRuntime, createRoot } from '../src/index.js';
+import { Container, Network, Pod, formatAction, memory, serve } from '../src/index.js';
 
-const root = createRoot({ sink: createDummyRuntime() });
+const app = (
+  <>
+    <Network name="demo" subnet="10.88.0.0/24" />
 
-const web = (replicas: number, image: string) => (
-  <Deployment name="web" replicas={replicas}>
-    <Container image={image} ports={[80]} />
-  </Deployment>
+    <Pod name="web" network="demo" labels={{ app: 'web' }}>
+      <Container name="nginx" image="docker.io/library/nginx:alpine" ports={[80]} />
+    </Pod>
+  </>
 );
 
-console.log('# initial: 3 replicas');
-root.render(web(3, 'nginx:1.26'));
+const served = serve(app, {
+  runtime: memory(),
+  onActions: (actions) => {
+    for (const action of actions) console.log(`  ${formatAction(action)}`);
+  },
+});
 
-console.log('# scale 3 -> 5');
-root.render(web(5, 'nginx:1.26'));
+console.log('reconciling:');
+await served.root.settle();
+await served.idle();
 
-console.log('# bump image');
-root.render(web(5, 'nginx:1.27'));
+console.log('\nobserved:');
+for (const pod of served.observed.snapshot().pods.values()) {
+  console.log(`  ${pod.name} ${pod.phase}${pod.ip ? ` ip=${pod.ip}` : ''}`);
+}
 
-console.log('# same tree again (no ops expected)');
-root.render(web(5, 'nginx:1.27'));
-
-console.log('# scale 5 -> 2');
-root.render(web(2, 'nginx:1.27'));
-
-console.log('# unmount');
-root.unmount();
+await served.stop();

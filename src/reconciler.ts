@@ -1,51 +1,73 @@
+/**
+ * The React half of the control plane.
+ *
+ * `createRoot` renders a tree and publishes a `DesiredState` snapshot after
+ * every commit. That is the entirety of React's job here. It never learns
+ * whether a Pod actually started, and it is never asked to re-render because
+ * one stopped — that is observed state, and it reaches the control loop by a
+ * different path (see `observed.ts`).
+ *
+ * The tree can still *read* observed state, through `useReady` and friends, to
+ * decide what it wants next: "don't declare the web Pod until the database is
+ * ready" is a statement about desired state that happens to depend on an
+ * observation. Reading is fine. What the tree must never do is restate an
+ * observation as a fake desired-state change in order to provoke a commit.
+ */
 import { createElement, type ReactNode } from 'react';
 import Reconciler from 'react-reconciler';
 import { ConcurrentRoot } from 'react-reconciler/constants.js';
-import { StatusContext } from './hooks.js';
+import { ObservedContext } from './hooks.js';
+import { createObservedStore } from './observed.js';
 import { createRootContainer, typedHostConfig, type RootContainer } from './hostConfig.js';
-import type { InstanceKind, Op, OpSink } from './ops.js';
-import { createStatusStore, type StatusStore } from './status.js';
+import type { DesiredState } from './resources.js';
+import type { ObservedStore } from './runtime/types.js';
 
 const reconciler = Reconciler(typedHostConfig);
 
+/** An empty desired state: what a root holds before its first render. */
+export const EMPTY_DESIRED: DesiredState = { resources: [] };
+
 export interface Root {
   /**
-   * Render `element` as the desired state and flush synchronously.
-   * When it returns, every op the commit produced has been handed to the sink.
+   * Render `element` as the desired state and flush synchronously. When it
+   * returns, the snapshot it produced has been handed to `onCommit`.
    */
   render(element: ReactNode): void;
   /**
-   * Flush work scheduled outside `render()`: status-store events and timers
-   * (self-healing) re-render on the next microtask by themselves; call this
-   * to have them committed right now, e.g. in tests with fake timers.
+   * Flush work scheduled outside `render()` — an observed-state event, a timer
+   * — right now. Useful in tests with fake timers; otherwise this happens on
+   * the next microtask by itself.
    */
   flush(): void;
   /**
-   * Resolve once React has nothing left to commit. Unlike `flush()`, this
-   * also waits for work that goes through the Scheduler (a Suspense retry
-   * after `useReady` settles), which cannot be flushed synchronously.
+   * Resolve once React has nothing left to commit. Unlike `flush()`, this also
+   * waits for work that goes through the Scheduler (a Suspense retry after
+   * `useReady` settles), which cannot be flushed synchronously.
    */
   settle(): Promise<void>;
-  /** Tear the tree down: emits DELETE for every live container. */
+  /** Tear the tree down. The next snapshot is empty, so everything is removed. */
   unmount(): void;
-  /** Ids of resources of `kind` (default containers) that currently have a CREATE outstanding, in creation order. */
-  liveIds(kind?: InstanceKind): string[];
-  /** The status store this tree reads from. Runtimes and tests write to it. */
-  readonly status: StatusStore;
+  /** The most recent snapshot. */
+  desired(): DesiredState;
+  /** The observed state this tree reads from. Runtimes and tests write to it. */
+  readonly observed: ObservedStore;
 }
 
 export interface CreateRootOptions {
-  /** Receives one batch per commit. Defaults to no-op; use `collectOps` or a runtime. */
-  sink?: OpSink;
-  /** Status store to read from. A fresh one is created when omitted. */
-  status?: StatusStore;
+  /** Receives the snapshot after every commit. Defaults to no-op. */
+  onCommit?: (desired: DesiredState) => void;
+  /** Observed state to read from. A fresh, empty store is created when omitted. */
+  observed?: ObservedStore;
   onUncaughtError?: (error: unknown) => void;
 }
 
 export function createRoot(options: CreateRootOptions = {}): Root {
-  const sink = options.sink ?? (() => {});
-  const status = options.status ?? createStatusStore();
-  const container: RootContainer = createRootContainer(sink);
+  const observed = options.observed ?? createObservedStore();
+  let latest: DesiredState = EMPTY_DESIRED;
+  const container: RootContainer = createRootContainer((desired) => {
+    latest = desired;
+    options.onCommit?.(desired);
+  });
 
   // React reports errors that escape every boundary through these callbacks,
   // from inside the commit. We park the first one and re-throw it once the
@@ -83,7 +105,7 @@ export function createRoot(options: CreateRootOptions = {}): Root {
   }
 
   function update(element: ReactNode): void {
-    const tree = element === null ? null : createElement(StatusContext, { value: status }, element);
+    const tree = element === null ? null : createElement(ObservedContext, { value: observed }, element);
     reconciler.updateContainerSync(tree, fiberRoot, null, null);
     flush();
   }
@@ -101,7 +123,7 @@ export function createRoot(options: CreateRootOptions = {}): Root {
   }
 
   return {
-    status,
+    observed,
     render(element) {
       update(element);
     },
@@ -110,25 +132,26 @@ export function createRoot(options: CreateRootOptions = {}): Root {
     unmount() {
       update(null);
     },
-    liveIds(kind = 'container') {
-      return [...container.live.values()].filter((i) => i.kind === kind).map((i) => i.id);
+    desired() {
+      return latest;
     },
   };
 }
 
-/** A sink that records every op in order. Handy for tests and dry runs. */
-export function collectOps(): { ops: Op[]; batches: Op[][]; sink: OpSink; take(): Op[] } {
-  const ops: Op[] = [];
-  const batches: Op[][] = [];
+/** Records every snapshot a root publishes. Handy for tests and dry runs. */
+export function collectSnapshots(): {
+  snapshots: DesiredState[];
+  onCommit: (desired: DesiredState) => void;
+  last(): DesiredState;
+} {
+  const snapshots: DesiredState[] = [];
   return {
-    ops,
-    batches,
-    sink(batch) {
-      batches.push([...batch]);
-      ops.push(...batch);
+    snapshots,
+    onCommit(desired) {
+      snapshots.push(desired);
     },
-    take() {
-      return ops.splice(0, ops.length);
+    last() {
+      return snapshots[snapshots.length - 1] ?? EMPTY_DESIRED;
     },
   };
 }

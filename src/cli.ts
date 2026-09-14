@@ -2,7 +2,7 @@
 /**
  * fiber-servo CLI.
  *
- *   fiber-servo plan app.tsx           print the ops the tree would produce, without a runtime
+ *   fiber-servo plan app.tsx           print the actions the tree would produce, without a runtime
  *   fiber-servo up   app.tsx           run the tree on containerd until Ctrl-C
  *   fiber-servo up   app.tsx --watch   ...and re-evaluate the file whenever it is saved
  *
@@ -17,16 +17,16 @@ import { listenSession, requestApply, sessionAddress, type ApplyResult } from '.
 import { loadElement } from './load.js';
 import { createSession } from './session.js';
 export { loadElement } from './load.js';
-import { formatOp } from './ops.js';
+import { formatAction } from './planner.js';
 import { containerd } from './runtime/containerd/index.js';
-import { dummy } from './runtime/dummy.js';
-import { serve, type Runtime } from './serve.js';
-import type { ContainerStatus } from './status.js';
+import { memory } from './runtime/memory.js';
+import { serve } from './serve.js';
+import type { ObservedPod, ObservedState, RuntimeFactory } from './runtime/types.js';
 
 const USAGE = `usage:
-  fiber-servo plan <app.tsx>                       print the ops, execute nothing
+  fiber-servo plan <app.tsx>                       print the actions, execute nothing
   fiber-servo apply <app.tsx>                      re-evaluate the running session
-  fiber-servo up   <app.tsx> [--watch] [--runtime containerd|dummy]
+  fiber-servo up   <app.tsx> [--watch] [--runtime containerd|memory]
                              [--namespace n] [--address sock] [--quiet]
 
 <app.tsx> must default-export a React element or a component.
@@ -74,35 +74,39 @@ export function watchFile(file: string, onChange: () => void, debounceMs = 100):
   };
 }
 
-function statusPrinter(log: (line: string) => void): (entries: ReadonlyMap<string, ContainerStatus>) => void {
-  const seen = new Map<string, ContainerStatus>();
-  return (entries) => {
-    for (const [name, s] of entries) {
-      if (seen.get(name) === s) continue;
-      seen.set(name, s);
-      const extra = [
-        s.exitCode !== undefined ? `exit ${s.exitCode}` : '',
-        s.ready ? 'ready' : '',
-        s.reason ? s.reason : '',
-      ]
-        .filter(Boolean)
-        .join(', ');
-      log(`status ${name} ${s.state}${extra ? ` (${extra})` : ''}`);
+/**
+ * Prints observed state as it changes. This is the only place the CLI shows
+ * reality rather than intent, and it is deliberately separate from the action
+ * log above it: one is what we asked for, the other is what happened.
+ */
+function podPrinter(log: (line: string) => void): (state: ObservedState) => void {
+  const seen = new Map<string, ObservedPod>();
+  return (state) => {
+    for (const [name, pod] of state.pods) {
+      if (seen.get(name) === pod) continue;
+      seen.set(name, pod);
+      const detail = pod.containers
+        .map(
+          (c) =>
+            `${c.name}=${c.phase}${c.ready ? '/ready' : ''}${c.exitCode !== undefined ? ` exit ${c.exitCode}` : ''}`,
+        )
+        .join(' ');
+      log(`pod ${name} ${pod.phase}${pod.ip ? ` ip=${pod.ip}` : ''}${detail ? ` [${detail}]` : ''}`);
     }
-    for (const name of [...seen.keys()]) if (!entries.has(name)) seen.delete(name);
+    for (const name of [...seen.keys()]) if (!state.pods.has(name)) seen.delete(name);
   };
 }
 
-function pickRuntime(flags: Args['flags'], log: (line: string) => void): Runtime {
+function pickRuntime(flags: Args['flags'], log: (line: string) => void): RuntimeFactory {
   const which = flags['runtime'] ?? 'containerd';
-  if (which === 'dummy') return dummy({ log });
+  if (which === 'memory') return memory({ log });
   if (which === 'containerd') {
     return containerd({
       namespace: typeof flags['namespace'] === 'string' ? flags['namespace'] : undefined,
       address: typeof flags['address'] === 'string' ? flags['address'] : undefined,
     });
   }
-  throw new Error(`fiber-servo: unknown --runtime "${String(which)}"; use containerd or dummy`);
+  throw new Error(`fiber-servo: unknown --runtime "${String(which)}"; use containerd or memory`);
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
@@ -121,7 +125,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     for (const error of result.errors) console.error(`!! ${error}`);
     console.log(
       result.ok
-        ? `Applied (${result.ops.length} ops); readiness may still be pending.`
+        ? `Applied (${result.ops.length} actions); readiness may still be pending.`
         : 'Apply failed; runtime changes are not rolled back.',
     );
     return result.ok ? 0 : 1;
@@ -131,10 +135,28 @@ export async function main(argv: readonly string[]): Promise<number> {
   const stamp = (line: string) => console.log(`[${new Date().toISOString()}] ${line}`);
 
   if (command === 'plan') {
+    // Planning runs the whole control plane against the in-memory runtime, which
+    // always succeeds. That is what makes gated subtrees appear: <Ready on="db">
+    // only declares its children once the db Pod is observed running, and here
+    // it is observed running because the memory runtime says so. Nothing
+    // touches containerd.
+    const actions: string[] = [];
     const served = serve(await loadElement(canonicalFile), {
-      runtime: dummy({ log: (l) => console.log(l) }),
+      runtime: memory(),
+      onActions: (batch) => {
+        for (const action of batch) actions.push(formatAction(action));
+      },
     });
-    await served.root.settle();
+    // React commits and control-loop passes feed each other, so quiescence is
+    // "two rounds in a row produced no new action".
+    let quiet = 0;
+    for (let i = 0; i < 50 && quiet < 2; i++) {
+      const before = actions.length;
+      await served.root.settle();
+      await served.idle();
+      quiet = actions.length === before ? quiet + 1 : 0;
+    }
+    for (const line of actions) console.log(line);
     return 0;
   }
 
@@ -143,10 +165,9 @@ export async function main(argv: readonly string[]): Promise<number> {
       {
         runtime: pickRuntime(flags, quiet ? () => {} : stamp),
         log: quiet ? () => {} : stamp,
+        // No `onActions` here: `serve` already logs each action through `log`,
+        // and printing from both channels doubles every line.
         onError: (e) => stamp(`!! ${e.message}`),
-        onOps: (ops) => {
-          for (const op of ops) stamp(`op ${formatOp(op)}`);
-        },
       },
       () => loadElement(canonicalFile),
     );
@@ -161,8 +182,8 @@ export async function main(argv: readonly string[]): Promise<number> {
         `Cannot start session at ${sessionAddress(canonicalFile)}: ${String(e)}. Another up may own it. On Unix, remove a stale socket only after confirming its owner has exited.`,
       );
     }
-    const printStatus = statusPrinter(stamp);
-    if (!quiet) served.status.subscribe(() => printStatus(served.status.entries()));
+    const printPods = podPrinter(stamp);
+    if (!quiet) served.observed.subscribe(() => printPods(served.observed.snapshot()));
 
     let unwatch = () => {};
     let exitCode = 0;
