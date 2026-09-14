@@ -1,65 +1,78 @@
 /**
- * The bridge from the status store into the tree.
+ * The read path from observed state into the tree.
  *
- * `useContainerStatus` is a plain `useSyncExternalStore` read. `useSelfHeal`
- * turns observed deaths into a desired restart generation, which is the only
- * thing the tree can say about status: "I want attempt n of this container".
- * `useReady` suspends until a dependency has come up.
+ * These hooks let a component *read* what is actually running, so the desired
+ * state it declares can depend on it — "don't declare the web Pod until the
+ * database answers its probe". Reading is the whole of the contract.
+ *
+ * What used to live here and deliberately does not any more: `useSelfHeal`.
+ * It watched for a container dying and answered by incrementing a restart
+ * generation, which travelled down as a prop purely so that React would see a
+ * changed value and emit a commit. That made a runtime failure look like a
+ * change of intent. Replacing a dead Pod is now what the ReplicaSet controller
+ * and the planner do, from observed state, without troubling React at all —
+ * which is why a Pod dying no longer produces a single React render.
  */
-import { createContext, use, useContext, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
-import { type ContainerStatus, type StatusStore, createStatusStore } from './status.js';
+import { createContext, use, useContext, useSyncExternalStore } from 'react';
+import { createObservedStore, isPodReady } from './observed.js';
+import type { ObservedPod, ObservedStore } from './runtime/types.js';
 
-export const StatusContext = createContext<StatusStore>(createStatusStore());
+/** The observed state the enclosing root reads from. */
+export const ObservedContext = createContext<ObservedStore>(createObservedStore());
 
-/** Name of the enclosing <Network>, or undefined at the top level. */
-export const NetworkContext = createContext<string | undefined>(undefined);
-
-export function useStatusStore(): StatusStore {
-  return useContext(StatusContext);
+export function useObserved(): ObservedStore {
+  return useContext(ObservedContext);
 }
 
-export function useNetwork(): string | undefined {
-  return useContext(NetworkContext);
+/** The current observation of one Pod, or undefined when the runtime has never reported it. */
+export function usePod(name: string): ObservedPod | undefined {
+  const store = useObserved();
+  return useSyncExternalStore(store.subscribe, () => store.getPod(name));
 }
 
 // ---- dependency ordering ---------------------------------------------------
 
 /**
- * What a dependent waits for. `running` is the runtime's process start;
- * `ready` additionally needs the container's readiness probe to have passed.
+ * What a dependent waits for. `running` is the runtime having started the
+ * Pod's containers; `ready` additionally needs every readiness probe to have
+ * passed.
  */
 export type ReadyCondition = 'running' | 'ready';
 
-export function isReady(status: ContainerStatus, until: ReadyCondition): boolean {
-  return status.state === 'running' && (until === 'running' || status.ready === true);
+export function podSatisfies(pod: ObservedPod | undefined, until: ReadyCondition): boolean {
+  if (pod === undefined) return false;
+  return until === 'running' ? pod.phase === 'running' : isPodReady(pod);
 }
 
 interface ReadyThenable {
   status: 'pending' | 'fulfilled';
-  value?: ContainerStatus;
-  then(onFulfilled: (value: ContainerStatus) => void, onRejected?: (reason: unknown) => void): void;
+  value?: ObservedPod;
+  then(onFulfilled: (value: ObservedPod) => void, onRejected?: (reason: unknown) => void): void;
 }
 
-const readyCache = new WeakMap<StatusStore, Map<string, ReadyThenable>>();
+const readyCache = new WeakMap<ObservedStore, Map<string, ReadyThenable>>();
 
 /**
- * A thenable that settles the first time `id` satisfies `until`, and stays
- * settled: dependency ordering is about startup, not liveness. React's
- * `use` reads `status` synchronously, so a container that is already up
- * never suspends.
+ * A thenable that settles the first time `name` satisfies `until`, and stays
+ * settled. Dependency ordering is about startup, not liveness: once the
+ * database has come up, the web Pod's desired state does not stop being
+ * desired because the database later restarts — the planner will bring the
+ * database back, and unmounting its dependents in the meantime would turn a
+ * blip into an outage. React's `use` reads `status` synchronously, so a Pod
+ * that is already up never suspends.
  */
 export function readyThenable(
-  store: StatusStore,
-  id: string,
+  store: ObservedStore,
+  name: string,
   until: ReadyCondition = 'running',
 ): ReadyThenable {
   let perStore = readyCache.get(store);
   if (!perStore) readyCache.set(store, (perStore = new Map()));
-  const key = `${until}:${id}`;
+  const key = `${until}:${name}`;
   const cached = perStore.get(key);
   if (cached) return cached;
 
-  const listeners: ((value: ContainerStatus) => void)[] = [];
+  const listeners: ((value: ObservedPod) => void)[] = [];
   const thenable: ReadyThenable = {
     status: 'pending',
     then(onFulfilled) {
@@ -67,19 +80,19 @@ export function readyThenable(
       else listeners.push(onFulfilled);
     },
   };
-  const settle = (status: ContainerStatus): void => {
+  const settle = (pod: ObservedPod): void => {
     thenable.status = 'fulfilled';
-    thenable.value = status;
-    for (const l of listeners.splice(0)) l(status);
+    thenable.value = pod;
+    for (const l of listeners.splice(0)) l(pod);
   };
-  const now = store.get(id);
-  if (isReady(now, until)) settle(now);
+  const now = store.getPod(name);
+  if (podSatisfies(now, until)) settle(now!);
   else {
     const off = store.subscribe(() => {
-      const s = store.get(id);
-      if (!isReady(s, until)) return;
+      const pod = store.getPod(name);
+      if (!podSatisfies(pod, until)) return;
       off();
-      settle(s);
+      settle(pod!);
     });
   }
   perStore.set(key, thenable);
@@ -87,115 +100,13 @@ export function readyThenable(
 }
 
 /**
- * Suspend until every listed container satisfies `until` once.
+ * Suspend until every listed Pod satisfies `until` once.
  * Needs a <Suspense> boundary above; <Ready> provides one.
  */
-export function useReady(ids: string | readonly string[], until: ReadyCondition = 'running'): void {
-  const store = useStatusStore();
-  for (const id of typeof ids === 'string' ? [ids] : ids) {
+export function useReady(names: string | readonly string[], until: ReadyCondition = 'running'): void {
+  const store = useObserved();
+  for (const name of typeof names === 'string' ? [names] : names) {
     // React's Usable type wants a Promise shape; a status-tracked thenable is what `use` actually reads.
-    use(readyThenable(store, id, until) as unknown as Promise<ContainerStatus>);
+    use(readyThenable(store, name, until) as unknown as Promise<ObservedPod>);
   }
-}
-
-export function useContainerStatus(id: string): ContainerStatus {
-  const store = useStatusStore();
-  return useSyncExternalStore(store.subscribe, () => store.get(id));
-}
-
-// ---- self-healing ----------------------------------------------------------
-
-export interface RestartPolicy {
-  /** Delay before the first restart. Default 1000. */
-  baseDelayMs?: number;
-  /** Multiplier applied per consecutive restart. Default 2. */
-  factor?: number;
-  /** Upper bound for the delay. Default 300000 (5 min). */
-  maxDelayMs?: number;
-  /** Give up after this many consecutive restarts. Default: unlimited. */
-  maxRestarts?: number;
-  /** Running this long resets the consecutive counter (and the backoff). Default 600000 (10 min). */
-  resetAfterMs?: number;
-}
-
-export type RestartMode = 'always' | 'never' | RestartPolicy;
-
-interface ResolvedPolicy {
-  baseDelayMs: number;
-  factor: number;
-  maxDelayMs: number;
-  maxRestarts: number;
-  resetAfterMs: number;
-}
-
-export const DEFAULT_RESTART_POLICY: Readonly<ResolvedPolicy> = Object.freeze({
-  baseDelayMs: 1_000,
-  factor: 2,
-  maxDelayMs: 300_000,
-  maxRestarts: Number.POSITIVE_INFINITY,
-  resetAfterMs: 600_000,
-});
-
-export function backoffDelay(consecutiveRestarts: number, policy: ResolvedPolicy): number {
-  return Math.min(policy.baseDelayMs * policy.factor ** consecutiveRestarts, policy.maxDelayMs);
-}
-
-interface HealState {
-  /** Desired restart generation; becomes the `restarts` host prop. */
-  generation: number;
-  /** Restarts issued since the container last ran long enough to reset. */
-  consecutive: number;
-  /** `seq` of the death event the latest restart answered. */
-  handledSeq: number;
-}
-
-const INITIAL: HealState = { generation: 0, consecutive: 0, handledSeq: 0 };
-
-/**
- * Returns the restart generation for `id`. It advances once per death event,
- * after the policy's backoff, and never twice for the same event: a death
- * that is already being answered waits for the runtime to report back.
- */
-export function useSelfHeal(id: string, mode: RestartMode = 'always'): number {
-  const status = useContainerStatus(id);
-  const [state, setState] = useState<HealState>(INITIAL);
-
-  const raw = mode === 'always' ? {} : mode === 'never' ? null : mode;
-  const policy = useMemo<ResolvedPolicy | null>(
-    () => (raw === null ? null : { ...DEFAULT_RESTART_POLICY, ...stripUndefined(raw) }),
-    // Rebuild only when a field changes, not when the caller passes a new literal.
-    [raw?.baseDelayMs, raw?.factor, raw?.maxDelayMs, raw?.maxRestarts, raw?.resetAfterMs, raw === null],
-  );
-
-  // Death -> (backoff) -> next generation.
-  useEffect(() => {
-    if (policy === null || status.state !== 'dead' || status.seq === state.handledSeq) return;
-    if (state.consecutive >= policy.maxRestarts) return;
-    const delay = backoffDelay(state.consecutive, policy);
-    const timer = setTimeout(() => {
-      setState((s) => ({
-        generation: s.generation + 1,
-        consecutive: s.consecutive + 1,
-        handledSeq: status.seq,
-      }));
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [policy, status, state.consecutive, state.handledSeq]);
-
-  // Running for long enough -> forget the crash history. A readiness mark
-  // amends the snapshot without restarting the clock.
-  const runningSince = status.state === 'running' ? status.at : -1;
-  useEffect(() => {
-    if (policy === null || runningSince < 0 || state.consecutive === 0) return;
-    const timer = setTimeout(() => setState((s) => ({ ...s, consecutive: 0 })), policy.resetAfterMs);
-    return () => clearTimeout(timer);
-  }, [policy, runningSince, state.consecutive]);
-
-  return state.generation;
-}
-
-function stripUndefined<T extends object>(obj: T): Partial<T> {
-  const out: Partial<T> = {};
-  for (const [k, v] of Object.entries(obj)) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
-  return out;
 }

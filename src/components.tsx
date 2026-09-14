@@ -1,170 +1,175 @@
 /**
- * User-facing components. Everything here is a plain function component that
- * eventually renders one of the two host elements, `container` or `network`.
- * Composition (Deployment, Service, your own <WebApp/>) is just functions
- * returning elements.
+ * The user-facing API: six components, each a thin wrapper over one host
+ * element, plus `<Ready>` for ordering.
  *
- * The tree shape carries meaning:
- *   - inside a <Network>: membership
- *   - inside a <Container>: dependency; children mount once the container is up
+ * They are thin on purpose. A component here decides nothing about the
+ * runtime — it declares a resource and stops. The interesting behaviour
+ * (how many Pods there should be, which of them are up, what to do about the
+ * difference) lives in the controllers, where it can see observed state.
+ *
+ * Two shapes to learn, and they are the whole mental model:
+ *
+ *   nesting is ownership     <ReplicaSet> owns a <Pod> template,
+ *                            a <Pod> owns its <Container>s
+ *
+ *   props are references     a Pod joins a Network by name,
+ *                            a Service selects Pods by label
+ *
+ * So this is right:
+ *
+ *   <Network name="backend" />
+ *   <ReplicaSet name="api" replicas={3}>
+ *     <Pod network="backend" labels={{ app: 'api' }}>
+ *       <Container name="app" image="api:v1" />
+ *     </Pod>
+ *   </ReplicaSet>
+ *
+ * and wrapping the ReplicaSet in the <Network> would not be, because a Network
+ * does not own the Pods that attach to it.
  */
-import {
-  Children,
-  Fragment,
-  Suspense,
-  cloneElement,
-  createElement,
-  isValidElement,
-  type ReactElement,
-  type ReactNode,
-} from 'react';
-import type { ContainerHostProps, NetworkHostProps } from './hostConfig.js';
-import {
-  NetworkContext,
-  type ReadyCondition,
-  type RestartMode,
-  useNetwork,
-  useReady,
-  useSelfHeal,
-} from './hooks.js';
-import type { ContainerSpec, NetworkSpec } from './ops.js';
-
-export interface ContainerProps extends Omit<ContainerSpec, 'name'> {
-  /**
-   * Runtime identity. Required when used directly; a parent such as
-   * <Deployment> fills it in for replicas.
-   */
-  name?: string;
-  /**
-   * What to do when the status store reports the container dead.
-   * `'always'` (default) restarts with exponential backoff, `'never'` leaves
-   * it, an object tunes the backoff. See `RestartPolicy`.
-   */
-  restart?: RestartMode;
-  /**
-   * Dependents. They mount only once this container is running, or ready
-   * when it has a `readiness` probe, and unmount before it.
-   */
-  children?: ReactNode;
-}
+import { Suspense, createElement, type ReactElement, type ReactNode } from 'react';
+import type {
+  ContainerSpec,
+  DeploymentSpec,
+  NetworkSpec,
+  PodTemplate,
+  PortMapping,
+  ReplicaSetSpec,
+  ServiceSpec,
+} from './resources.js';
+import { useReady, type ReadyCondition } from './hooks.js';
 
 /** The host elements. Typed here once so callers never touch string types. */
-function container(props: ContainerHostProps): ReactElement {
-  return createElement('container' as never, props);
-}
-function network(props: NetworkHostProps): ReactElement {
-  return createElement('network' as never, props);
+function host<P extends object>(type: string, props: P): ReactElement {
+  return createElement(type as never, props);
 }
 
-export function Container(props: ContainerProps): ReactElement {
-  const { name, restart = 'always', children, ...rest } = props;
-  const enclosing = useNetwork();
-  if (name === undefined) {
-    throw new Error(
-      'fiber-servo: <Container> needs a "name", or a parent that assigns one (e.g. <Deployment>)',
-    );
-  }
-  const spec = { name, ...rest, network: rest.network ?? enclosing };
-  const host = container({ ...spec, restarts: useSelfHeal(name, restart) });
-  if (children === undefined || children === null || children === false) return host;
-  // Dependents come first in tree order so React deletes them before the
-  // container on unmount; on mount the gate holds them back anyway.
-  return createElement(
-    Fragment,
-    null,
-    createElement(Ready, { on: name, until: spec.readiness ? 'ready' : 'running' }, children),
-    host,
-  );
-}
-
-export interface ServiceOptions {
-  /** Port the service listens on inside the network. */
-  port: number;
-  /** Port on the targets. Default: `port`. */
-  targetPort?: number;
-  /** Host port to bind, if the service should be reachable from outside. */
-  publish?: number;
-  /** Service name. Default: the deployment's name. */
-  name?: string;
-  /** Which template's replicas to target when the deployment has named templates. */
-  target?: string;
-}
-
-export interface DeploymentProps {
-  name: string;
-  replicas?: number;
-  /** One or more <Container> templates; each is stamped out `replicas` times. */
-  children: ReactNode;
-  /** Also render a <Service> in front of the replicas. */
-  service?: ServiceOptions;
-}
-
-/**
- * Expands its container templates into `replicas` keyed copies named
- * `${name}-${index}` (or `${name}-${childName}-${index}` for named templates).
- *
- * Keys are the replica index, so scaling 3 -> 5 leaves 0..2 untouched and
- * only mounts 3 and 4; the reconciler emits exactly two CREATE ops.
- *
- * Dependents nested inside a template are cloned per replica too; give them
- * per-replica names or place them next to the deployment instead.
- */
-export function Deployment({ name, replicas = 1, children, service }: DeploymentProps): ReactElement {
-  if (!Number.isInteger(replicas) || replicas < 0) {
-    throw new Error(`fiber-servo: <Deployment name="${name}"> replicas must be a non-negative integer`);
-  }
-  const templates = Children.toArray(children).filter((c): c is ReactElement<ContainerProps> =>
-    isValidElement<ContainerProps>(c),
-  );
-  const copies: ReactElement[] = [];
-  const targets: string[] = [];
-  for (let i = 0; i < replicas; i++) {
-    for (const template of templates) {
-      const templateName = template.props.name;
-      const base = templateName ? `${name}-${templateName}` : name;
-      const id = `${base}-${i}`;
-      copies.push(cloneElement(template, { key: id, name: id }));
-      if (service && (service.target ?? undefined) === templateName) targets.push(id);
-    }
-  }
-  if (service) {
-    if (targets.length === 0 && replicas > 0) {
-      throw new Error(
-        `fiber-servo: <Deployment name="${name}"> service has no targets; name the template with service.target`,
-      );
-    }
-    copies.push(
-      createElement(Service, {
-        key: `${name}:service`,
-        name: service.name ?? name,
-        port: service.port,
-        targetPort: service.targetPort,
-        publish: service.publish,
-        targets,
-      }),
-    );
-  }
-  return createElement(Fragment, null, ...copies);
-}
+// ---- Network ---------------------------------------------------------------
 
 export interface NetworkProps extends NetworkSpec {
-  children?: ReactNode;
+  /** Networks own nothing. Pods join by `network="name"`. */
+  children?: never;
 }
 
 /**
- * A user-defined network. Containers rendered inside attach to it (unless
- * they name another `network` explicitly) and resolve each other by name.
- * Being a host element, it is created before its containers and deleted
- * after them.
+ * A local bridge network, roughly a Docker user-defined network. Pods on the
+ * same Network reach each other. Everything but the name is fixed once it
+ * exists, so changing the subnet replaces the Network.
  */
-export function Network({ children, ...spec }: NetworkProps): ReactElement {
-  return network({ ...spec, children: createElement(NetworkContext, { value: spec.name }, children) });
+export function Network(props: NetworkProps): ReactElement {
+  const { children: _children, ...spec } = props;
+  return host('network', spec);
 }
 
+// ---- Container -------------------------------------------------------------
+
+export interface ContainerProps extends ContainerSpec {
+  /** Containers own nothing. Ordering between Pods is `<Ready>`. */
+  children?: never;
+}
+
+/**
+ * One process and one root filesystem inside a Pod's sandbox. Only valid as a
+ * child of `<Pod>`: a container has no network or lifecycle of its own, it
+ * borrows the sandbox's.
+ *
+ * Everything here except `resources` is immutable — change an image or a
+ * command and the container is replaced, not edited.
+ */
+export function Container(props: ContainerProps): ReactElement {
+  const { children: _children, ...spec } = props;
+  return host('container', spec);
+}
+
+// ---- Pod -------------------------------------------------------------------
+
+export interface PodProps extends Omit<PodTemplate, 'containers'> {
+  /**
+   * Runtime identity. Required at the top level; omitted when the Pod is a
+   * `<ReplicaSet>`'s or `<Deployment>`'s template, because those name the
+   * copies they create.
+   */
+  name?: string;
+  /** One or more `<Container>`s. */
+  children: ReactNode;
+}
+
+/**
+ * An execution sandbox: a network namespace and shared volumes, with one or
+ * more containers inside it. The Pod is the unit everything else counts and
+ * routes to — a ReplicaSet keeps N Pods, a Service load-balances across Pods.
+ *
+ * Pod-level props define the sandbox, so all of them are immutable: changing
+ * `network` replaces the Pod rather than moving it.
+ */
+export function Pod({ children, ...spec }: PodProps): ReactElement {
+  return host('pod', { ...spec, children });
+}
+
+// ---- ReplicaSet ------------------------------------------------------------
+
+export interface ReplicaSetProps extends Omit<ReplicaSetSpec, 'template' | 'replicas'> {
+  replicas?: number;
+  /** Exactly one unnamed `<Pod>`: the template to stamp out. */
+  children: ReactNode;
+}
+
+/**
+ * "Keep `replicas` Pods of this template alive."
+ *
+ * This is the component that makes the project's central claim concrete. It
+ * declares a *count*, not identities, so when a Pod dies nothing here changes
+ * and React does not re-render: the ReplicaSet controller compares desired 3
+ * against observed 2 and creates one. The JSX is the same either way.
+ */
+export function ReplicaSet({ children, ...spec }: ReplicaSetProps): ReactElement {
+  return host('replicaset', { ...spec, children });
+}
+
+// ---- Deployment ------------------------------------------------------------
+
+export interface DeploymentProps extends Omit<DeploymentSpec, 'template' | 'replicas'> {
+  replicas?: number;
+  /** Exactly one unnamed `<Pod>`: the template to roll out. */
+  children: ReactNode;
+}
+
+/**
+ * A rollout policy over ReplicaSets. Editing the template does not edit the
+ * running Pods: it names a new generation, and the Deployment controller moves
+ * replicas from the old ReplicaSet to the new one within `strategy`'s bounds.
+ */
+export function Deployment({ children, ...spec }: DeploymentProps): ReactElement {
+  return host('deployment', { ...spec, children });
+}
+
+// ---- Service ---------------------------------------------------------------
+
+export interface ServiceProps extends ServiceSpec {
+  /** Services own nothing; they select Pods by label. */
+  children?: never;
+}
+
+/**
+ * One stable address in front of whichever Pods currently match `selector`.
+ *
+ * Note what is *not* a prop: the list of backends. Pods matching the selector
+ * come and go without the tree changing, so the backend set is resolved from
+ * observed state by the Service controller. This is also the answer to "why
+ * not just publish a host port on the Pod" — three replicas cannot each own
+ * host port 8080, but one Service in front of them can.
+ */
+export function Service(props: ServiceProps): ReactElement {
+  const { children: _children, ...spec } = props;
+  return host('service', spec);
+}
+
+// ---- ordering --------------------------------------------------------------
+
 export interface ReadyProps {
-  /** Container name(s) that must be up before `children` mount. */
+  /** Pod name(s) that must be up before `children` are declared. */
   on: string | readonly string[];
-  /** `running` (default) or `ready` (the container's readiness probe has passed). */
+  /** `running` (default), or `ready` once every readiness probe has passed. */
   until?: ReadyCondition;
   children?: ReactNode;
 }
@@ -175,60 +180,15 @@ function Gate({ on, until = 'running', children }: ReadyProps): ReactNode {
 }
 
 /**
- * Dependency ordering. Nothing inside mounts (no CREATE is emitted) until
- * every container in `on` has satisfied `until` once. Sugar for a
- * <Suspense> boundary around a component that calls `useReady`. Nesting
- * inside <Container> does the same for a single dependency.
+ * Dependency ordering. Nothing inside is declared until every Pod in `on` has
+ * satisfied `until` once — so a migration Pod can wait for its database.
+ *
+ * This is the one place the tree reads observed state, and it reads it to
+ * decide what to *want*, which is legitimate. It latches: a dependency that
+ * later dies does not retract what already depends on it.
  */
 export function Ready({ on, until, children }: ReadyProps): ReactElement {
   return createElement(Suspense, { fallback: null }, createElement(Gate, { on, until }, children));
 }
 
-export const DEFAULT_PROXY_IMAGE = 'docker.io/library/caddy:2-alpine';
-
-export interface ServiceProps {
-  name: string;
-  /** Port the service listens on inside the network. */
-  port: number;
-  /** Port on the targets. Default: `port`. */
-  targetPort?: number;
-  /** Host port to bind, if the service should be reachable from outside. */
-  publish?: number;
-  /** Container names to balance across. */
-  targets: readonly string[];
-  /** Proxy image. Must ship the `caddy` binary. */
-  image?: string;
-  restart?: RestartMode;
-}
-
-/**
- * One name in front of many containers: a caddy reverse proxy that
- * round-robins across `targets`. Built entirely by composition, so scaling
- * the targets is an UPDATE of the proxy's command.
- */
-export function Service({
-  name,
-  port,
-  targetPort = port,
-  publish,
-  targets,
-  image = DEFAULT_PROXY_IMAGE,
-  restart,
-}: ServiceProps): ReactElement | null {
-  if (targets.length === 0) return null;
-  const command = [
-    'caddy',
-    'reverse-proxy',
-    '--from',
-    `:${port}`,
-    ...targets.flatMap((t) => ['--to', `${t}:${targetPort}`]),
-  ];
-  return createElement(Container, {
-    name,
-    image,
-    command,
-    ports: [port],
-    publish: publish === undefined ? undefined : [{ host: publish, container: port }],
-    restart,
-  });
-}
+export type { PortMapping, ReadyCondition };

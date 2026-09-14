@@ -1,76 +1,127 @@
 /**
  * react-reconciler hostConfig for fiber-servo.
  *
- * Two rules are fixed here and everything else is built on top of them:
+ * One rule governs this file:
  *
- *   1. spec = fiber tree. Host instances *are* the desired state. Runtime
- *      status (is the container alive?) lives outside the tree and is read
- *      with useSyncExternalStore.
- *   2. commit executes nothing. Every host method is synchronous and only
- *      appends to `root.pending`. `resetAfterCommit` hands the batch to the
- *      sink; the sink is the only place a side effect may happen.
+ *   **A commit produces a snapshot of what should exist, never a list of
+ *   things to do.**
  *
- * Host elements: `container` and `network`. Nesting gives ordering: a
- * network is created before the containers inside it and deleted after.
+ * So there are no ops here. The host methods do nothing but maintain a tree of
+ * `Instance` nodes — append, insert, remove, re-read props — and
+ * `resetAfterCommit` serialises that whole tree into a `DesiredState` and hands
+ * it to the control plane. React's contribution is deciding *what the tree is*;
+ * deciding what to do about it needs observed state, which React cannot see and
+ * should not.
+ *
+ * That makes this file dramatically less clever than the op-emitting version it
+ * replaces. There is no mount/unmount bookkeeping, no batch normalisation, no
+ * rename handling: a resource that vanished from the tree is simply absent from
+ * the next snapshot, and the reconciler downstream works out that it must go.
+ * Re-serialising the tree on every commit is O(tree) where the old code was
+ * O(changes), which at one machine's worth of containers is a trade worth
+ * making many times over for the clarity.
+ *
+ * Host elements, and what nesting means for each:
+ *
+ *   network      a bridge network            (no children)
+ *   pod          a sandbox                   (children: container)
+ *   container    a process in a sandbox      (no children)
+ *   replicaset   "keep N of this template"   (children: exactly one pod, unnamed)
+ *   deployment   rollout policy over those   (children: exactly one pod, unnamed)
+ *   service      a stable endpoint           (no children)
+ *
+ * Nesting is ownership and nothing else. A Pod's *network* is a `network="..."`
+ * reference, never an ancestor, because a Network does not own the Pods on it.
  */
 import type { HostConfig } from 'react-reconciler';
 import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants.js';
-import {
-  SPEC_KEYS,
-  diffSpec,
-  normalizeBatch,
-  type ContainerSpec,
-  type InstanceKind,
-  type NetworkSpec,
-  type Op,
-  type OpSink,
-  type Specs,
-} from './ops.js';
+import type {
+  ContainerSpec,
+  DeploymentSpec,
+  DesiredState,
+  NetworkSpec,
+  PodSpec,
+  PodTemplate,
+  PortMapping,
+  ReplicaSetSpec,
+  Resource,
+  ResourceLimits,
+  RolloutStrategy,
+  ServiceSpec,
+} from './resources.js';
 
-export type HostType = InstanceKind;
+export type HostKind = 'network' | 'pod' | 'container' | 'replicaset' | 'deployment' | 'service';
 
-/** Props accepted by the `container` host element. */
-export interface ContainerHostProps extends ContainerSpec {
-  /**
-   * Desired restart generation. Not part of the spec sent with CREATE; each
-   * increment after mount becomes one START op. Written by <Container>'s
-   * self-healing logic from what it reads in the status store.
-   */
-  restarts?: number;
-  children?: unknown;
-}
+const HOST_KINDS: readonly HostKind[] = [
+  'network',
+  'pod',
+  'container',
+  'replicaset',
+  'deployment',
+  'service',
+];
+
+// ---- props the host elements accept ----------------------------------------
 
 export interface NetworkHostProps extends NetworkSpec {
   children?: unknown;
 }
 
-export type HostProps = { container: ContainerHostProps; network: NetworkHostProps };
+/** `name` is absent when the Pod is a ReplicaSet's or Deployment's template. */
+export interface PodHostProps {
+  name?: string;
+  network?: string;
+  labels?: Readonly<Record<string, string>>;
+  publish?: readonly PortMapping[];
+  children?: unknown;
+}
 
-export type Instance = {
-  [K in InstanceKind]: {
-    kind: K;
-    /** Identity as seen by the runtime. Equal to `spec.name`. */
-    id: string;
-    spec: Specs[K];
-    /** Last restart generation turned into an op (containers only). */
-    restarts: number;
-    children: Instance[];
-    root: RootContainer;
-    /** True between the CREATE and DELETE ops for this instance. */
-    created: boolean;
-  };
-}[InstanceKind];
+export interface ContainerHostProps extends ContainerSpec {
+  children?: unknown;
+}
+
+export interface ReplicaSetHostProps {
+  name: string;
+  replicas?: number;
+  children?: unknown;
+}
+
+export interface DeploymentHostProps {
+  name: string;
+  replicas?: number;
+  strategy?: RolloutStrategy;
+  children?: unknown;
+}
+
+export interface ServiceHostProps extends ServiceSpec {
+  children?: unknown;
+}
+
+export type HostProps = {
+  network: NetworkHostProps;
+  pod: PodHostProps;
+  container: ContainerHostProps;
+  replicaset: ReplicaSetHostProps;
+  deployment: DeploymentHostProps;
+  service: ServiceHostProps;
+};
+
+export type AnyHostProps = HostProps[HostKind];
+
+/** A node of the tree React maintains for us. Deliberately dumb: props and children. */
+export interface Instance {
+  kind: HostKind;
+  props: Record<string, unknown>;
+  children: Instance[];
+}
 
 export interface RootContainer {
   kind: 'root';
   children: Instance[];
-  /** Ops of the commit in flight. Flushed to `sink` in `resetAfterCommit`. */
-  pending: Op[];
-  /** Instances that currently have an outstanding CREATE, keyed by `kind:id`. */
-  live: Map<string, Instance>;
-  /** Number of commits so far, including ones that produced no ops. */
+  /** Number of commits so far, including ones whose snapshot was unchanged. */
   commits: number;
-  sink: OpSink;
+  /** Receives the snapshot after every commit. */
+  onCommit: (desired: DesiredState) => void;
 }
 
 type HostContext = Record<never, never>;
@@ -80,75 +131,187 @@ export interface TimeoutHandle {
   cancelled: boolean;
 }
 
-export function createRootContainer(sink: OpSink): RootContainer {
-  return { kind: 'root', children: [], pending: [], live: new Map(), commits: 0, sink };
+export function createRootContainer(onCommit: (desired: DesiredState) => void): RootContainer {
+  return { kind: 'root', children: [], commits: 0, onCommit };
 }
 
-export const liveKey = (kind: InstanceKind, id: string): string => `${kind}:${id}`;
+// ---- tree -> DesiredState ---------------------------------------------------
 
-function isKind(type: string): type is InstanceKind {
-  return type in SPEC_KEYS;
+function fail(message: string): never {
+  throw new Error(`fiber-servo: ${message}`);
 }
 
-function propsToSpec<K extends InstanceKind>(kind: K, props: HostProps[K]): Specs[K] {
-  const p = props as unknown as Record<string, unknown>;
-  if (typeof p['name'] !== 'string' || p['name'].length === 0) {
-    throw new Error(`fiber-servo: <${kind}> requires a non-empty string "name"`);
+function requireName(kind: HostKind, props: Record<string, unknown>): string {
+  const name = props['name'];
+  if (typeof name !== 'string' || name.length === 0) {
+    fail(`<${kind}> requires a non-empty string "name"`);
   }
-  if (kind === 'container' && (typeof p['image'] !== 'string' || p['image'].length === 0)) {
-    throw new Error(`fiber-servo: <container name="${p['name']}"> requires a non-empty string "image"`);
+  return name;
+}
+
+/** Copies the listed props that were actually provided. Keeps `undefined` out of specs. */
+function pick<T extends object>(props: Record<string, unknown>, keys: readonly string[]): T {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) if (props[key] !== undefined) out[key] = props[key];
+  return out as T;
+}
+
+function toContainer(instance: Instance): ContainerSpec {
+  const name = requireName('container', instance.props);
+  const image = instance.props['image'];
+  if (typeof image !== 'string' || image.length === 0) {
+    fail(`<container name="${name}"> requires a non-empty string "image"`);
   }
-  const spec: Record<string, unknown> = {};
-  for (const key of SPEC_KEYS[kind] as readonly string[]) {
-    if (p[key] !== undefined) spec[key] = p[key];
+  if (instance.children.length > 0) {
+    fail(`<container name="${name}"> takes no host children; a container has no sub-resources`);
   }
-  return spec as unknown as Specs[K];
+  return {
+    ...pick<Omit<ContainerSpec, 'name' | 'image'>>(instance.props, [
+      'command',
+      'env',
+      'ports',
+      'resources',
+      'readiness',
+    ]),
+    name,
+    image,
+  };
 }
 
-function push(root: RootContainer, op: Op): void {
-  root.pending.push(op);
-}
-
-function createOp(instance: Instance): Op {
-  return instance.kind === 'container'
-    ? { type: 'CREATE', kind: 'container', id: instance.id, spec: instance.spec }
-    : { type: 'CREATE', kind: 'network', id: instance.id, spec: instance.spec };
-}
-
-function deleteOp<K extends InstanceKind>(kind: K, id: string, spec: Specs[K]): Op {
-  return kind === 'container'
-    ? { type: 'DELETE', kind: 'container', id, spec: spec as ContainerSpec }
-    : { type: 'DELETE', kind: 'network', id, spec: spec as NetworkSpec };
-}
-
-/** Emit CREATE for every not-yet-created instance in the subtree, parents first. */
-function mountSubtree(instance: Instance): void {
-  const root = instance.root;
-  if (!instance.created) {
-    const key = liveKey(instance.kind, instance.id);
-    if (root.live.has(key)) {
-      throw new Error(`fiber-servo: duplicate ${instance.kind} name "${instance.id}"`);
+/** The sandbox half of a Pod: everything except its identity. */
+function toPodTemplate(instance: Instance, owner: string): PodTemplate {
+  const containers = instance.children.map((child) => {
+    if (child.kind !== 'container') {
+      fail(`<pod> in ${owner} may only contain <container>, got <${child.kind}>`);
     }
-    instance.created = true;
-    root.live.set(key, instance);
-    push(root, createOp(instance));
+    return toContainer(child);
+  });
+  if (containers.length === 0) fail(`<pod> in ${owner} needs at least one <container>`);
+  const seen = new Set<string>();
+  for (const c of containers) {
+    if (seen.has(c.name)) fail(`<pod> in ${owner} has two containers named "${c.name}"`);
+    seen.add(c.name);
   }
-  for (const child of instance.children) mountSubtree(child);
+  return {
+    ...pick<Omit<PodTemplate, 'containers'>>(instance.props, ['network', 'labels', 'publish']),
+    containers,
+  };
+}
+
+function toPod(instance: Instance): PodSpec {
+  const name = requireName('pod', instance.props);
+  return { ...toPodTemplate(instance, `<pod name="${name}">`), name };
+}
+
+/** A ReplicaSet or Deployment owns exactly one unnamed `<pod>`: its template. */
+function templateOf(instance: Instance, owner: string): PodTemplate {
+  const pods = instance.children.filter((c) => c.kind === 'pod');
+  if (instance.children.length !== pods.length) {
+    fail(`${owner} may only contain a single <pod> template`);
+  }
+  const [pod, ...rest] = pods;
+  if (pod === undefined) fail(`${owner} needs a <pod> template describing what to replicate`);
+  if (rest.length > 0) {
+    fail(`${owner} has ${pods.length} <pod> templates; it replicates exactly one`);
+  }
+  if (pod.props['name'] !== undefined) {
+    fail(
+      `${owner} has a <pod name="${String(pod.props['name'])}"> template: a replicated pod is named by its ` +
+        'controller, so the template must not carry a name',
+    );
+  }
+  return toPodTemplate(pod, owner);
+}
+
+function replicasOf(props: Record<string, unknown>, owner: string): number {
+  const replicas = props['replicas'] ?? 1;
+  if (typeof replicas !== 'number' || !Number.isInteger(replicas) || replicas < 0) {
+    fail(`${owner} replicas must be a non-negative integer`);
+  }
+  return replicas;
+}
+
+function toResource(instance: Instance): Resource {
+  switch (instance.kind) {
+    case 'network': {
+      const name = requireName('network', instance.props);
+      const spec: NetworkSpec = { ...pick<Omit<NetworkSpec, 'name'>>(instance.props, ['subnet', 'labels']), name };
+      return { kind: 'network', name, spec };
+    }
+    case 'pod': {
+      const spec = toPod(instance);
+      return { kind: 'pod', name: spec.name, spec };
+    }
+    case 'replicaset': {
+      const name = requireName('replicaset', instance.props);
+      const owner = `<replicaset name="${name}">`;
+      const spec: ReplicaSetSpec = {
+        name,
+        replicas: replicasOf(instance.props, owner),
+        template: templateOf(instance, owner),
+      };
+      return { kind: 'replicaset', name, spec };
+    }
+    case 'deployment': {
+      const name = requireName('deployment', instance.props);
+      const owner = `<deployment name="${name}">`;
+      const spec: DeploymentSpec = {
+        ...pick<Pick<DeploymentSpec, 'strategy'>>(instance.props, ['strategy']),
+        name,
+        replicas: replicasOf(instance.props, owner),
+        template: templateOf(instance, owner),
+      };
+      return { kind: 'deployment', name, spec };
+    }
+    case 'service': {
+      const name = requireName('service', instance.props);
+      const port = instance.props['port'];
+      const selector = instance.props['selector'];
+      if (typeof port !== 'number') fail(`<service name="${name}"> requires a numeric "port"`);
+      if (typeof selector !== 'object' || selector === null) {
+        fail(`<service name="${name}"> requires a "selector" object matching pod labels`);
+      }
+      const spec: ServiceSpec = {
+        ...pick<Omit<ServiceSpec, 'name' | 'port' | 'selector'>>(instance.props, [
+          'network',
+          'targetPort',
+          'publish',
+        ]),
+        name,
+        port,
+        selector: selector as Readonly<Record<string, string>>,
+      };
+      return { kind: 'service', name, spec };
+    }
+    case 'container':
+      return fail('<container> must be inside a <pod>');
+  }
 }
 
 /**
- * Emit DELETE for the whole subtree: children in tree order, then the parent.
- * Tree order matters because <Container> renders its dependents ahead of
- * itself, so a later-inserted dependent still goes before what it depends on.
+ * Serialise the tree, parents before children, into the set of resources that
+ * should exist. Containers do not appear at this level: they are part of the
+ * Pod that owns them, which is what the Pod being a lifecycle boundary means.
  */
-function unmountSubtree(instance: Instance): void {
-  for (const child of instance.children) unmountSubtree(child);
-  if (instance.created) {
-    instance.created = false;
-    instance.root.live.delete(liveKey(instance.kind, instance.id));
-    push(instance.root, deleteOp(instance.kind, instance.id, instance.spec));
-  }
+export function snapshot(root: RootContainer): DesiredState {
+  const resources: Resource[] = [];
+  const seen = new Set<string>();
+  const walk = (nodes: readonly Instance[]): void => {
+    for (const node of nodes) {
+      const resource = toResource(node);
+      const key = `${resource.kind}:${resource.name}`;
+      if (seen.has(key)) fail(`duplicate ${resource.kind} name "${resource.name}"`);
+      seen.add(key);
+      resources.push(resource);
+      // Pods, ReplicaSets and Deployments have already absorbed their children.
+      if (node.kind === 'network' || node.kind === 'service') walk(node.children);
+    }
+  };
+  walk(root.children);
+  return { resources };
 }
+
+// ---- child-list plumbing ----------------------------------------------------
 
 function detach(list: Instance[], child: Instance): void {
   const i = list.indexOf(child);
@@ -202,25 +365,16 @@ export const hostConfig = {
     return instance;
   },
 
-  // ---- render phase (no ops here) ----------------------------------------
-  createInstance(type: string, props: HostProps[InstanceKind], root: RootContainer): Instance {
-    if (!isKind(type)) {
-      throw new Error(
-        `fiber-servo: unknown host element <${type}>. Only <container> and <network> are supported.`,
-      );
+  // ---- render phase -------------------------------------------------------
+  createInstance(type: string, props: AnyHostProps): Instance {
+    if (!(HOST_KINDS as readonly string[]).includes(type)) {
+      fail(`unknown host element <${type}>. Valid elements are ${HOST_KINDS.join(', ')}.`);
     }
-    const base = { children: [], root, created: false };
-    if (type === 'container') {
-      const p = props as ContainerHostProps;
-      const spec = propsToSpec('container', p);
-      return { kind: 'container', id: spec.name, spec, restarts: p.restarts ?? 0, ...base };
-    }
-    const spec = propsToSpec('network', props as NetworkHostProps);
-    return { kind: 'network', id: spec.name, spec, restarts: 0, ...base };
+    return { kind: type as HostKind, props: props as unknown as Record<string, unknown>, children: [] };
   },
   createTextInstance(text: string): never {
-    throw new Error(
-      `fiber-servo: text is not allowed in the tree (got ${JSON.stringify(text)}). ` +
+    return fail(
+      `text is not allowed in the tree (got ${JSON.stringify(text)}). ` +
         'Wrap runtime status in a component instead.',
     );
   },
@@ -234,89 +388,44 @@ export const hostConfig = {
     return false;
   },
 
-  // ---- commit phase (ops only, never execution) --------------------------
+  // ---- commit phase -------------------------------------------------------
   prepareForCommit(): null {
     return null;
   },
+  /**
+   * The only place this renderer talks to the outside world, and it says one
+   * thing: "here is everything that should exist". Every commit publishes,
+   * even when the snapshot is identical to the last, because deciding that
+   * nothing changed needs a comparison against observed state — and that is
+   * the control loop's job, not React's.
+   */
   resetAfterCommit(root: RootContainer): void {
     root.commits += 1;
-    const batch = normalizeBatch(root.pending);
-    root.pending = [];
-    if (batch.length === 0) return;
-    root.sink(batch);
+    root.onCommit(snapshot(root));
   },
   clearContainer(root: RootContainer): void {
-    for (const child of root.children) unmountSubtree(child);
     root.children = [];
   },
   appendChild(parent: Instance, child: Instance): void {
     insertAt(parent.children, child);
-    mountSubtree(child);
   },
   appendChildToContainer(root: RootContainer, child: Instance): void {
     insertAt(root.children, child);
-    mountSubtree(child);
   },
   insertBefore(parent: Instance, child: Instance, before: Instance): void {
     insertAt(parent.children, child, before);
-    mountSubtree(child);
   },
   insertInContainerBefore(root: RootContainer, child: Instance, before: Instance): void {
     insertAt(root.children, child, before);
-    mountSubtree(child);
   },
   removeChild(parent: Instance, child: Instance): void {
     detach(parent.children, child);
-    unmountSubtree(child);
   },
   removeChildFromContainer(root: RootContainer, child: Instance): void {
     detach(root.children, child);
-    unmountSubtree(child);
   },
-  commitUpdate(
-    instance: Instance,
-    _type: string,
-    _prevProps: HostProps[InstanceKind],
-    nextProps: HostProps[InstanceKind],
-  ): void {
-    if (instance.kind === 'network') {
-      const prev = instance.spec;
-      const next = propsToSpec('network', nextProps as NetworkHostProps);
-      const changed = diffSpec('network', prev, next);
-      if (changed.length === 0) return;
-      instance.spec = next;
-      if (next.name !== prev.name) return rename(instance, prev);
-      if (instance.created)
-        push(instance.root, { type: 'UPDATE', kind: 'network', id: instance.id, prev, next, changed });
-      return;
-    }
-
-    const props = nextProps as ContainerHostProps;
-    const prev = instance.spec;
-    const next = propsToSpec('container', props);
-    const changed = diffSpec('container', prev, next);
-    const restarts = props.restarts ?? 0;
-
-    if (changed.length > 0) {
-      instance.spec = next;
-      if (next.name !== prev.name) {
-        // A fresh container starts at the current generation; no START needed.
-        instance.restarts = restarts;
-        return rename(instance, prev);
-      }
-      if (instance.created) {
-        push(instance.root, { type: 'UPDATE', kind: 'container', id: instance.id, prev, next, changed });
-      }
-    }
-
-    if (restarts !== instance.restarts) {
-      instance.restarts = restarts;
-      // A subtree that was never placed cannot be started; the CREATE that
-      // eventually places it starts the container anyway.
-      if (instance.created) {
-        push(instance.root, { type: 'START', kind: 'container', id: instance.id, attempt: restarts });
-      }
-    }
+  commitUpdate(instance: Instance, _type: string, _prevProps: AnyHostProps, nextProps: AnyHostProps): void {
+    instance.props = nextProps as unknown as Record<string, unknown>;
   },
   commitTextUpdate(): void {
     /* unreachable: createTextInstance throws */
@@ -324,9 +433,9 @@ export const hostConfig = {
   commitMount(): void {},
   resetTextContent(): void {},
   hideInstance(): void {
-    // Called when an already-mounted subtree re-suspends. useReady latches,
-    // so this only happens for user-thrown promises; a hidden container
-    // keeps running. Stopping dependents is a policy for conditional render.
+    // A re-suspended subtree keeps its resources: `useReady` latches, so this
+    // only happens for user-thrown promises, and stopping a Pod because a
+    // sibling suspended would be a surprising policy to impose.
   },
   unhideInstance(): void {},
   hideTextInstance(): void {},
@@ -343,11 +452,10 @@ export const hostConfig = {
 
   // ---- scheduling ---------------------------------------------------------
   /**
-   * React's only use of this in concurrent mode is to throttle the commit
-   * that replaces a Suspense fallback (about 300ms after the fallback was
-   * shown, to avoid flashing). There is no UI to flash: a container gated by
-   * <Ready> should be created the moment its dependency is up. So "later"
-   * means the next microtask, still cancellable.
+   * React's only use of this in concurrent mode is to throttle the commit that
+   * replaces a Suspense fallback (about 300ms, to avoid flashing UI). There is
+   * no UI to flash: a Pod gated by <Ready> should be declared the moment its
+   * dependency is up. So "later" means the next microtask, still cancellable.
    */
   scheduleTimeout(fn: () => void, _ms: number): TimeoutHandle {
     const handle: TimeoutHandle = { cancelled: false };
@@ -368,11 +476,11 @@ export const hostConfig = {
     currentUpdatePriority = priority;
   },
   resolveUpdatePriority(): number {
-    // Every update outside an explicit priority is discrete, i.e. SyncLane.
-    // A container spec has no "less urgent" changes, and sync lanes mean a
-    // store event re-renders and commits in the next microtask (or on
-    // `root.flush()`), with no Scheduler involvement. Suspense retries are
-    // the exception: React picks a retry lane and goes through the Scheduler.
+    // Every update outside an explicit priority is discrete, i.e. SyncLane. A
+    // desired-state change has no "less urgent" variety, and sync lanes mean an
+    // observed-state event re-renders and commits on the next microtask with no
+    // Scheduler involvement. Suspense retries are the exception: React picks a
+    // retry lane and goes through the Scheduler.
     return currentUpdatePriority !== NoEventPriority ? currentUpdatePriority : DiscreteEventPriority;
   },
   shouldAttemptEagerTransition(): boolean {
@@ -387,7 +495,7 @@ export const hostConfig = {
   },
   requestPostPaintCallback(): void {},
 
-  // ---- suspending commits (unused) -----------------------------------------
+  // ---- suspending commits (unused) ----------------------------------------
   maySuspendCommit(): boolean {
     return false;
   },
@@ -420,27 +528,12 @@ export const hostConfig = {
 };
 
 /**
- * `name` is identity. React kept the fiber (same key/type), but for the
- * runtime this is a different resource: tear down the old one and create
- * the new one. Children keep their own identity.
- */
-function rename(instance: Instance, previous: ContainerSpec | NetworkSpec): void {
-  if (instance.created) {
-    instance.created = false;
-    instance.root.live.delete(liveKey(instance.kind, previous.name));
-    push(instance.root, deleteOp(instance.kind, previous.name, previous));
-  }
-  instance.id = instance.spec.name;
-  mountSubtree(instance);
-}
-
-/**
- * @types/react-reconciler lags the runtime (0.33 types vs 0.34 runtime), so
- * the config is authored as a plain object and cast once, here.
+ * @types/react-reconciler lags the runtime (0.33 types vs 0.34 runtime), so the
+ * config is authored as a plain object and cast once, here.
  */
 export const typedHostConfig = hostConfig as unknown as HostConfig<
-  HostType,
-  HostProps[InstanceKind],
+  HostKind,
+  AnyHostProps,
   RootContainer,
   Instance,
   never,
@@ -454,3 +547,5 @@ export const typedHostConfig = hostConfig as unknown as HostConfig<
   -1,
   null
 >;
+
+export type { ResourceLimits };

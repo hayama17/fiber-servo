@@ -1,43 +1,82 @@
 /**
- * Composition, a network, dependency ordering and a service, without a
- * runtime.
+ * A small application: a database Pod, a rolled-out API, and one Service in
+ * front of the replicas.
  *
- *   npm run example:webapp
+ * Three things worth noticing:
  *
- * The tree shape is the topology: inside <Network> is membership, inside
- * <Container> is dependency. The deployment only mounts once the database
- * is ready, and its replicas sit behind one proxy. The dummy runtime reports
- * every CREATE as running and ready, so the gate opens by itself.
+ *   - the API is a <Deployment>, so editing the image rolls the replicas over
+ *     rather than editing them in place;
+ *   - <Service> has a `selector`, not a list of targets — it finds its
+ *     backends in observed state, which is what lets replicas come and go;
+ *   - <Ready on="db"> holds the migration back until the database answers its
+ *     readiness probe.
+ *
+ * Run it with `npm run example:webapp`.
  */
-import { Container, Deployment, Network, dummy, serve } from '../src/index.js';
+import {
+  Container,
+  Deployment,
+  Network,
+  Pod,
+  Ready,
+  Service,
+  formatAction,
+  memory,
+  serve,
+} from '../src/index.js';
 
-function WebApp({ replicas, image }: { replicas: number; image: string }) {
-  return (
-    <Network name="app">
+const app = (
+  <>
+    <Network name="backend" />
+
+    <Pod name="db" network="backend" labels={{ app: 'db' }}>
       <Container
-        name="db"
-        image="postgres:16"
+        name="postgres"
+        image="docker.io/library/postgres:16"
         env={{ POSTGRES_PASSWORD: 'dev' }}
+        ports={[5432]}
         readiness={{ exec: ['pg_isready', '-U', 'postgres'] }}
-      >
-        <Deployment name="web" replicas={replicas} service={{ port: 80, publish: 8080 }}>
-          <Container image={image} env={{ DATABASE_HOST: 'db' }} />
-        </Deployment>
-      </Container>
-    </Network>
-  );
+      />
+    </Pod>
+
+    {/* Declared only once the database reports ready. */}
+    <Ready on="db" until="ready">
+      <Pod name="migrate" network="backend">
+        <Container name="migrate" image="api:v2" command={['./migrate']} />
+      </Pod>
+
+      <Deployment name="api" replicas={3} strategy={{ maxSurge: 1 }}>
+        <Pod network="backend" labels={{ app: 'api' }}>
+          <Container
+            name="app"
+            image="api:v2"
+            env={{ DATABASE_URL: 'postgres://postgres:dev@db:5432/postgres' }}
+            ports={[8080]}
+          />
+        </Pod>
+      </Deployment>
+
+      <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
+    </Ready>
+  </>
+);
+
+const served = serve(app, {
+  runtime: memory(),
+  onActions: (actions) => {
+    for (const action of actions) console.log(`  ${formatAction(action)}`);
+  },
+});
+
+console.log('reconciling:');
+for (let i = 0; i < 20; i++) {
+  await served.root.settle();
+  await served.idle();
 }
 
-console.log('# mount: network and db first; web waits for db to be ready');
-console.log(
-  '# (the dummy runtime reports db ready at once, so web-* and the proxy follow in the next commit)',
-);
-const served = serve(<WebApp replicas={2} image="nginx:1.26" />, { runtime: dummy({ log: console.log }) });
-await served.root.settle();
+console.log('\nobserved:');
+for (const pod of served.observed.snapshot().pods.values()) {
+  console.log(`  ${pod.name} ${pod.phase}`);
+}
 
-console.log('# scale to 3 and bump the image: web-0/1 UPDATE, web-2 CREATE, proxy UPDATE, db untouched');
-served.root.render(<WebApp replicas={3} image="nginx:1.27" />);
-await served.root.settle();
-
-console.log('# stop: dependents first, then db, then the network');
 await served.stop();
