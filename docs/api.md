@@ -1,8 +1,7 @@
 # API
 
-Everything is exported from the package root. The layers below mirror
-[`docs/architecture.md`](architecture.md); if a name here is unfamiliar, that
-is the document that explains why it exists.
+Public exports are available from the package root. See [Architecture](architecture.md)
+for responsibilities and [containerd](containerd.md) for adapter configuration.
 
 ```ts
 import { Container, Network, ReplicaSet, Service, serve, containerd } from 'fiber-servo';
@@ -16,18 +15,10 @@ import { Container, Network, ReplicaSet, Service, serve, containerd } from 'fibe
 <Network name="backend" subnet="10.88.0.0/24" />
 ```
 
-A local bridge network. Containers join it by name. Networks have no children —
-a Network does not own the containers on it.
-
-Compose creates and removes networks as part of applying the model, so nothing
-in fiber-servo decides anything about their lifecycle. `subnet` becomes the
-Compose network's `ipam.config[].subnet`; the gateway is the runtime's to
-choose.
-
-There is no `labels` prop. A Compose network can declare labels, but nerdctl
-does not pass them on — checked against nerdctl 2.1.2 in both the map and the
-list syntax, and the created network carries only Compose's own two labels
-either way. A prop that provably does nothing is worse than no prop.
+A local bridge network, joined by Container's `network` prop. It has no
+children. `subnet` maps to Compose's `ipam.config[].subnet`; Compose chooses
+the gateway. No `labels` prop is exposed because the tested nerdctl version
+ignores custom network labels. See [network limits](architecture.md#reconciliation-and-its-limits).
 
 ### `<Container>`
 
@@ -40,7 +31,7 @@ either way. A prop that provably does nothing is worse than no prop.
   ports={[8080]}
   network="backend"
   labels={{ app: 'api' }}
-  publish={[{ host: 8080, target: 80 }]}
+  publish={[{ host: 8080, target: 8080 }]}
   resources={{ cpu: 0.5, memory: '512m' }}
   readiness={{ exec: ['curl', '-fs', 'localhost:8080/health'], intervalMs: 2000 }}
 />
@@ -61,10 +52,7 @@ The unit of everything: one process, one image, one Compose service.
 | `resources` | `ResourceLimits?`        | `{ cpu?: number; memory?: string }`.                                                      |
 | `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number; timeoutMs?: number }`. Exit 0 means ready.        |
 
-**Every field is immutable, `resources` included.** Changing any of them
-replaces the container. There is no in-place update: Compose has no
-live-update primitive, so raising a memory limit restarts the process. See
-decision 34.
+Changing any Container field, including `resources`, replaces the container.
 
 ### `<ReplicaSet>`
 
@@ -74,9 +62,8 @@ decision 34.
 </ReplicaSet>
 ```
 
-Keeps `replicas` copies of its `<Container>` template alive, named
-`<name>-<index>`. It declares a count, not identities — which is why a dead
-container is a controller's problem and not a re-render.
+Keeps `replicas` copies of its Container template alive (default 1), named
+`<name>-<index>`.
 
 ### `<Deployment>`
 
@@ -86,15 +73,11 @@ container is a controller's problem and not a re-render.
 </Deployment>
 ```
 
-Rollout policy over ReplicaSets. Editing the template creates a new generation
-and shifts replicas across, rather than editing containers in place.
-
-A generation's **identity** is `digest(template)` — the full 64-hex value,
-carried on each replica's `fiber-servo.generation` label, and the key its
-template is filed under. A generation's **name** is the Deployment's name plus
-`shortDigest(template)`, which is what you see in `nerdctl ps`. Nothing that
-decides anything reads the short form; it exists so a container name stays
-readable.
+Rolls out a Container template through ReplicaSets. Defaults: `replicas=1`,
+`maxSurge=1`, `maxUnavailable=0`. Editing the template creates a new generation;
+its full digest is the identity and a 16-character prefix appears in names.
+Rollout history is process-local: a restart removes old generations without
+gradual draining.
 
 ### `<Service>`
 
@@ -102,8 +85,11 @@ readable.
 <Service name="api" network="backend" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
 ```
 
-A stable endpoint in front of whichever containers currently match `selector`.
-The backend set is resolved from observed state, not from the tree.
+Proxies to running containers matching `selector`, sorted by name.
+`targetPort` defaults to `port`; `publish` exposes the proxy on a host port.
+The proxy joins `network`, but selection does not filter network membership
+or readiness: selected backends must be reachable from it. No matches means
+no proxy; backend changes replace it and may interrupt traffic.
 
 ### `<Ready>`
 
@@ -113,9 +99,9 @@ The backend set is resolved from observed state, not from the tree.
 </Ready>
 ```
 
-Nothing inside is declared until the named container(s) are observed
-`running`, or `ready` when `until="ready"`. Latches: a dependency that later
-dies does not retract what depends on it.
+`on` accepts a name or an array of names. Children are declared after every
+named container satisfies `until`: `running` by default, or `ready`.
+The gate latches; a later dependency failure does not retract children.
 
 ## Running a tree
 
@@ -153,27 +139,13 @@ interface Served {
 }
 ```
 
-`stop` and `detach` are the two ways to finish, and they differ in what they
-leave behind:
+`stop()` unmounts the tree, drains reconciliation, removes the application,
+and closes the adapter. `detach()` stops accepting reconciliation, clears
+retries, unsubscribes, drains in-flight work, and unmounts without calling
+`runtime.down()` or `runtime.close()`.
 
-```text
-detach()   the control plane stops.    containers and networks stay.
-stop()     the application stops.      runtime.down() removes them.
-```
-
-`detach` is what "the fiber-servo process died" looks like from inside one
-process: reconcile requests stop being accepted, the retry timer is cleared,
-both subscriptions are dropped, the tree is unmounted, and all controller
-state — the restart gate, the rollout history, the last applied model — goes
-with it. The runtime adapter is not even closed, because a process that
-crashed does not politely close its socket either.
-
-Use it to hand a machine over to another process, to swap a control plane
-without an outage, or to write a test about restart semantics that is
-actually about a restart. Merely dropping the reference to a `serve()` does
-not detach it: it still holds a runtime subscription, still reconciles when an
-event arrives, and can still apply its own stale desired state over the top of
-whatever replaced it.
+Use `detach()` before handing control to another loop. Dropping a `Served`
+reference alone leaves its subscriptions active.
 
 ### `createRoot(options)`
 
@@ -205,9 +177,8 @@ useReady('db', 'ready'); // suspend until ready (needs a <Suspense>)
 ```
 
 `ObservedState` is `{ containers: ReadonlyMap<string, ObservedContainer>, revision }`.
-There are no networks in it: Compose owns their lifecycle, so nothing in the
-control plane decides anything about them. A container's own attachments are on
-`ObservedContainer.networks`.
+Network declarations are not observed; container attachments are available
+as `ObservedContainer.networks`.
 
 ## Controllers, the Compose model, and the planner
 
@@ -215,7 +186,7 @@ All pure functions, callable directly:
 
 ```ts
 runControllers(desired, observed); // → { networks, containers }
-expandDeployment(spec, observed); // → ReplicaSetSpec[]
+expandDeployment(spec, observed, generations); // → ReplicaSetSpec[]
 expandReplicaSet(spec, observed); // → ContainerSpec[]
 serviceEndpoints(spec, observed); // → Endpoint[]
 serviceProxyContainer(spec, endpoints); // → ContainerSpec | undefined
@@ -223,7 +194,7 @@ serviceProxyContainer(spec, endpoints); // → ContainerSpec | undefined
 toComposeApplication(containers, networks, project); // → ComposeApplication
 renderCompose(app); // → the file handed to `nerdctl compose -f`
 
-planApply({ networks, containers }, observed, project); // → Plan
+planApply({ networks, containers }, observed, project, previousModel); // → Plan
 planIsEmpty(plan); // → nothing would change
 formatPlan(plan); // → "create api-0 image=api:v1\nreplace db"
 ```
@@ -273,20 +244,13 @@ interface Runtime {
 }
 ```
 
-`apply` takes the complete desired application, not a list of operations:
-deciding that a changed image means "remove this service, then recreate it" is
-the adapter's business, because it is the only layer that knows its actuator
-well enough to decide it. It must be a no-op when nothing changed — the control
-loop is level-triggered and will call it again on every observation.
+`apply` takes the complete desired application and must be idempotent: an
+unchanged running service keeps its identity. The control loop skips empty
+plans, but adapters must tolerate repeated application.
 
-Two labels carry fiber-servo's own state on each container, and an adapter
-reads both back rather than keeping them in memory, so that a fiber-servo
-restart recovers:
-
-```ts
-SPEC_LABEL; // 'fiber-servo.spec' — digest() of the ContainerSpec it was created from
-READINESS_LABEL; // 'fiber-servo.readiness' — the probe, via encodeReadiness/decodeReadiness
-```
+Adapters read the creation spec digest (`SPEC_LABEL`) and probe configuration
+(`READINESS_LABEL`) back from runtime metadata after restart. See
+[metadata](containerd.md#runtime-metadata) for labels and limits.
 
 `src/runtime/memory.ts` is the reference implementation and the shortest way to
 see what the contract asks for.

@@ -1,221 +1,136 @@
 # Running on containerd
 
-The containerd adapter is the only part of fiber-servo that knows what a
-container runtime is. Everything above it speaks specs (see
-[`docs/architecture.md`](architecture.md)); this is where a spec becomes a
-process.
-
-It talks to two different things, and the seam between them is **who owns the
-resource**:
-
-```text
-writes  ──> nerdctl compose      up / rm / down. Owns images, networks, running
-reads   ──> containerd gRPC      Containers, Tasks, Events. Owns what is alive
-```
-
-fiber-servo never assembles a `nerdctl run` command line, and it never mutates
-containerd — no `Containers.Create`, no `Tasks.Start`, no image pull, no
-snapshot. Decisions 30 and 33 in [`docs/decisions.md`](decisions.md) record why
-the seam moved here from an earlier read-versus-write split.
+The adapter applies Compose models through nerdctl and observes containers
+through containerd gRPC. See [Architecture](architecture.md) for the control
+loop and its recovery limits.
 
 ## Requirements
 
-- containerd on the host, and `nerdctl` on `PATH`.
-- Permission to reach containerd's socket (root, or rootless nerdctl).
 - Node 20+.
+- containerd and `nerdctl` on the host.
+- Permission to access the containerd socket, using root or rootless setup.
 
-Tested against containerd v2.2.2 and nerdctl 2.1.2.
+The repository's recorded live verification used containerd 2.2.2 and
+nerdctl 2.1.2. The behavior below is based on those versions.
 
-## Using it
+## Configuration
 
 ```tsx
 import { containerd, serve } from 'fiber-servo';
 
 const served = serve(<App />, {
+  project: 'my-app',
   runtime: containerd({ namespace: 'default' }),
 });
 ```
 
-`containerd(options)`:
+| Option             | Default                                         | Purpose                                                      |
+| ------------------ | ----------------------------------------------- | ------------------------------------------------------------ |
+| `namespace`        | `default`                                       | Shared by nerdctl and containerd gRPC.                       |
+| `address`          | `/run/containerd/containerd.sock`               | Socket for both paths; configure for rootless setups.        |
+| `bin`              | `nerdctl`                                       | Actuator executable.                                         |
+| `project`          | From `serve()`                                  | Override only when driving the adapter directly.             |
+| `composeFile`      | `join(tmpdir(), 'fiber-servo', 'compose.json')` | Stable file used by both apply and down.                     |
+| `probeTickMs`      | `250`                                           | Readiness scheduling interval.                               |
+| `reconnectDelayMs` | `1000`                                          | Delay between event-stream retries and disconnected resyncs. |
 
-| Option             | Default                            |                                                                        |
-| ------------------ | ---------------------------------- | ---------------------------------------------------------------------- |
-| `namespace`        | `default`                          | containerd namespace. Reaches **both** seams; see below.               |
-| `address`          | `/run/containerd/containerd.sock`  | containerd's socket. Rootless containerd puts it elsewhere.            |
-| `bin`              | `nerdctl`                          | The actuator binary.                                                   |
-| `project`          | from `serve()`                     | Normally left unset; see below.                                        |
-| `composeFile`      | `$TMPDIR/fiber-servo/compose.json` | Where the rendered model is written. Must be stable — `down` reads it. |
-| `probeTickMs`      | `250`                              | How often the readiness prober looks for work.                         |
-| `reconnectDelayMs` | `1000`                             | Backoff before reattaching a dead event stream.                        |
+Set the project through `serve({ project })`. The adapter rejects a model
+whose project differs from the project it observes. Use one writer per
+namespace/project, and separate `composeFile` paths for separate applications;
+the default path is shared.
 
-**Two names must not be set twice.** `namespace` is computed once and handed
-to both seams. It becomes
-`nerdctl --namespace <ns> compose …` and containerd's `containerd-namespace`
-gRPC metadata. If the two ever disagreed, the write path would create
-containers the read path could not see, and the loop would create them again
-for ever. `index.ts` is the only place it is resolved.
+## Apply and teardown
 
-The Compose **project** has the same hazard and is settled the same way:
-`serve({ project })` owns it and passes it to the adapter through
-`RuntimeContext`, so `containerd({ project })` is only for driving the adapter
-directly. Should the two ever disagree anyway, `apply()` refuses the model and
-says so — a read path filtering for a project nothing was created under would
-otherwise report the whole application missing on every pass and recreate it
-for ever, without a single error.
+`apply(model)` receives the complete desired application:
 
-## What `apply()` does
+1. Read recorded spec digests from project containers.
+2. Write the model with temporary entries for orphaned services.
+3. Run `compose -f <file> rm -f -s <changed…> <orphaned…>` if needed.
+4. Rewrite the exact desired model, removing temporary entries.
+5. Run `compose -f <file> up -d --no-recreate` if the model has services.
 
-The control plane hands the adapter a whole `ComposeApplication` — never a
-sequence of operations. Turning that into a running machine is three steps,
-and the reason it is not one is measured, not assumed:
+In the recorded nerdctl verification, plain `up -d` recreated unchanged
+containers. `--no-recreate` preserves them and starts stopped containers;
+explicit removal makes a spec change take effect. Orphan entries are needed
+because `compose rm` requires its targets in the file.
 
-```text
-1. render the model to composeFile
-2. nerdctl compose -f <file> rm -f -s <changed…> <orphaned…>
-3. nerdctl compose -f <file> up -d --no-recreate
-```
+An empty service map skips `up`, which otherwise fails with
+`no service was provided`. Network-only declarations therefore do not create
+networks by themselves. Network edits are delegated to Compose; the adapter
+does not explicitly recreate networks.
 
-`compose up -d` on its own recreates **every** container on every invocation,
-even when nothing changed — nerdctl does not implement the config-hash check
-Docker Compose has. Under a level-triggered loop that would churn the whole
-application for ever. `--no-recreate` makes `up` idempotent (ids stay stable)
-and self-healing (a killed container is simply started again), but it also
-means literally that: a changed service is left alone. So step 2 evicts what
-changed, and step 3 creates it back, creates what is new, and restarts what
-merely stopped. One command, three jobs, and nothing in the adapter has to
-tell them apart.
+`down()` restores the last model that declared resources, then runs
+`compose -f <file> down`. This retains network declarations after the final
+empty apply. If no model was applied in this process it uses the existing
+file; a missing file makes down a no-op.
 
-**Which services changed** comes from comparing the desired digest against the
-`fiber-servo.spec` label read back off the running container. That is the same
-recorded-spec mechanism the pre-Compose adapter used (decision 26), now
-carrying the write path too.
+## Runtime metadata
 
-**A wrinkle, verified against a real daemon.** `compose rm -s <service>`
-validates its target against the file passed with `-f`, and fails with
-`no such service` if the key is missing — it does not fall back to finding the
-container by label. An orphaned service is by definition no longer in the
-model, so step 1 writes the model _plus a bare `{ image }` stub_ for each
-orphan, and rewrites the file as the true model immediately afterwards, before
-`up` ever reads it.
+| Label                        | Purpose                                            |
+| ---------------------------- | -------------------------------------------------- |
+| `fiber-servo.managed`        | Management marker used by the planner.             |
+| `fiber-servo.spec`           | SHA-256 digest of the creation spec.               |
+| `fiber-servo.readiness`      | Percent-encoded probe configuration, when present. |
+| `fiber-servo.owner`          | Owning Deployment or ReplicaSet.                   |
+| `fiber-servo.generation`     | Full template digest.                              |
+| `com.docker.compose.service` | Controller-selected service name.                  |
+| `com.docker.compose.project` | Compose project used to scope observations.        |
+| `nerdctl/networks`           | Container network membership.                      |
 
-An **empty** application is a legitimate desired state — it is what the last
-pass of `serve().stop()` asks for — but `compose up` on a file with no
-services fails outright (`no service was provided`). Step 2 has already
-removed everything by then, so step 3 is skipped.
+The adapter reads spec digests and probes from labels after restart. Rollout
+templates remain in memory and are lost with the control plane; see
+[restart behavior](architecture.md#state-and-restart-behavior).
 
-`down()` is `compose -f <file> down`, guarded by the file existing — `down`
-against a missing file is an error, not a no-op. Before running it, the
-adapter rewrites the file with the last model that **declared** anything:
-`compose down` removes only the networks the file it is given declares, and by
-then the file has usually been reduced to the empty model by that final
-`apply()`. Without this the application's network outlives it, which is what a
-live run showed.
+Containerd's recorded limit is 4096 bytes per label key/value pair. Readiness
+configuration is variable-sized and subject to that limit; full templates
+are never stored in labels.
 
-## Labels, and how a restart recovers
-
-Every container carries:
-
-| Label                        |                                                                    |
-| ---------------------------- | ------------------------------------------------------------------ |
-| `fiber-servo.managed`        | Ours. Anything without it is left strictly alone.                  |
-| `fiber-servo.spec`           | `digest()` of the `ContainerSpec` it was created from.             |
-| `fiber-servo.readiness`      | The readiness probe, percent-encoded JSON. Only when there is one. |
-| `fiber-servo.owner`          | The Deployment or ReplicaSet that produced it.                     |
-| `fiber-servo.generation`     | Which template generation it belongs to.                           |
-| `com.docker.compose.service` | Compose's own — and it is the name our controllers chose.          |
-| `com.docker.compose.project` | Compose's own.                                                     |
-| `nerdctl/networks`           | nerdctl's own. Network membership, without reading a CNI file.     |
-
-Identity needs no label of fiber-servo's invention: Compose mangles the
-container name to `<project>-<service>-<index>` but records the service name,
-which is the name the controllers chose (`api-0`, `web-43bfee23d1cb5f62-1`). Two of
-the six labels above are ours; the rest were already there.
-
-**Every label here is small and fixed-width, deliberately.** containerd
-refuses any label whose key and value together exceed 4096 bytes — measured:
-6015 bytes rejected, two labels of 3000 bytes each accepted, so the cap is per
-pair rather than across the set. A Deployment's whole `ContainerTemplate` was
-briefly carried in a label, which made a perfectly legal spec with a few
-kilobytes of environment impossible to create at all. Labels answer "what is
-this", never "how did we get here": the templates of past generations are
-controller state, held in memory for the life of the process and written
-nowhere. See decision 40.
-
-A container with no `fiber-servo.managed` label is adopted, never removed —
-fiber-servo shares a machine, it does not own one. And because the digest and
-the probe live on the resource rather than in the process, a fiber-servo
-restart recovers both: what each container was created from, and what to probe
-it with.
+The planner filters recorded digests by the managed marker. The containerd
+adapter scopes reads by Compose project and derives removal candidates from
+recorded digests; `down()` delegates project cleanup to Compose. Use a
+dedicated project rather than treating the marker as an isolation boundary.
 
 ## Readiness
 
-Compose has a `healthcheck` field. **nerdctl does not implement it** — `up`
-accepts one and silently ignores it — so readiness cannot be delegated and
-fiber-servo runs the probe itself, with `nerdctl compose exec <service>`.
+The tested nerdctl version ignores Compose healthchecks, so the adapter runs
+`nerdctl compose exec <service> <probe…>`. Exit 0 latches readiness for the
+current target; recreation resets it. This is startup readiness, not a
+continuous health check.
 
-The probe has to reach the adapter somehow, and `apply()` receives a
-`ComposeApplication` and nothing else. So it rides in the service's labels
-under `fiber-servo.readiness`, written by `toComposeService` in
-`src/compose.ts` and read back by the adapter — off the model for a service
-about to be applied, and off a running container when rebuilding the schedule
-after a restart.
+Each attempt has `timeoutMs` (default 2000). The timeout kills the process
+group so a child `nerdctl exec` cannot keep pipes or locks open and block
+teardown. Set a longer timeout explicitly for slower probes.
 
-**Every probe is bounded** (`timeoutMs`, default 2000), and the timeout kills
-the process _group_, not the child. Both halves of that were found by running
-it rather than reading it:
+Service selection checks running state and labels, not readiness. Use Ready
+for declaration ordering; a Service is not a readiness filter.
 
-- An unbounded probe is not merely slow. `nerdctl exec` into a wedged
-  container never returns, and it holds the container's exec lock — so the
-  `compose rm` that teardown issues blocks behind it and **Ctrl-C never
-  completes**. Measured before the fix: still running after 31 seconds; after
-  it: 3 seconds, container removed.
-- Signalling only the direct child does nothing, because `nerdctl compose
-exec` is itself a parent of `nerdctl exec`: the grandchild survives holding
-  the stdout pipe, so Node's `close` event never fires and the timeout has no
-  effect at all. The child is spawned `detached` and the timeout signals
-  `-pid`.
+## Observations
 
-## Files
+The adapter reads Containers and Tasks and subscribes to Events. Task
+start/exit/delete events refresh container state; container deletion events
+reconcile the known IDs against a fresh list. Task events use `container_id`;
+container deletion events use `id`.
 
-| File         |                                                                                    |
-| ------------ | ---------------------------------------------------------------------------------- |
-| `index.ts`   | `containerd()`: builds the two seams and resolves the namespace.                   |
-| `nerdctl.ts` | The write seam: `exec`. Tests inject a fake.                                       |
-| `api.ts`     | The read seam: containerd gRPC over vendored protos.                               |
-| `parse.ts`   | Pure decoding: task status → phase, labels → `ObservedContainer`.                  |
-| `runtime.ts` | The `Runtime` implementation: `apply`, `down`, `inspect`, `subscribe`, the prober. |
+A full inspect runs when watching starts and after the stream ends or fails.
+Retries use `reconnectDelayMs`, with a resync between attempts. There is no
+periodic full resync while the stream is healthy. Network drift is not
+observed.
 
-`api.ts` is separately testable against a live daemon without creating a
-single container, which is how the event decoding was verified.
+## Other limitations
 
-## Events
+- No image refresh policy; Compose pulls missing images.
+- Resource limits describe the requested spec, not measured cgroup limits.
+- Service backend changes replace the proxy and may interrupt traffic.
+- No Pod resource or sidecar orchestration.
 
-`Events.Subscribe` delivers typed events; `runtime.ts` maps topics:
+## Code map
 
-| Topic                |                                 |
-| -------------------- | ------------------------------- |
-| `/tasks/start`       | the container's process is up   |
-| `/tasks/exit`        | it stopped, with an exit status |
-| `/tasks/delete`      | its task is gone                |
-| `/containers/delete` | the container itself is gone    |
+Paths are relative to `src/runtime/containerd/`.
 
-Task events name the container `container_id`; container events name it `id` —
-a difference that silently broke `/containers/delete` handling until it was
-caught against a live daemon.
-
-If the stream dies, the adapter emits a `resync` from a full `inspect()` and
-reattaches with backoff, so a missed event costs a late reconcile rather than
-a wrong one. It also resyncs when a subscriber first attaches, so nothing has
-to have been watching from the start.
-
-## Known limitations
-
-- **Single writer.** One fiber-servo per machine per namespace, per project.
-  Two would each hold their own idea of desired state and fight.
-- **No image pulling policy.** Compose pulls what is missing; there is no
-  periodic refresh.
-- **Resource limits are what was asked for**, not what the cgroup reports.
-  containerd's API exposes no cgroup limits.
-- **No sidecars.** A container is the unit (decision 32). Several containers
-  sharing a network namespace would be a Compose feature
-  (`network_mode: service:<name>`), not a fiber-servo resource kind.
+| File         | Responsibility                                             |
+| ------------ | ---------------------------------------------------------- |
+| `index.ts`   | Runtime factory and shared configuration.                  |
+| `nerdctl.ts` | Process execution and timeout handling; fakeable in tests. |
+| `api.ts`     | gRPC client using vendored protobufs.                      |
+| `parse.ts`   | Task phases and container-label decoding.                  |
+| `runtime.ts` | Apply, down, observations, and readiness probes.           |
