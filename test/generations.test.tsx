@@ -180,9 +180,9 @@ describe('a restart converges freshly rather than resuming', () => {
       runtime.calls.slice(callsAtDetach).some((c) => c.includes(shortDigest(big)) && c.startsWith('create')),
     ).toBe(false);
 
-    // And no history crossed the boundary: the new control plane knows only
-    // the generation it declared itself.
-    expect([...historyBefore.all().keys()]).toEqual([digest(v2)]);
+    // Controller history belongs to the React Deployment component. The
+    // detached tree's history does not cross the control-plane boundary.
+    expect([...historyBefore.all().keys()]).toEqual([]);
 
     await second.stop();
   }, 20_000);
