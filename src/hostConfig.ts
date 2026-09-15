@@ -24,25 +24,25 @@
  * Host elements, and what nesting means for each:
  *
  *   network      a bridge network            (no children)
- *   pod          a sandbox                   (children: container)
- *   container    a process in a sandbox      (no children)
- *   replicaset   "keep N of this template"   (children: exactly one pod, unnamed)
- *   deployment   rollout policy over those   (children: exactly one pod, unnamed)
+ *   container    the unit of everything      (no children)
+ *   replicaset   "keep N of this template"   (children: exactly one container, unnamed)
+ *   deployment   rollout policy over those   (children: exactly one container, unnamed)
  *   service      a stable endpoint           (no children)
  *
- * Nesting is ownership and nothing else. A Pod's *network* is a `network="..."`
- * reference, never an ancestor, because a Network does not own the Pods on it.
+ * Nesting is ownership and nothing else. A Container's *network* is a
+ * `network="..."` reference, never an ancestor, because a Network does not
+ * own the containers on it. There is no `pod` element any more: a container
+ * is the unit everything counts, routes to and becomes exactly one Compose
+ * service, so there is no sandbox layer left to be a host element of its own.
  */
 import type { HostConfig } from 'react-reconciler';
 import { DiscreteEventPriority, NoEventPriority } from 'react-reconciler/constants.js';
 import type {
   ContainerSpec,
+  ContainerTemplate,
   DeploymentSpec,
   DesiredState,
   NetworkSpec,
-  PodSpec,
-  PodTemplate,
-  PortMapping,
   ReplicaSetSpec,
   Resource,
   ResourceLimits,
@@ -50,16 +50,9 @@ import type {
   ServiceSpec,
 } from './resources.js';
 
-export type HostKind = 'network' | 'pod' | 'container' | 'replicaset' | 'deployment' | 'service';
+export type HostKind = 'network' | 'container' | 'replicaset' | 'deployment' | 'service';
 
-const HOST_KINDS: readonly HostKind[] = [
-  'network',
-  'pod',
-  'container',
-  'replicaset',
-  'deployment',
-  'service',
-];
+const HOST_KINDS: readonly HostKind[] = ['network', 'container', 'replicaset', 'deployment', 'service'];
 
 // ---- props the host elements accept ----------------------------------------
 
@@ -67,16 +60,9 @@ export interface NetworkHostProps extends NetworkSpec {
   children?: unknown;
 }
 
-/** `name` is absent when the Pod is a ReplicaSet's or Deployment's template. */
-export interface PodHostProps {
+/** `name` is absent when the Container is a ReplicaSet's or Deployment's template. */
+export interface ContainerHostProps extends Omit<ContainerSpec, 'name'> {
   name?: string;
-  network?: string;
-  labels?: Readonly<Record<string, string>>;
-  publish?: readonly PortMapping[];
-  children?: unknown;
-}
-
-export interface ContainerHostProps extends ContainerSpec {
   children?: unknown;
 }
 
@@ -99,7 +85,6 @@ export interface ServiceHostProps extends ServiceSpec {
 
 export type HostProps = {
   network: NetworkHostProps;
-  pod: PodHostProps;
   container: ContainerHostProps;
   replicaset: ReplicaSetHostProps;
   deployment: DeploymentHostProps;
@@ -156,71 +141,56 @@ function pick<T extends object>(props: Record<string, unknown>, keys: readonly s
   return out as T;
 }
 
-function toContainer(instance: Instance): ContainerSpec {
-  const name = requireName('container', instance.props);
+/** Every field of a container's spec except its identity (`name`). */
+const CONTAINER_TEMPLATE_KEYS = [
+  'command',
+  'env',
+  'ports',
+  'network',
+  'labels',
+  'publish',
+  'resources',
+  'readiness',
+] as const;
+
+/** Shared by a top-level `<container>` and a ReplicaSet/Deployment's template child. */
+function containerTemplate(instance: Instance, context: string): ContainerTemplate {
   const image = instance.props['image'];
   if (typeof image !== 'string' || image.length === 0) {
-    fail(`<container name="${name}"> requires a non-empty string "image"`);
+    fail(`${context} requires a non-empty string "image"`);
   }
   if (instance.children.length > 0) {
-    fail(`<container name="${name}"> takes no host children; a container has no sub-resources`);
+    fail(`${context} takes no host children; a container has no sub-resources`);
   }
   return {
-    ...pick<Omit<ContainerSpec, 'name' | 'image'>>(instance.props, [
-      'command',
-      'env',
-      'ports',
-      'resources',
-      'readiness',
-    ]),
-    name,
+    ...pick<Omit<ContainerTemplate, 'image'>>(instance.props, CONTAINER_TEMPLATE_KEYS),
     image,
   };
 }
 
-/** The sandbox half of a Pod: everything except its identity. */
-function toPodTemplate(instance: Instance, owner: string): PodTemplate {
-  const containers = instance.children.map((child) => {
-    if (child.kind !== 'container') {
-      fail(`<pod> in ${owner} may only contain <container>, got <${child.kind}>`);
-    }
-    return toContainer(child);
-  });
-  if (containers.length === 0) fail(`<pod> in ${owner} needs at least one <container>`);
-  const seen = new Set<string>();
-  for (const c of containers) {
-    if (seen.has(c.name)) fail(`<pod> in ${owner} has two containers named "${c.name}"`);
-    seen.add(c.name);
-  }
-  return {
-    ...pick<Omit<PodTemplate, 'containers'>>(instance.props, ['network', 'labels', 'publish']),
-    containers,
-  };
+function toContainer(instance: Instance): ContainerSpec {
+  const name = requireName('container', instance.props);
+  return { ...containerTemplate(instance, `<container name="${name}">`), name };
 }
 
-function toPod(instance: Instance): PodSpec {
-  const name = requireName('pod', instance.props);
-  return { ...toPodTemplate(instance, `<pod name="${name}">`), name };
-}
-
-/** A ReplicaSet or Deployment owns exactly one unnamed `<pod>`: its template. */
-function templateOf(instance: Instance, owner: string): PodTemplate {
-  const pods = instance.children.filter((c) => c.kind === 'pod');
-  if (instance.children.length !== pods.length) {
-    fail(`${owner} may only contain a single <pod> template`);
+/** A ReplicaSet or Deployment owns exactly one unnamed `<container>`: its template. */
+function templateOf(instance: Instance, owner: string): ContainerTemplate {
+  const containers = instance.children.filter((c) => c.kind === 'container');
+  if (instance.children.length !== containers.length) {
+    fail(`${owner} may only contain a single <container> template`);
   }
-  const [pod, ...rest] = pods;
-  if (pod === undefined) fail(`${owner} needs a <pod> template describing what to replicate`);
+  const [container, ...rest] = containers;
+  if (container === undefined) fail(`${owner} needs a <container> template describing what to replicate`);
   if (rest.length > 0) {
-    fail(`${owner} has ${pods.length} <pod> templates; it replicates exactly one`);
+    fail(`${owner} has ${containers.length} <container> templates; it replicates exactly one`);
   }
-  if (pod.props['name'] !== undefined) {
+  if (container.props['name'] !== undefined) {
     fail(
-      `${owner} has a <pod name="${String(pod.props['name'])}"> template: a replicated pod is named by its ` +
-        'controller, so the template must not carry a name',
+      `${owner} has a <container name="${String(container.props['name'])}"> template: a replicated ` +
+        'container is named by its controller, so the template must not carry a name',
     );
   }
-  return toPodTemplate(pod, owner);
+  return containerTemplate(container, owner);
 }
 
 function replicasOf(props: Record<string, unknown>, owner: string): number {
@@ -241,9 +211,9 @@ function toResource(instance: Instance): Resource {
       };
       return { kind: 'network', name, spec };
     }
-    case 'pod': {
-      const spec = toPod(instance);
-      return { kind: 'pod', name: spec.name, spec };
+    case 'container': {
+      const spec = toContainer(instance);
+      return { kind: 'container', name: spec.name, spec };
     }
     case 'replicaset': {
       const name = requireName('replicaset', instance.props);
@@ -286,15 +256,15 @@ function toResource(instance: Instance): Resource {
       };
       return { kind: 'service', name, spec };
     }
-    case 'container':
-      return fail('<container> must be inside a <pod>');
   }
 }
 
 /**
  * Serialise the tree, parents before children, into the set of resources that
- * should exist. Containers do not appear at this level: they are part of the
- * Pod that owns them, which is what the Pod being a lifecycle boundary means.
+ * should exist. A ReplicaSet's or Deployment's template container does not
+ * appear at this level: it was already absorbed into the owning resource's
+ * `template` by `templateOf`, the same way it always has been — only now
+ * there is no Pod for it to have been absorbed *through*.
  */
 export function snapshot(root: RootContainer): DesiredState {
   const resources: Resource[] = [];
@@ -306,7 +276,7 @@ export function snapshot(root: RootContainer): DesiredState {
       if (seen.has(key)) fail(`duplicate ${resource.kind} name "${resource.name}"`);
       seen.add(key);
       resources.push(resource);
-      // Pods, ReplicaSets and Deployments have already absorbed their children.
+      // ReplicaSets and Deployments have already absorbed their template child.
       if (node.kind === 'network' || node.kind === 'service') walk(node.children);
     }
   };
@@ -437,8 +407,8 @@ export const hostConfig = {
   resetTextContent(): void {},
   hideInstance(): void {
     // A re-suspended subtree keeps its resources: `useReady` latches, so this
-    // only happens for user-thrown promises, and stopping a Pod because a
-    // sibling suspended would be a surprising policy to impose.
+    // only happens for user-thrown promises, and stopping a container because
+    // a sibling suspended would be a surprising policy to impose.
   },
   unhideInstance(): void {},
   hideTextInstance(): void {},
@@ -457,8 +427,8 @@ export const hostConfig = {
   /**
    * React's only use of this in concurrent mode is to throttle the commit that
    * replaces a Suspense fallback (about 300ms, to avoid flashing UI). There is
-   * no UI to flash: a Pod gated by <Ready> should be declared the moment its
-   * dependency is up. So "later" means the next microtask, still cancellable.
+   * no UI to flash: a container gated by <Ready> should be declared the moment
+   * its dependency is up. So "later" means the next microtask, still cancellable.
    */
   scheduleTimeout(fn: () => void, _ms: number): TimeoutHandle {
     const handle: TimeoutHandle = { cancelled: false };

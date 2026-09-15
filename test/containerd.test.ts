@@ -1,690 +1,715 @@
-import { describe, expect, it } from 'vitest';
-import { digest, type ContainerSpec, type PodSpec } from '../src/resources.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { ContainerSpec, NetworkSpec, ReadinessProbe } from '../src/resources.js';
 import {
-  CONTAINER_LABEL,
+  COMPOSE_PROJECT_LABEL,
+  COMPOSE_SERVICE_LABEL,
   MANAGED_LABEL,
-  POD_LABEL,
-  ROLE_LABEL,
+  NERDCTL_NETWORKS_LABEL,
+  READINESS_LABEL,
   SPEC_LABEL,
+  encodeReadiness,
+  toComposeApplication,
+  type ComposeApplication,
+} from '../src/compose.js';
+import {
   createContainerdRuntime,
-  encodeSpecLabel,
-  infraRunArgs,
-  memberRunArgs,
-  updateResourcesArgs,
+  type ApiContainer,
+  type ApiEvent,
+  type ApiTask,
+  type ContainerdApi,
+  type ContainerdRuntimeOptions,
   type ExecResult,
   type Nerdctl,
 } from '../src/runtime/containerd/index.js';
 import type { RuntimeEvent } from '../src/runtime/types.js';
 
+const PROJECT = 'fiber-servo';
+
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 const fail = (stderr: string, code = 1): ExecResult => ({ code, stdout: '', stderr });
 
-function podSpec(overrides: Partial<PodSpec> = {}): PodSpec {
-  return { name: 'api', containers: [{ name: 'app', image: 'app:1' }], ...overrides };
+/** Build a `ComposeApplication` the same way the control plane does -- through `compose.ts`, not by hand. */
+function model(containers: ContainerSpec[], networks: NetworkSpec[] = []): ComposeApplication {
+  return toComposeApplication(containers, networks, PROJECT);
 }
 
-function memoryStringToBytes(s: string): number {
-  const m = /^(\d+(?:\.\d+)?)([kmg])?$/i.exec(s.trim());
-  if (!m) return Number(s) || 0;
-  const unit = (m[2] ?? '').toLowerCase();
-  const mult = unit === 'g' ? 1024 ** 3 : unit === 'm' ? 1024 ** 2 : unit === 'k' ? 1024 : 1;
-  return Math.round(Number(m[1]) * mult);
+/** Attach `READINESS_LABEL` to one service's labels -- for a model built by hand rather than from a spec carrying a probe. */
+function withReadiness(app: ComposeApplication, service: string, probe: ReadinessProbe): ComposeApplication {
+  const target = app.services[service];
+  if (!target) throw new Error(`no service "${service}" in this model`);
+  return {
+    ...app,
+    services: {
+      ...app.services,
+      [service]: { ...target, labels: { ...target.labels, [READINESS_LABEL]: encodeReadiness(probe) } },
+    },
+  };
 }
 
-// ---- a fake containerd -------------------------------------------------------
+// ---- a fake containerd --------------------------------------------------------
 //
-// Not a script of canned responses (the old adapter's test used one, keyed by
-// subcommand -- fine for a container-only, op-based world). Realising a Pod
-// takes several *different* nerdctl calls in sequence (run, inspect, ps,
-// rm...) that all have to agree on the same state, so this fake actually
-// keeps that state -- a map of containers and networks -- and answers each
-// call the way real nerdctl would, by reading the same `--format` strings
-// `runtime.ts` sends. Tests below drive the `Runtime` methods directly and
-// assert on what came out, the same way `test/memory-runtime.test.ts` does.
+// One seam apiece, one shared state -- `nerdctl` (writes) and `api` (reads)
+// both answer out of the same `containers` map, the way a real nerdctl CLI
+// call and a real gRPC read both answer out of the one daemon.
+//
+// The one rule that matters most here: every response this fake gives is
+// something real nerdctl 2.1.2 / containerd v2.2.2 was actually observed to
+// produce, checked live against a real daemon, not a plausible guess. Three
+// things below exist specifically because they are easy to get wrong by
+// guessing:
+//
+//   - `compose rm -f -s <service>` fails outright with "no such service: x"
+//     when `x` is not a key in the file loaded with `-f` -- it does not fall
+//     back to finding the container by label (`handleRm`). This is why
+//     `apply()` in runtime.ts writes removal stubs for orphaned services
+//     before removing them.
+//   - `compose up -d --no-recreate` on an already-running, unchanged service
+//     does nothing at all -- no new task event, no new id (`handleUp`).
+//   - a `ContainerDelete` event's `containerId` is unconditionally
+//     `undefined` through `api.ts`'s decoder (`removeAndEmit`), because that
+//     message's field is named `id`, not `container_id`.
 
 interface FakeContainer {
   id: string;
-  name: string;
+  service: string;
   labels: Record<string, string>;
   image: string;
   running: boolean;
+  /** False models "no task at all": never started, or a task already deleted. */
+  hasTask: boolean;
   exitCode?: number;
-  cpu?: number;
-  memory?: string;
-  ip?: string;
 }
 
-function createFakeContainerd() {
-  const containers = new Map<string, FakeContainer>();
-  const networks = new Map<string, { labels: Record<string, string>; subnet?: string }>();
+function createFakeContainerd(project = PROJECT) {
+  const containers = new Map<string, FakeContainer>(); // keyed by service name -- one instance per service, index 1
   const probeResults = new Map<string, ExecResult>();
-  const eventLines: string[] = [];
   const calls: string[] = [];
   let counter = 0;
+  let subscriber: { onEvent: (e: ApiEvent) => void; onError?: (e: Error) => void } | undefined;
 
-  const findByNameOrId = (t: string): FakeContainer | undefined =>
-    containers.get(t) ?? [...containers.values()].find((c) => c.id === t);
-
-  function parseRun(rest: string[]) {
-    const labels: Record<string, string> = {};
-    let name = '';
-    let network: string | undefined;
-    let cpu: number | undefined;
-    let memory: string | undefined;
-    const positional: string[] = [];
-    for (let i = 0; i < rest.length; i++) {
-      const a = rest[i]!;
-      if (a === '-d' || a === '--restart=no' || a === '--pull=missing') continue;
-      if (a === '--name') {
-        name = rest[++i]!;
-        continue;
-      }
-      if (a === '--label') {
-        const v = rest[++i]!;
-        const eq = v.indexOf('=');
-        labels[v.slice(0, eq)] = v.slice(eq + 1);
-        continue;
-      }
-      if (a === '--network') {
-        network = rest[++i];
-        continue;
-      }
-      if (a.startsWith('--network=')) {
-        network = a.slice('--network='.length);
-        continue;
-      }
-      if (a === '-p') {
-        i++;
-        continue;
-      } // publish: recorded via calls.join, not fake state
-      if (a === '-e') {
-        i++;
-        continue;
-      }
-      if (a === '--cpus') {
-        cpu = Number(rest[++i]);
-        continue;
-      }
-      if (a === '--memory') {
-        memory = rest[++i];
-        continue;
-      }
-      positional.push(a);
-    }
-    return { name, labels, network, cpu, memory, image: positional[0] ?? '' };
+  function emit(event: ApiEvent): void {
+    subscriber?.onEvent(event);
   }
 
-  function handleRun(rest: string[]): ExecResult {
-    const parsed = parseRun(rest);
-    if (containers.has(parsed.name))
-      return fail(`nerdctl: conflict: name "${parsed.name}" is already in use`);
-    counter += 1;
-    const id = counter.toString(16).padStart(64, '0');
-    containers.set(parsed.name, {
-      id,
-      name: parsed.name,
-      labels: parsed.labels,
-      image: parsed.image,
-      running: true,
-      cpu: parsed.cpu,
-      memory: parsed.memory,
-      ip: parsed.network && !parsed.network.startsWith('container:') ? `10.88.0.${counter + 1}` : undefined,
+  function readModel(file: string): ComposeApplication {
+    return JSON.parse(readFileSync(file, 'utf8')) as ComposeApplication;
+  }
+
+  function removeAndEmit(c: FakeContainer): void {
+    containers.delete(c.service);
+    emit({
+      topic: '/tasks/delete',
+      type: 'containerd.events.TaskDelete',
+      containerId: c.id,
+      exitStatus: c.exitCode ?? 0,
     });
-    return ok(`${id}\n`);
+    // No `containerId` here -- see the file doc above.
+    emit({ topic: '/containers/delete', type: 'containerd.events.ContainerDelete' });
   }
 
-  function handleRm(rest: string[]): ExecResult {
-    for (const name of rest) if (name !== '-f') containers.delete(name);
-    return ok();
-  }
-
-  function handleInspect(rest: string[]): ExecResult {
-    const format = rest[1] ?? '';
-    const targets = rest.slice(2);
-    if (format.includes('NetworkSettings.IPAddress')) {
-      const c = findByNameOrId(targets[0]!);
-      return c ? ok(`${c.ip ?? ''}\n`) : fail('no such container');
-    }
-    if (format.includes('HostConfig.NanoCpus')) {
-      const lines = targets.map((t) => {
-        const c = findByNameOrId(t);
-        if (!c) return '';
-        const nano = c.cpu !== undefined ? Math.round(c.cpu * 1e9) : 0;
-        const bytes = c.memory !== undefined ? memoryStringToBytes(c.memory) : 0;
-        return `/${c.name} ${nano} ${bytes}`;
-      });
-      return ok(lines.join('\n') + '\n');
-    }
-    if (format.includes('State.Status')) {
-      const c = findByNameOrId(targets[0]!);
-      if (!c) return fail('no such container');
-      return ok(`${c.id} ${c.running ? 'running' : 'exited'} ${c.exitCode ?? 0} ${c.image}\n`);
-    }
-    if (format.includes(MANAGED_LABEL) && format.includes(ROLE_LABEL)) {
-      const c = findByNameOrId(targets[0]!);
-      if (!c) return fail('no such container');
-      return ok(
-        `${c.labels[MANAGED_LABEL] ?? ''} ${c.labels[POD_LABEL] ?? ''} ${c.labels[CONTAINER_LABEL] ?? ''} ${c.labels[ROLE_LABEL] ?? ''}\n`,
-      );
-    }
-    // inspectContainer: {{.Id}} {{SPEC_LABEL}}
-    const c = findByNameOrId(targets[0]!);
-    if (!c) return fail('no such container');
-    return ok(`${c.id} ${c.labels[SPEC_LABEL] ?? ''}\n`);
-  }
-
-  function handlePs(rest: string[]): ExecResult {
-    let podFilter: string | undefined;
-    const fi = rest.indexOf('--filter');
-    if (fi !== -1) {
-      const m = /^label=fiber-servo\.pod=(.*)$/.exec(rest[fi + 1] ?? '');
-      if (m) podFilter = m[1];
-    }
-    const rows = [...containers.values()]
-      .filter((c) => c.labels[MANAGED_LABEL] === 'true')
-      .filter((c) => !podFilter || c.labels[POD_LABEL] === podFilter)
-      .map((c) =>
-        JSON.stringify({
-          ID: c.id,
-          Names: c.name,
-          Image: c.image,
-          Status: c.running ? 'Up 1 second' : `Exited (${c.exitCode ?? 0}) 1 second ago`,
-          Labels: Object.entries(c.labels)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(','),
-        }),
-      );
-    return ok(rows.join('\n') + '\n');
-  }
-
-  function handleNetwork(rest: string[]): ExecResult {
-    const [sub, ...more] = rest;
-    if (sub === 'create') {
-      const name = more[more.length - 1]!;
-      const labels: Record<string, string> = {};
-      for (let i = 0; i < more.length; i++) {
-        if (more[i] === '--label') {
-          const v = more[++i]!;
-          const eq = v.indexOf('=');
-          labels[v.slice(0, eq)] = v.slice(eq + 1);
-        }
+  function handleUp(file: string): ExecResult {
+    const app = readModel(file);
+    if (app.name !== project) return ok(); // a different project's file: nothing here to do
+    for (const [service, def] of Object.entries(app.services)) {
+      const existing = containers.get(service);
+      if (!existing) {
+        counter += 1;
+        const id = counter.toString(16).padStart(64, '0');
+        containers.set(service, {
+          id,
+          service,
+          labels: {
+            [COMPOSE_PROJECT_LABEL]: app.name,
+            [COMPOSE_SERVICE_LABEL]: service,
+            [NERDCTL_NETWORKS_LABEL]: JSON.stringify(def.networks ?? []),
+            ...def.labels,
+          },
+          image: def.image,
+          running: true,
+          hasTask: true,
+        });
+        emit({ topic: '/tasks/start', type: 'containerd.events.TaskStart', containerId: id });
+      } else if (!existing.running) {
+        // `--no-recreate` means exactly what it says: an existing, merely
+        // stopped container is *started*, not replaced. Same id, fresh task.
+        existing.running = true;
+        existing.hasTask = true;
+        existing.exitCode = undefined;
+        emit({ topic: '/tasks/start', type: 'containerd.events.TaskStart', containerId: existing.id });
       }
-      const si = more.indexOf('--subnet');
-      networks.set(name, { labels, subnet: si !== -1 ? more[si + 1] : undefined });
-      return ok();
-    }
-    if (sub === 'rm') return networks.delete(more[0]!) ? ok() : fail('no such network');
-    if (sub === 'inspect') {
-      const fmt = more[1] ?? '';
-      const names = more.slice(2);
-      if (fmt.includes('IPAM')) {
-        return ok(names.map((n) => `${n} ${networks.get(n)?.subnet ?? ''}`).join('\n') + '\n');
-      }
-      return networks.has(names[0]!) ? ok(`${names[0]}\n`) : fail('no such network');
-    }
-    if (sub === 'ls') {
-      const rows = [...networks.entries()].map(([name, n]) =>
-        JSON.stringify({
-          Name: name,
-          Labels: Object.entries(n.labels)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(','),
-        }),
-      );
-      return ok(rows.join('\n') + '\n');
+      // else: already running and unchanged -- `--no-recreate` does nothing,
+      // and does not even emit an event, matching what a real daemon does
+      // when `nerdctl start` meets an already-running container.
     }
     return ok();
   }
 
-  function handleUpdate(rest: string[]): ExecResult {
-    const name = rest[rest.length - 1]!;
-    const c = containers.get(name);
-    if (!c) return fail('no such container');
-    for (let i = 0; i < rest.length - 1; i++) {
-      if (rest[i] === '--cpus') c.cpu = Number(rest[++i]);
-      if (rest[i] === '--memory') c.memory = rest[++i];
+  function handleRm(file: string, rest: string[]): ExecResult {
+    const app = readModel(file);
+    const sIndex = rest.indexOf('-s');
+    const services = rest.slice(sIndex + 1);
+    // Verified live: `rm -s <service>` validates every name against the keys
+    // declared in the *loaded file*, not against what is actually running.
+    for (const service of services) {
+      if (!(service in app.services)) return fail(`no such service: ${service}`);
+    }
+    for (const service of services) {
+      const existing = containers.get(service);
+      if (existing) removeAndEmit(existing); // absent is a silent no-op, verified live
     }
     return ok();
+  }
+
+  function handleDown(file: string): ExecResult {
+    let app: ComposeApplication;
+    try {
+      app = readModel(file);
+    } catch {
+      return fail(`open ${file}: no such file or directory`);
+    }
+    if (app.name !== project) return ok();
+    for (const c of [...containers.values()]) removeAndEmit(c);
+    return ok();
+  }
+
+  function handleExec(rest: string[]): ExecResult {
+    const service = rest[0] ?? '';
+    return probeResults.get(service) ?? ok();
   }
 
   const nerdctl: Nerdctl = {
     async exec(args) {
       calls.push(args.join(' '));
-      const [cmd, ...rest] = args;
-      switch (cmd) {
-        case 'run':
-          return handleRun(rest);
+      if (args[0] !== 'compose') return ok();
+      const [, , file, verb, ...rest] = args;
+      switch (verb) {
+        case 'up':
+          return handleUp(file!);
         case 'rm':
-          return handleRm(rest);
-        case 'inspect':
-          return handleInspect(rest);
-        case 'ps':
-          return handlePs(rest);
-        case 'network':
-          return handleNetwork(rest);
-        case 'update':
-          return handleUpdate(rest);
+          return handleRm(file!, rest);
+        case 'down':
+          return handleDown(file!);
         case 'exec':
-          return probeResults.get(rest[0]!) ?? ok();
+          return handleExec(rest);
         default:
           return ok();
       }
     },
-    async *stream(args) {
-      calls.push(args.join(' '));
-      for (const line of eventLines.splice(0)) yield line;
+  };
+
+  const api: ContainerdApi = {
+    async listContainers(): Promise<ApiContainer[]> {
+      calls.push('api.listContainers');
+      return [...containers.values()].map((c) => ({ id: c.id, image: c.image, labels: { ...c.labels } }));
+    },
+    async getContainer(id) {
+      calls.push(`api.getContainer ${id}`);
+      const c = [...containers.values()].find((x) => x.id === id);
+      return c ? { id: c.id, image: c.image, labels: { ...c.labels } } : undefined;
+    },
+    async listTasks(): Promise<ApiTask[]> {
+      calls.push('api.listTasks');
+      const tasks: ApiTask[] = [];
+      for (const c of containers.values()) {
+        if (!c.hasTask) continue;
+        tasks.push({
+          id: c.id,
+          status: c.running ? 'running' : 'stopped',
+          ...(c.running ? {} : { exitStatus: c.exitCode ?? 0 }),
+        });
+      }
+      return tasks;
+    },
+    subscribe(onEvent, onError) {
+      calls.push('api.subscribe');
+      subscriber = { onEvent, onError };
+      return () => {
+        if (subscriber?.onEvent === onEvent) subscriber = undefined;
+      };
+    },
+    close() {
+      calls.push('api.close');
     },
   };
 
   return {
     nerdctl,
+    api,
     calls,
     containers,
-    networks,
-    eventLines,
     probeResults,
-    idOf: (name: string): string => {
-      const c = containers.get(name);
-      if (!c) throw new Error(`fake containerd: no container named "${name}"`);
+    /** A process inside the container exiting on its own -- fires `/tasks/exit`. */
+    setExited: (service: string, exitCode: number): void => {
+      const c = containers.get(service);
+      if (!c) throw new Error(`fake containerd: no service "${service}"`);
+      c.running = false;
+      c.exitCode = exitCode;
+      emit({
+        topic: '/tasks/exit',
+        type: 'containerd.events.TaskExit',
+        containerId: c.id,
+        exitStatus: exitCode,
+      });
+    },
+    /** Something outside this process removed a container -- e.g. an operator running `nerdctl rm` by hand. */
+    externalRemove: (service: string): void => {
+      const c = containers.get(service);
+      if (!c) throw new Error(`fake containerd: no service "${service}"`);
+      removeAndEmit(c);
+    },
+    /** Fails the live subscription the way a dropped gRPC stream would -- `api.subscribe`'s only such signal. */
+    killStream: (error = new Error('stream dropped')): void => {
+      const s = subscriber;
+      subscriber = undefined;
+      s?.onError?.(error);
+    },
+    idOf: (service: string): string => {
+      const c = containers.get(service);
+      if (!c) throw new Error(`fake containerd: no service "${service}"`);
       return c.id;
     },
   };
 }
 
-// ---- argv: the sandbox, a member joining it, and the one in-place update ----
+// ---- a stable compose file per test ------------------------------------------
 
-describe('containerd runtime: argv', () => {
-  it('infraRunArgs runs the sandbox: publish and Pod labels live here, not on any member', () => {
-    const spec: PodSpec = {
-      name: 'api',
-      network: 'backend',
-      labels: { tier: 'web' },
-      publish: [
-        { host: 8080, target: 80 },
-        { host: 9000, target: 90, protocol: 'udp' },
-      ],
-      containers: [{ name: 'app', image: 'app:1' }],
-    };
-    expect(infraRunArgs(spec, 'pause:3.9')).toEqual([
-      'run',
-      '-d',
-      '--name',
-      'api',
-      '--restart=no',
-      '--pull=missing',
-      '--label',
-      'fiber-servo.managed=true',
-      '--label',
-      `fiber-servo.spec=${digest(spec)}`,
-      '--label',
-      `fiber-servo.spec-json=${encodeSpecLabel(spec)}`,
-      '--label',
-      'fiber-servo.pod=api',
-      '--label',
-      'fiber-servo.role=infra',
-      '--network',
-      'backend',
-      '-p',
-      '8080:80',
-      '-p',
-      '9000:90/udp',
-      '--label',
-      'tier=web',
-      'pause:3.9',
-    ]);
-  });
+const composeDirs: string[] = [];
 
-  it('memberRunArgs joins the sandbox with a single --network=container:<pod> token, and never publishes', () => {
-    const spec: ContainerSpec = {
-      name: 'app',
-      image: 'app:1',
-      env: { PORT: '80' },
-      command: ['node', 'server.js'],
-    };
-    expect(memberRunArgs('api', spec)).toEqual([
-      'run',
-      '-d',
-      '--name',
-      'api-app',
-      '--restart=no',
-      '--pull=missing',
-      '--label',
-      'fiber-servo.managed=true',
-      '--label',
-      `fiber-servo.spec=${digest(spec)}`,
-      '--label',
-      `fiber-servo.spec-json=${encodeSpecLabel(spec)}`,
-      '--label',
-      'fiber-servo.pod=api',
-      '--label',
-      'fiber-servo.container=app',
-      '--label',
-      'fiber-servo.role=member',
-      '--network=container:api',
-      '-e',
-      'PORT=80',
-      'app:1',
-      'node',
-      'server.js',
-    ]);
-    // ports are documentation, and even a Pod that publishes leaves the member alone.
-    expect(memberRunArgs('api', { ...spec, ports: [80] })).not.toContain('-p');
-  });
-
-  it('memberRunArgs applies initial cpu/memory with the same flags an update uses later', () => {
-    const spec: ContainerSpec = { name: 'app', image: 'app:1', resources: { cpu: 0.5, memory: '512m' } };
-    const args = memberRunArgs('api', spec);
-    expect(args).toContain('--cpus');
-    expect(args[args.indexOf('--cpus') + 1]).toBe('0.5');
-    expect(args).toContain('--memory');
-    expect(args[args.indexOf('--memory') + 1]).toBe('512m');
-  });
-
-  it('updateResourcesArgs is the one in-place mutation: nerdctl update --cpus/--memory', () => {
-    expect(updateResourcesArgs('api', 'app', { cpu: 0.5, memory: '512m' })).toEqual([
-      'update',
-      '--cpus',
-      '0.5',
-      '--memory',
-      '512m',
-      'api-app',
-    ]);
-    expect(updateResourcesArgs('api', 'app', { cpu: 1 })).toEqual(['update', '--cpus', '1', 'api-app']);
-  });
+afterEach(() => {
+  for (const dir of composeDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-// ---- creating and removing Pods ---------------------------------------------
+function tempComposeFile(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'fiber-servo-compose-'));
+  composeDirs.push(dir);
+  return join(dir, 'compose.json');
+}
 
-describe('containerd runtime: creating and removing Pods', () => {
-  it('createPod runs the sandbox then each member, and is idempotent for the same spec', async () => {
+function runtimeFor(
+  fc: ReturnType<typeof createFakeContainerd>,
+  extra: Partial<ContainerdRuntimeOptions> = {},
+) {
+  return createContainerdRuntime({
+    nerdctl: fc.nerdctl,
+    api: fc.api,
+    project: PROJECT,
+    composeFile: tempComposeFile(),
+    ...extra,
+  });
+}
+
+// ---- apply(): the two-step write path ----------------------------------------
+
+describe('containerd runtime: apply()', () => {
+  it('a fresh apply renders the file and runs exactly `compose -f <file> up -d --no-recreate`, no rm', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    const spec = podSpec();
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile });
 
-    await runtime.createPod(spec);
-    const runCalls = fc.calls.filter((c) => c.startsWith('run '));
-    expect(runCalls).toHaveLength(2);
-    expect(runCalls[0]).toContain('--name api ');
-    expect(runCalls[0]).toContain('fiber-servo.role=infra');
-    expect(runCalls[1]).toContain('--name api-app ');
-    expect(runCalls[1]).toContain('--network=container:api');
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
 
-    const callsBefore = fc.calls.length;
-    await runtime.createPod(spec); // same spec: idempotent
-    expect(fc.calls.filter((c) => c.startsWith('run ')).length).toBe(2); // no new run
-    expect(fc.calls.filter((c) => c.startsWith('rm ')).length).toBe(0);
-    expect(fc.calls.length).toBeGreaterThan(callsBefore); // it still checked, just did not act
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toEqual([
+      `compose -f ${composeFile} up -d --no-recreate`,
+    ]);
+    expect(fc.containers.has('app')).toBe(true);
+    expect(JSON.parse(readFileSync(composeFile, 'utf8'))).toEqual(model([{ name: 'app', image: 'app:1' }]));
   });
 
-  it('createPod replaces the whole Pod when the spec digest changes', async () => {
+  it('is idempotent for an unchanged model: `up` runs again, but nothing is removed or recreated', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    await runtime.createPod(podSpec());
-    await runtime.createPod(podSpec({ containers: [{ name: 'app', image: 'app:2' }] }));
+    const runtime = runtimeFor(fc);
+    const spec = model([{ name: 'app', image: 'app:1' }]);
 
-    expect(fc.calls.filter((c) => c.startsWith('rm ')).length).toBeGreaterThan(0);
+    await runtime.apply(spec);
+    const idBefore = fc.idOf('app');
+
+    fc.calls.length = 0;
+    await runtime.apply(spec); // same model, same digest
+
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toHaveLength(1); // `up` only, no `rm`
+    expect(fc.calls.some((c) => c.includes(' rm '))).toBe(false);
+    expect(fc.idOf('app')).toBe(idBefore); // not recreated
+  });
+
+  it('self-heals a killed container through `up --no-recreate` alone, without an rm', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    const spec = model([{ name: 'app', image: 'app:1' }]);
+    await runtime.apply(spec);
+    const idBefore = fc.idOf('app');
+
+    fc.setExited('app', 137); // killed from outside
+
+    fc.calls.length = 0;
+    await runtime.apply(spec); // same model: the runtime never even sees a "changed" service
+
+    expect(fc.calls.some((c) => c.includes(' rm '))).toBe(false);
+    expect(fc.idOf('app')).toBe(idBefore); // same container, just restarted
     const state = await runtime.inspect();
-    expect(state.pods.get('api')?.containers[0]?.image).toBe('app:2');
+    expect(state.containers.get('app')?.phase).toBe('running');
   });
 
-  it('createPod heals a member a crash left missing, without recreating the sandbox', async () => {
+  it('a changed service is removed with `rm -f -s <service>` before `up` recreates it, siblings untouched', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    const spec = podSpec({
-      containers: [
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile });
+    await runtime.apply(
+      model([
         { name: 'app', image: 'app:1' },
         { name: 'sidecar', image: 'proxy:1' },
-      ],
-    });
-    await runtime.createPod(spec);
-    fc.containers.delete('api-sidecar'); // the sandbox and `app` made it; `sidecar` did not
+      ]),
+    );
+    const sidecarId = fc.idOf('sidecar');
+    const appIdBefore = fc.idOf('app');
 
-    await runtime.createPod(spec); // same digest as before
-
-    expect(fc.containers.has('api-sidecar')).toBe(true);
-    expect(fc.calls.filter((c) => c.startsWith('run ') && c.includes('--name api ')).length).toBe(1);
-  });
-
-  it('removePod removes the sandbox and every member together, and is idempotent', async () => {
-    const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    await runtime.createPod(
-      podSpec({
-        containers: [
-          { name: 'app', image: 'app:1' },
-          { name: 'sidecar', image: 'proxy:1' },
-        ],
-      }),
+    fc.calls.length = 0;
+    await runtime.apply(
+      model([
+        { name: 'app', image: 'app:2' },
+        { name: 'sidecar', image: 'proxy:1' },
+      ]),
     );
 
-    await runtime.removePod('api');
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toEqual([
+      `compose -f ${composeFile} rm -f -s app`,
+      `compose -f ${composeFile} up -d --no-recreate`,
+    ]);
+    expect(fc.idOf('app')).not.toBe(appIdBefore); // replaced
+    expect(fc.idOf('sidecar')).toBe(sidecarId); // untouched
+    expect(fc.containers.get('app')?.image).toBe('app:2');
+  });
+
+  it('a service the model no longer declares is removed via the same `compose rm`, with a stub so the removal file still names it', async () => {
+    const fc = createFakeContainerd();
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile });
+    await runtime.apply(
+      model([
+        { name: 'app', image: 'app:1' },
+        { name: 'sidecar', image: 'proxy:1' },
+      ]),
+    );
+
+    fc.calls.length = 0;
+    const finalModel = model([{ name: 'app', image: 'app:1' }]); // sidecar dropped
+    await runtime.apply(finalModel);
+
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toEqual([
+      `compose -f ${composeFile} rm -f -s sidecar`,
+      `compose -f ${composeFile} up -d --no-recreate`,
+    ]);
+    expect(fc.containers.has('sidecar')).toBe(false);
+    expect(fc.containers.has('app')).toBe(true);
+    // The file on disk ends up exactly the final model -- the removal stub
+    // that made `rm` accept "sidecar" does not survive into what `up` sees.
+    expect(JSON.parse(readFileSync(composeFile, 'utf8'))).toEqual(finalModel);
+  });
+
+  it('a changed service and an orphaned one are removed together in one sorted `rm -f -s`', async () => {
+    const fc = createFakeContainerd();
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile });
+    await runtime.apply(
+      model([
+        { name: 'web', image: 'web:1' },
+        { name: 'app', image: 'app:1' },
+        { name: 'sidecar', image: 'proxy:1' },
+      ]),
+    );
+
+    fc.calls.length = 0;
+    await runtime.apply(
+      model([
+        { name: 'web', image: 'web:1' },
+        { name: 'app', image: 'app:2' },
+      ]),
+    ); // app changed, sidecar dropped
+
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toEqual([
+      `compose -f ${composeFile} rm -f -s app sidecar`, // sorted
+      `compose -f ${composeFile} up -d --no-recreate`,
+    ]);
+  });
+
+  it('down() runs exactly `compose -f <file> down` and removes everything', async () => {
+    const fc = createFakeContainerd();
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile });
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
+
+    fc.calls.length = 0;
+    await runtime.down();
+
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toEqual([`compose -f ${composeFile} down`]);
     expect(fc.containers.size).toBe(0);
-    expect((await runtime.inspect()).pods.has('api')).toBe(false);
-    expect(fc.calls.filter((c) => c.startsWith('rm ')).length).toBe(1); // one rm for the whole Pod
-
-    await expect(runtime.removePod('api')).resolves.toBeUndefined(); // already gone
-    await expect(runtime.removePod('never-existed')).resolves.toBeUndefined();
-    expect(fc.calls.filter((c) => c.startsWith('rm ')).length).toBe(1); // neither issued another rm
+    expect((await runtime.inspect()).containers.size).toBe(0);
   });
 
-  it('createContainer adds a member to a live sandbox, and throws for a Pod that does not exist', async () => {
+  it('down() is a no-op, issuing no nerdctl call at all, when apply() was never called', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    await runtime.createPod(podSpec());
+    const runtime = runtimeFor(fc);
 
-    await runtime.createContainer('api', { name: 'sidecar', image: 'proxy:1' });
-    expect(fc.containers.has('api-sidecar')).toBe(true);
-
-    await expect(runtime.createContainer('ghost', { name: 'x', image: 'x' })).rejects.toThrow(/fiber-servo:/);
-  });
-
-  it('removeContainer removes one member and leaves the rest, and is idempotent', async () => {
-    const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    await runtime.createPod(
-      podSpec({
-        containers: [
-          { name: 'app', image: 'app:1' },
-          { name: 'sidecar', image: 'proxy:1' },
-        ],
-      }),
-    );
-
-    await runtime.removeContainer('api', 'sidecar');
-    const pod = (await runtime.inspect()).pods.get('api');
-    expect(pod?.containers.map((c) => c.name)).toEqual(['app']);
-
-    await expect(runtime.removeContainer('api', 'sidecar')).resolves.toBeUndefined();
-    await expect(runtime.removeContainer('ghost', 'app')).resolves.toBeUndefined();
+    await expect(runtime.down()).resolves.toBeUndefined();
+    expect(fc.calls.filter((c) => c.startsWith('compose'))).toHaveLength(0);
   });
 });
 
-// ---- inspect(): the resync path ----------------------------------------------
+// ---- inspect(): grouping by Compose's own labels ------------------------------
 
 describe('containerd runtime: inspect()', () => {
-  it('groups members under their Pod and fills ip, specDigest, spec and phase', async () => {
+  it('groups by com.docker.compose.service and fills image, networks, specDigest and phase', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    const spec = podSpec({
-      network: 'backend',
-      containers: [
-        { name: 'app', image: 'app:1' },
-        { name: 'sidecar', image: 'proxy:1' },
-      ],
-    });
-    await runtime.createPod(spec);
+    const runtime = runtimeFor(fc);
+    const spec = model([{ name: 'app', image: 'app:1', network: 'backend' }], [{ name: 'backend' }]);
+    await runtime.apply(spec);
 
     const state = await runtime.inspect();
-    const pod = state.pods.get('api');
-    expect(pod?.phase).toBe('running');
-    expect(pod?.specDigest).toBe(digest(spec));
-    expect(pod?.ip).toMatch(/^10\.88\.0\./);
-    expect(pod?.containers.map((c) => c.name).sort()).toEqual(['app', 'sidecar']);
-    expect(pod?.containers.every((c) => c.phase === 'running')).toBe(true);
-    expect(pod?.spec).toEqual(spec); // reconstructed from labels, across the whole Pod
+    const app = state.containers.get('app');
+    expect(app?.phase).toBe('running');
+    expect(app?.image).toBe('app:1');
+    expect(app?.networks).toEqual(['backend']);
+    expect(app?.specDigest).toBe(spec.services['app']!.labels![SPEC_LABEL]);
+    expect(app?.labels[MANAGED_LABEL]).toBe('true');
+    expect(app?.labels[COMPOSE_PROJECT_LABEL]).toBe(PROJECT);
   });
 
-  it('reflects a live nerdctl update in the reconstructed spec, without any label ever being rewritten', async () => {
+  it('a stopped task reads as exited with its exit code', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
-    await runtime.createPod(podSpec());
+    const runtime = runtimeFor(fc);
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
+    fc.setExited('app', 7);
 
-    await runtime.updateContainerResources('api', 'app', { cpu: 0.5, memory: '512m' });
-
-    const pod = (await runtime.inspect()).pods.get('api');
-    expect(pod?.spec?.containers[0]).toMatchObject({ name: 'app', resources: { cpu: 0.5, memory: '512m' } });
+    const state = await runtime.inspect();
+    expect(state.containers.get('app')).toMatchObject({ phase: 'exited', exitCode: 7 });
   });
 
-  it('a Pod with no fiber-servo label at all reports specDigest and spec as undefined, not a crash', async () => {
+  it('a container from a different project (or with no compose labels at all) is not surfaced', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc);
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
     fc.containers.set('stray', {
       id: 'f'.repeat(64),
-      name: 'stray',
-      labels: {}, // not managed at all: inspect() must not even surface it
+      service: 'stray',
+      labels: { [COMPOSE_PROJECT_LABEL]: 'someone-elses-project', [COMPOSE_SERVICE_LABEL]: 'stray' },
       image: 'whatever',
       running: true,
+      hasTask: true,
     });
 
     const state = await runtime.inspect();
-    expect(state.pods.size).toBe(0);
+    expect(state.containers.has('stray')).toBe(false);
+    expect(state.containers.size).toBe(1);
+  });
+
+  it('recovers specDigest across a fresh runtime instance -- purely from labels, no state carried over', async () => {
+    const fc = createFakeContainerd();
+    const composeFile = tempComposeFile();
+    const runtime1 = createContainerdRuntime({
+      nerdctl: fc.nerdctl,
+      api: fc.api,
+      project: PROJECT,
+      composeFile,
+    });
+    const spec = model([{ name: 'app', image: 'app:1' }]);
+    await runtime1.apply(spec);
+
+    // A second runtime over the same containerd state simulates a process
+    // restart: its idIndex starts empty and can only be rebuilt from labels.
+    const runtime2 = createContainerdRuntime({
+      nerdctl: fc.nerdctl,
+      api: fc.api,
+      project: PROJECT,
+      composeFile,
+    });
+    const state = await runtime2.inspect();
+    expect(state.containers.get('app')?.specDigest).toBe(spec.services['app']!.labels![SPEC_LABEL]);
+  });
+
+  // `compose up` on a file with no services is a hard error, not a no-op --
+  // and an empty application is exactly what the last pass of `stop()` asks
+  // for. Removing everything must not then fail on the way out.
+  it('applies an empty model by removing what is there, without calling `up` on nothing', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
+    fc.calls.length = 0;
+
+    await runtime.apply(model([]));
+
+    const nerdctlCalls = fc.calls.filter((c) => !c.startsWith('api.'));
+    expect(nerdctlCalls.some((c) => c.includes('rm -f -s app'))).toBe(true);
+    expect(nerdctlCalls.some((c) => c.includes('up'))).toBe(false);
+    expect((await runtime.inspect()).containers.size).toBe(0);
+  });
+
+  // A model for one project applied by an adapter reading another is the
+  // failure with no symptom: every inspect() filters for a project nothing
+  // was created under, so the plan reports the whole application missing on
+  // every pass and the loop reapplies it for ever, silently.
+  it('refuses a model whose project is not the one it reads back, rather than looping for ever', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    const foreign = toComposeApplication([{ name: 'app', image: 'app:1' }], [], 'somebody-elses-project');
+    await expect(runtime.apply(foreign)).rejects.toThrow(
+      /reads project "fiber-servo".*"somebody-elses-project"/s,
+    );
+    expect(fc.calls).toEqual([]); // and it never touched the machine
   });
 });
 
 // ---- events -> RuntimeEvent ---------------------------------------------------
 
 describe('containerd runtime: events -> RuntimeEvent', () => {
-  it('translates a member exit, a sandbox start, and a sandbox delete', async () => {
+  it('translates a task start into a running container, and a task exit into an exited one with its exit code', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
-    await runtime.createPod(podSpec());
-    const infraId = fc.idOf('api');
-    const appId = fc.idOf('api-app');
-
-    fc.eventLines.push(
-      JSON.stringify({
-        ID: appId,
-        Topic: '/tasks/exit',
-        Event: JSON.stringify({ container_id: appId, id: appId, exit_status: 1 }),
-      }),
-      JSON.stringify({
-        ID: infraId,
-        Topic: '/tasks/start',
-        Event: JSON.stringify({ container_id: infraId }),
-      }),
-    );
-    fc.containers.get('api-app')!.running = false;
-    fc.containers.get('api-app')!.exitCode = 1;
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
 
     const events: RuntimeEvent[] = [];
-    const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 20));
-    unsubscribe();
+    const unsubscribe = runtime.subscribe((e) => void events.push(e));
+    await new Promise((r) => setTimeout(r, 10)); // let the initial (empty) resync land
 
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }])); // -> /tasks/start, observed live since we're already subscribed
+    await new Promise((r) => setTimeout(r, 10));
     expect(events).toContainEqual({
       type: 'container',
-      pod: 'api',
-      container: expect.objectContaining({ name: 'app', phase: 'exited', exitCode: 1 }),
+      container: expect.objectContaining({ name: 'app', phase: 'running' }),
     });
-    // The sandbox starting does NOT make the Pod running: its only member has
-    // exited, and a Pod's phase is derived from its containers, not from the
-    // sandbox. Asserting `exited` here is the point of the case.
+
+    fc.setExited('app', 3); // -> /tasks/exit
+    await new Promise((r) => setTimeout(r, 10));
     expect(events).toContainEqual({
-      type: 'pod',
-      pod: expect.objectContaining({ name: 'api', phase: 'exited' }),
+      type: 'container',
+      container: expect.objectContaining({ name: 'app', phase: 'exited', exitCode: 3 }),
     });
+
+    unsubscribe();
   });
 
-  it('translates a sandbox delete as the whole Pod disappearing', async () => {
+  it('a /containers/delete is attributed by diffing the id index, not by an id the event never carries', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
-    await runtime.createPod(podSpec());
-    const infraId = fc.idOf('api');
-
-    fc.eventLines.push(
-      JSON.stringify({ ID: infraId, Topic: '/containers/delete', Event: JSON.stringify({ id: infraId }) }),
-    );
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
+    await runtime.inspect(); // populate the id index the way a resync at subscribe time also would
 
     const events: RuntimeEvent[] = [];
-    const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 20));
-    unsubscribe();
+    const unsubscribe = runtime.subscribe((e) => void events.push(e));
+    await new Promise((r) => setTimeout(r, 10));
 
-    expect(events).toContainEqual({ type: 'pod-removed', name: 'api' });
+    fc.externalRemove('app'); // e.g. an operator running `nerdctl rm` by hand
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(events).toContainEqual({ type: 'container-removed', name: 'app' });
+    unsubscribe();
   });
 
-  it('falls back to a periodic inspect() resync once the event stream ends', async () => {
+  it('emits a resync from a full inspect() when a subscriber attaches, and again once the stream dies', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, reconnectDelayMs: 5 });
-    await runtime.createPod(podSpec());
-    // No lines queued: the fake's `stream` ends immediately, every time it is opened.
+    const runtime = runtimeFor(fc, { reconnectDelayMs: 5 });
+    await runtime.apply(model([{ name: 'app', image: 'app:1' }]));
 
     const events: RuntimeEvent[] = [];
-    const unsubscribe = runtime.subscribe((e) => events.push(e));
-    await new Promise((r) => setTimeout(r, 30));
-    unsubscribe();
-
-    const resyncs = events.filter((e) => e.type === 'resync');
-    expect(resyncs.length).toBeGreaterThan(0);
-    expect(resyncs[0]).toMatchObject({
+    const unsubscribe = runtime.subscribe((e) => void events.push(e));
+    await new Promise((r) => setTimeout(r, 10));
+    const afterAttach = events.filter((e) => e.type === 'resync').length;
+    expect(afterAttach).toBeGreaterThan(0);
+    expect(events.find((e) => e.type === 'resync')).toMatchObject({
       type: 'resync',
-      state: { pods: expect.any(Map), networks: expect.any(Map) },
+      containers: expect.any(Array),
     });
+
+    fc.killStream(); // the only signal a real dropped gRPC stream gives, too
+    await new Promise((r) => setTimeout(r, 20));
+    expect(events.filter((e) => e.type === 'resync').length).toBeGreaterThan(afterAttach);
+
+    unsubscribe();
   });
 });
 
 // ---- readiness -----------------------------------------------------------------
+//
+// `ComposeApplication` has no field for `ContainerSpec.readiness` at all (see
+// `compose.ts`'s `READINESS_LABEL` doc) -- so the model handed to `apply()`
+// only carries a probe when its `labels` include the adapter's own
+// `fiber-servo.readiness` convention, which is what `withReadiness` attaches
+// here the way an upstream builder would have to.
 
 describe('containerd runtime: readiness prober', () => {
-  it('execs the probe until it exits 0, then reports ready via a container event', async () => {
+  it('probes via `compose -f <file> exec <service> <probe...>` until it exits 0, then reports ready', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl, probeTickMs: 5 });
-    fc.probeResults.set('api-app', fail('not ready yet'));
-    await runtime.createPod(
-      // `intervalMs` matters: it defaults to 2000, which would put the second
-      // attempt well past the end of this test.
-      podSpec({
-        containers: [{ name: 'app', image: 'app:1', readiness: { exec: ['pg_isready'], intervalMs: 5 } }],
-      }),
-    );
+    const composeFile = tempComposeFile();
+    const runtime = runtimeFor(fc, { composeFile, probeTickMs: 5 });
+    fc.probeResults.set('app', fail('not ready yet'));
+    const spec = withReadiness(model([{ name: 'app', image: 'app:1' }]), 'app', {
+      exec: ['pg_isready'],
+      intervalMs: 5, // matters: the default (2000) would put the second attempt past this test's end
+    });
+    await runtime.apply(spec);
 
     const events: RuntimeEvent[] = [];
-    const unsubscribe = runtime.subscribe((e) => events.push(e));
+    const unsubscribe = runtime.subscribe((e) => void events.push(e));
     await new Promise((r) => setTimeout(r, 15));
     expect(events.some((e) => e.type === 'container' && e.container.ready === true)).toBe(false);
 
-    fc.probeResults.set('api-app', ok());
+    fc.probeResults.set('app', ok());
     await new Promise((r) => setTimeout(r, 15));
     unsubscribe();
 
     expect(events).toContainEqual({
       type: 'container',
-      pod: 'api',
       container: expect.objectContaining({ name: 'app', ready: true }),
     });
-    expect(fc.calls).toContainEqual('exec api-app pg_isready');
+    expect(fc.calls).toContainEqual(`compose -f ${composeFile} exec app pg_isready`);
   });
-});
 
-// ---- networks --------------------------------------------------------------------
-
-describe('containerd runtime: networks', () => {
-  it('creates and removes networks idempotently, and lists subnets back through inspect()', async () => {
+  it('a service replaced by apply() starts unready again; an unchanged one keeps its ready state', async () => {
     const fc = createFakeContainerd();
-    const runtime = createContainerdRuntime({ nerdctl: fc.nerdctl });
+    const runtime = runtimeFor(fc, { probeTickMs: 5 });
+    fc.probeResults.set('app', ok());
+    fc.probeResults.set('sidecar', ok());
+    const spec = withReadiness(
+      withReadiness(
+        model([
+          { name: 'app', image: 'app:1' },
+          { name: 'sidecar', image: 'proxy:1' },
+        ]),
+        'app',
+        {
+          exec: ['true'],
+          intervalMs: 5,
+        },
+      ),
+      'sidecar',
+      { exec: ['true'], intervalMs: 5 },
+    );
+    await runtime.apply(spec);
 
-    await runtime.createNetwork({ name: 'backend', subnet: '10.9.0.0/24' });
-    expect((await runtime.inspect()).networks.get('backend')).toEqual({
-      name: 'backend',
-      subnet: '10.9.0.0/24',
-    });
+    const events: RuntimeEvent[] = [];
+    const unsubscribe = runtime.subscribe((e) => void events.push(e));
+    await new Promise((r) => setTimeout(r, 15)); // both go ready
+    unsubscribe();
 
-    await expect(runtime.createNetwork({ name: 'backend', subnet: '10.9.0.0/24' })).resolves.toBeUndefined();
-    expect(fc.calls.filter((c) => c.startsWith('network create')).length).toBe(1);
+    const nextSpec = withReadiness(
+      withReadiness(
+        model([
+          { name: 'app', image: 'app:2' },
+          { name: 'sidecar', image: 'proxy:1' },
+        ]),
+        'app',
+        {
+          exec: ['true'],
+          intervalMs: 5,
+        },
+      ),
+      'sidecar',
+      { exec: ['true'], intervalMs: 5 },
+    );
+    await runtime.apply(nextSpec); // app replaced (image changed), sidecar untouched
 
-    await runtime.removeNetwork('backend');
-    expect((await runtime.inspect()).networks.has('backend')).toBe(false);
-    await expect(runtime.removeNetwork('backend')).resolves.toBeUndefined();
-    await expect(runtime.removeNetwork('never-existed')).resolves.toBeUndefined();
+    const state = await runtime.inspect();
+    expect(state.containers.get('app')?.ready).toBe(false); // recreated: unready until probed again
+    expect(state.containers.get('sidecar')?.ready).toBe(true); // never touched: still ready
   });
 });

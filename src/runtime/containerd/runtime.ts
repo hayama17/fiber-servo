@@ -1,112 +1,121 @@
 /**
- * containerd as a `Runtime` (`../types.ts`): the orchestration engine. Every
- * other file in this directory is a helper this one calls.
+ * containerd as a `Runtime` (`../types.ts`), driven through `nerdctl compose`.
  *
- * ---- The central problem: being a Pod on nerdctl -----------------------
+ * ---- apply() is two steps because `compose up` alone cannot replace -------
  *
- * containerd has no Pod. What this adapter does is exactly what CRI does on
- * top of the same primitive: fake one out of two containers.
+ * `nerdctl compose -f <file> up -d --no-recreate` is idempotent (verified
+ * live against nerdctl 2.1.2: zero re-creations, container ids stable when
+ * nothing changed) and self-healing (a killed container comes back via
+ * `nerdctl start`, for free). What it will never do is notice that a
+ * *running* service's image or command changed -- `--no-recreate` means
+ * exactly that, literally. So a changed spec has to be evicted before `up`
+ * ever sees it:
  *
- *   - An "infra" (sandbox) container, named after the Pod itself, that does
- *     nothing but hold a network namespace open (`registry.k8s.io/pause`).
- *   - One real container per `ContainerSpec`, named `<pod>-<container>`,
- *     started with `--network=container:<pod>` instead of a network of its
- *     own -- that flag is what makes it join the sandbox's namespace rather
- *     than get one, and it is the single most important line in this file.
+ *   a. render `model` to `composeFile` -- a stable path, not a temp file:
+ *      `down()` has to find the same project later, possibly from a fresh
+ *      process that never called `apply()`.
+ *   b. `nerdctl compose -f <file> rm -f -s <service>` for every service whose
+ *      recorded `fiber-servo.spec` digest (`SPEC_LABEL`, from `compose.ts`)
+ *      differs from what `model` now asks for, plus every service `model` no
+ *      longer declares at all (`changedServices`/`orphanedServices` in
+ *      `compose.ts`, fed from this adapter's own `inspect()`).
+ *   c. `nerdctl compose -f <file> up -d --no-recreate` -- creates whatever
+ *      step (b) just evicted, creates whatever is new, restarts whatever was
+ *      merely stopped. One command does all three; nothing here has to tell
+ *      them apart.
  *
- * The consequence that follows directly from that flag, and that trips up
- * every first attempt at this: **a host port can only be published on
- * whichever container owns the network namespace.** Once a container joins
- * one with `--network=container:X`, it has no namespace of its own left to
- * publish a port on -- `nerdctl` refuses `-p` there outright. So
- * `PodTemplate.publish` is applied to the *infra* container's `run`
- * (`naming.ts`'s `infraRunArgs`), never to a member's, no matter which
- * member's process is the one actually listening. `ObservedPod.ip` follows
- * the same logic: it is the infra container's address, because that address
- * is the Pod's address -- every member answers on it too, by construction.
+ * **A measured wrinkle step (b) has to work around.** `compose rm -s
+ * <service>` validates its target against the services declared in the file
+ * loaded with `-f` -- verified live: pointed at a file that no longer has the
+ * key, nerdctl fails outright with `no such service: b`, it does not fall
+ * back to finding the container by label. An orphaned service is by
+ * definition gone from `model`, so it would never appear in the file `apply`
+ * is about to write. `withRemovalStubs` below works around this by adding a
+ * bare `{ image }` entry for each orphan -- enough for `rm` to accept the
+ * name, nothing that could make it try to pull or start anything -- and the
+ * file gets rewritten to the *true* desired model immediately afterwards, so
+ * `up` never sees the stub and never recreates what `rm` just removed. This
+ * is not one of the facts handed down for this rewrite; it was checked
+ * against a real daemon specifically because guessing it would have repeated
+ * the mistake decision 29 already paid for once (a fake answering "no such
+ * network", a string real nerdctl never emits).
  *
- * Everything else follows from having two kinds of container instead of one:
+ * ---- reads stay on containerd's own API -------------------------------------
  *
- *   - `createPod` creates the sandbox, then every member, in that order (a
- *     member cannot join a namespace that does not exist yet); `removePod`
- *     removes every container carrying the Pod's `POD_LABEL`, sandbox
- *     included, found with one `ps --filter` rather than a remembered list.
- *   - Adoption is by spec digest (decision 10 in `docs/decisions.md`), same
- *     as everywhere else in this project: every resource this adapter
- *     creates is labelled with `digest(spec)` of *that resource's own*
- *     spec -- the whole `PodSpec` on the sandbox, one `ContainerSpec` per
- *     member -- so a restarted process recognises what it already made
- *     instead of recreating it. `MANAGED_LABEL`/`POD_LABEL`/`ROLE_LABEL`
- *     (all defined in `nerdctl.ts`) are what let `inspect()` tell "ours" from
- *     "not ours" and "sandbox" from "member" out of a flat `ps -a` listing,
- *     and group members back under their Pod.
- *   - `ObservedPod.spec` is reconstructed from labels too, but *not* simply
- *     read back from one label -- see the comment above `reconstructPodSpec`
- *     in `parse.ts` for why (labels cannot be rewritten once a container
- *     exists, so a per-resource label plus a live cgroup read stands in for
- *     that instead).
+ * `inspect()` and `subscribe()` never shell out. `api.listContainers()` /
+ * `api.listTasks()` / `api.subscribe()` (`api.ts`) are containerd's own gRPC
+ * read path, unchanged by the move to Compose -- a container is still a
+ * container, and `com.docker.compose.project` / `com.docker.compose.service`
+ * (`compose.ts`) are just two more labels on it. `nerdctl/networks` is a
+ * label too, so a container's network membership comes from the same
+ * `listContainers()` call, no CNI file reading needed (the old adapter's
+ * `cni.ts` -- Compose owns network lifecycle now, and `ObservedState` has no
+ * top-level networks to read back at all; see `types.ts`).
  *
- * ---- Staying observable without trusting one source forever ------------
+ * `namespace` has to reach both halves identically -- nerdctl's `--namespace`
+ * flag and containerd's gRPC metadata -- or writes and reads would silently
+ * talk to two different containerd namespaces. `index.ts` computes it once
+ * and hands the same string to both seams; nothing in this file derives it a
+ * second time.
  *
- * `subscribe()` streams `nerdctl events` and translates lines as they
- * arrive, but a process that only ever streamed would go blind the moment
- * that stream ends (containerd restarting, the socket dropping) without
- * knowing what it missed. So the event loop, on any such end, resyncs fully
- * with one `inspect()` and emits it as a `resync` event before it tries to
- * reattach -- see `runEventLoop`. The readiness prober runs alongside it,
- * `nerdctl exec`-ing each container's probe until it exits 0 (decision 15).
+ * ---- staying observable without trusting one source forever ----------------
+ *
+ * Same discipline as before: `subscribe()` streams `api.subscribe` and
+ * translates events as they arrive, but resyncs fully with one `inspect()`
+ * both when a subscriber first attaches and whenever the stream ends, before
+ * trying to reattach (`runEventLoop`). `api.subscribe` already serialises
+ * deliveries to the handler passed to it (see its contract in `api.ts`), so
+ * `attachOnce` below does not rebuild that ordering -- it only has to route a
+ * handler failure into `finish` so the loop can resync and reattach.
+ *
+ * The readiness prober runs alongside it. It cannot be delegated to Compose:
+ * nerdctl's compose does not implement the Compose spec's `healthcheck` at
+ * all (verified: `up` accepts one in the file and silently ignores it), so
+ * "is this container answering yet" has to be asked directly, the same way
+ * the pre-Compose adapter asked it -- `nerdctl compose exec <service>
+ * <probe...>` (or plain `nerdctl exec <container>`; this file uses the
+ * former so a probe target is a service name, the same identity everything
+ * else in this file uses). The probe definition itself rides in the service's
+ * labels, under `compose.ts`'s `READINESS_LABEL` -- the only channel there
+ * is, since `apply()` is handed a `ComposeApplication` and nothing more.
  */
-import type { ContainerSpec, NetworkSpec, PodSpec, ResourceLimits } from '../../resources.js';
-import { digest } from '../../resources.js';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import {
+  changedServices,
+  COMPOSE_PROJECT_LABEL,
+  COMPOSE_SERVICE_LABEL,
+  orphanedServices,
+  renderCompose,
+  type ComposeApplication,
+  type ComposeService,
+} from '../../compose.js';
+import type { ReadinessProbe } from '../../resources.js';
 import type {
   ObservedContainer,
-  ObservedNetwork,
-  ObservedPod,
   ObservedState,
   Runtime,
   RuntimeEvent,
   RuntimeEventListener,
   Unsubscribe,
 } from '../types.js';
-import {
-  CONTAINER_LABEL,
-  MANAGED_LABEL,
-  POD_LABEL,
-  ROLE_LABEL,
-  SPEC_LABEL,
-  type ExecResult,
-  type Nerdctl,
-} from './nerdctl.js';
-import {
-  DEFAULT_SANDBOX_IMAGE,
-  infraName,
-  infraRunArgs,
-  memberName,
-  memberRunArgs,
-  networkCreateArgs,
-  updateResourcesArgs,
-} from './naming.js';
-import {
-  bytesToMemory,
-  decodeSpecLabel,
-  derivePodPhase,
-  interpretEventRow,
-  isManaged,
-  nanoCpusToCpu,
-  parseJsonSafe,
-  parsePsRow,
-  phaseFromStateStatus,
-  reconstructPodSpec,
-  toObservedContainer,
-  type EventRow,
-  type ManagedRow,
-} from './parse.js';
+import type { ExecResult, Nerdctl } from './nerdctl.js';
+import type { ApiContainer, ApiEvent, ApiTask, ContainerdApi } from './api.js';
+import { decodeReadiness, READINESS_LABEL, toObservedContainer } from './parse.js';
 
 export interface ContainerdRuntimeOptions {
-  /** The process-execution seam; see `nerdctl.ts`. Tests inject a fake here. */
+  /** The process-execution seam for `compose`/`exec`; see `nerdctl.ts`. Tests inject a fake here. */
   nerdctl: Nerdctl;
-  /** Image for every Pod's sandbox container. Must do nothing but hold a network namespace open. Default: `DEFAULT_SANDBOX_IMAGE`. */
-  sandboxImage?: string;
+  /** The gRPC read seam; see `api.ts`. Tests inject a fake here too. */
+  api: ContainerdApi;
+  /** The Compose project every container this adapter manages belongs to. */
+  project: string;
+  /**
+   * Where the rendered model is written. Must be a stable path: `apply`
+   * writes it and `down` needs the very same file later, possibly from a
+   * process that never called `apply` in this run at all.
+   */
+  composeFile: string;
   log?: (line: string) => void;
   onError?: (error: Error) => void;
   /** How often the readiness prober looks for containers due for a check. Default 250. */
@@ -116,42 +125,31 @@ export interface ContainerdRuntimeOptions {
   now?: () => number;
 }
 
-/** What the id index remembers about one containerd id, so an event can be resolved without an `inspect` on the hot path. */
-type Tracked = { role: 'infra'; pod: string } | { role: 'member'; pod: string; container: string };
-
 interface ReadinessTarget {
-  pod: string;
-  container: string;
-  probe: NonNullable<ContainerSpec['readiness']>;
-  /** Local latch: once true, the prober leaves this container alone until it is recreated. */
+  probe: ReadinessProbe;
+  /** Local latch: once true, the prober leaves this service alone until it is recreated. */
   ready: boolean;
 }
 
-interface NetworkRow {
-  Name: string;
-  Labels?: string;
-}
-
 export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runtime {
-  const { nerdctl } = options;
-  const sandboxImage = options.sandboxImage ?? DEFAULT_SANDBOX_IMAGE;
+  const { nerdctl, api, project, composeFile } = options;
   const log = options.log ?? (() => {});
   const onError = options.onError ?? ((e: Error) => console.error(e));
   const probeTickMs = options.probeTickMs ?? 250;
   const reconnectDelayMs = options.reconnectDelayMs ?? 1000;
   const now = options.now ?? (() => Date.now());
 
-  /** containerd id -> what it is. Populated by every `run` this process does, and by every `ps`/`inspect` sync. */
-  const idIndex = new Map<string, Tracked>();
-  /** Ids confirmed to carry no fiber-servo label, cached so a foreign container is inspected at most once. */
+  /** containerd id -> Compose service name. Populated by every list/resync and by `resolveId` on demand. */
+  const idIndex = new Map<string, string>();
+  /** Ids confirmed to belong to a different project (or no project at all), cached so they are looked up at most once. */
   const notOurs = new Set<string>();
-  /** Runtime member name -> its readiness schedule. The only place probe config lives; see `parse.ts`'s recorded-spec note. */
+  /** Service name -> its readiness schedule. See `compose.ts`'s `READINESS_LABEL` doc for where this comes from. */
   const readinessTargets = new Map<string, ReadinessTarget>();
   const listeners = new Set<RuntimeEventListener>();
   let controller: AbortController | undefined;
   let revision = 0;
 
-  // ---- process execution ---------------------------------------------------
+  // ---- process execution -----------------------------------------------------
 
   async function call(args: readonly string[]): Promise<ExecResult> {
     log(`$ nerdctl ${args.join(' ')}`);
@@ -160,18 +158,6 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
 
   function fail(res: ExecResult, what: string): Error {
     return new Error(`nerdctl ${what} failed (exit ${res.code}): ${res.stderr.trim() || res.stdout.trim()}`);
-  }
-
-  function isNotFound(res: ExecResult): boolean {
-    return /no such|not found/i.test(res.stderr);
-  }
-
-  function lastLine(text: string): string {
-    return text.trim().split('\n').at(-1) ?? '';
-  }
-
-  function isContainerId(text: string): boolean {
-    return /^[0-9a-f]{12,64}$/.test(text);
   }
 
   function notify(event: RuntimeEvent): void {
@@ -185,408 +171,298 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     }
   }
 
-  // ---- single-container inspection -----------------------------------------
-
-  interface Inspected {
-    id: string;
-    specDigest: string;
+  function writeModel(app: ComposeApplication): void {
+    mkdirSync(dirname(composeFile), { recursive: true });
+    writeFileSync(composeFile, renderCompose(app));
   }
 
-  /** Presence + the resource's own `SPEC_LABEL`. `specDigest` is `''` for a container that exists but carries no such label -- see `createPod`. */
-  async function inspectContainer(name: string): Promise<Inspected | null> {
-    const res = await call(['inspect', '--format', `{{.Id}} {{index .Config.Labels "${SPEC_LABEL}"}}`, name]);
-    if (res.code !== 0) return null;
-    const [id = '', specDigest = ''] = res.stdout.trim().split(/\s+/);
-    return { id, specDigest };
+  /**
+   * `model` plus a minimal stub entry for each service in `orphaned` -- just
+   * enough for `compose rm -f -s` to accept the name; see the file doc for
+   * why this exists at all. The stub's image is whatever this service was
+   * last observed running, purely so the rendered file reads sensibly to a
+   * human glancing at it; `rm` never resolves or starts it.
+   */
+  function withRemovalStubs(
+    model: ComposeApplication,
+    orphaned: readonly string[],
+    lastImage: ReadonlyMap<string, string>,
+  ): ComposeApplication {
+    if (orphaned.length === 0) return model;
+    const stubs: Record<string, ComposeService> = {};
+    for (const name of orphaned) stubs[name] = { image: lastImage.get(name) ?? 'scratch' };
+    return { ...model, services: { ...model.services, ...stubs } };
   }
 
-  async function infraIp(name: string): Promise<string | undefined> {
-    const res = await call(['inspect', '--format', '{{.NetworkSettings.IPAddress}}', name]);
-    if (res.code !== 0) return undefined;
-    return res.stdout.trim() || undefined;
+  // ---- reading containers -----------------------------------------------------
+
+  /** The Compose service name a containerd row belongs to, or `undefined` if it is not this adapter's project. */
+  function serviceOf(row: ApiContainer): string | undefined {
+    if (row.labels[COMPOSE_PROJECT_LABEL] !== project) return undefined;
+    return row.labels[COMPOSE_SERVICE_LABEL];
   }
 
-  async function inspectMemberContainer(
-    pod: string,
-    container: string,
-  ): Promise<ObservedContainer | undefined> {
-    const name = memberName(pod, container);
-    const res = await call([
-      'inspect',
-      '--format',
-      '{{.Id}} {{.State.Status}} {{.State.ExitCode}} {{.Config.Image}}',
-      name,
-    ]);
-    if (res.code !== 0) return undefined;
-    const [id = '', status = '', exitCodeRaw = '', image = ''] = res.stdout.trim().split(/\s+/);
-    const phase = phaseFromStateStatus(status);
-    return {
-      name: container,
-      id,
-      phase,
-      exitCode: phase === 'exited' && exitCodeRaw !== '' ? Number(exitCodeRaw) : undefined,
-      ready: readinessTargets.get(name)?.ready,
-      image: image || undefined,
-    };
-  }
-
-  /** Live cgroup limits for a batch of member names, one `inspect` call for all of them (same trick `listNetworks` uses for subnets). */
-  async function liveResources(names: readonly string[]): Promise<Map<string, ResourceLimits>> {
-    const out = new Map<string, ResourceLimits>();
-    if (names.length === 0) return out;
-    const res = await call([
-      'inspect',
-      '--format',
-      '{{.Name}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}',
-      ...names,
-    ]);
-    if (res.code !== 0) return out; // best-effort: a Pod mid-removal must not fail the whole inspect
-    for (const line of res.stdout.trim().split('\n')) {
-      if (!line.trim()) continue;
-      const [rawName, cpuRaw, memRaw] = line.trim().split(/\s+/);
-      const name = (rawName ?? '').replace(/^\//, '');
-      const cpu = nanoCpusToCpu(cpuRaw);
-      const memory = bytesToMemory(memRaw);
-      if (name && (cpu !== undefined || memory !== undefined)) out.set(name, { cpu, memory });
+  async function readProjectContainers(): Promise<ObservedContainer[]> {
+    const [rows, tasks] = await Promise.all([api.listContainers(), api.listTasks()]);
+    const taskById = new Map(tasks.map((t) => [t.id, t] as const));
+    const at = now();
+    const result: ObservedContainer[] = [];
+    for (const row of rows) {
+      const service = serviceOf(row);
+      if (!service) continue;
+      idIndex.set(row.id, service);
+      result.push(toObservedContainer(row, taskById.get(row.id), readinessTargets.get(service)?.ready, at));
     }
-    return out;
+    return result;
   }
 
-  // ---- whole-Pod inspection --------------------------------------------------
-
-  async function findPodRows(pod: string): Promise<ManagedRow[]> {
-    const res = await call([
-      'ps',
-      '-a',
-      '--no-trunc',
-      '--filter',
-      `label=${POD_LABEL}=${pod}`,
-      '--format',
-      '{{json .}}',
-    ]);
-    if (res.code !== 0) return [];
-    return res.stdout
-      .split('\n')
-      .map(parsePsRow)
-      .filter((r): r is ManagedRow => r !== null && r.pod === pod);
-  }
-
-  async function buildObservedPod(pod: string, rows: readonly ManagedRow[]): Promise<ObservedPod> {
-    const infraRow = rows.find((r) => r.role === 'infra');
-    const memberRows = rows.filter((r) => r.role === 'member');
-    const ip = infraRow ? await infraIp(infraRow.name) : undefined;
-    const resources = await liveResources(memberRows.map((r) => r.name));
-    const containers = memberRows.map((r) => toObservedContainer(r, readinessTargets.get(r.name)?.ready));
-    return {
-      name: pod,
-      id: infraRow?.id,
-      phase: derivePodPhase(infraRow?.phase ?? 'exited', containers),
-      ip,
-      labels: infraRow?.labels ?? {},
-      specDigest: infraRow?.specDigest,
-      spec: reconstructPodSpec(infraRow, memberRows, resources),
-      containers,
-      at: now(),
-    };
-  }
-
-  async function inspectPod(pod: string): Promise<ObservedPod | undefined> {
-    const rows = await findPodRows(pod);
-    return rows.length === 0 ? undefined : buildObservedPod(pod, rows);
-  }
-
-  /** Every container belonging to `pod` (sandbox and members alike), removed in one `rm -f`. Returns whether anything was there to remove. */
-  async function removePodContainers(pod: string): Promise<boolean> {
-    const rows = await findPodRows(pod);
-    if (rows.length === 0) return false;
-    const res = await call(['rm', '-f', ...rows.map((r) => r.name)]);
-    if (res.code !== 0 && !isNotFound(res)) throw fail(res, `rm ${pod}`);
-    for (const r of rows) {
-      idIndex.delete(r.id);
-      if (r.role === 'member') readinessTargets.delete(r.name);
-    }
-    return true;
-  }
-
-  // ---- creating containers ---------------------------------------------------
-
-  async function runInfra(spec: PodSpec): Promise<void> {
-    const res = await call(infraRunArgs(spec, sandboxImage));
-    if (res.code !== 0) throw fail(res, `run ${infraName(spec.name)}`);
-    const id = lastLine(res.stdout);
-    if (isContainerId(id)) idIndex.set(id, { role: 'infra', pod: spec.name });
-  }
-
-  async function runMember(pod: string, spec: ContainerSpec): Promise<void> {
-    const name = memberName(pod, spec.name);
-    const res = await call(memberRunArgs(pod, spec));
-    if (res.code !== 0) throw fail(res, `run ${name}`);
-    const id = lastLine(res.stdout);
-    if (isContainerId(id)) idIndex.set(id, { role: 'member', pod, container: spec.name });
-    if (spec.readiness)
-      readinessTargets.set(name, { pod, container: spec.name, probe: spec.readiness, ready: false });
-    else readinessTargets.delete(name);
-  }
-
-  /** Creates whichever of `spec.containers` does not exist yet. Returns whether it created anything. */
-  async function ensureMembers(spec: PodSpec): Promise<boolean> {
-    let created = false;
-    for (const c of spec.containers) {
-      if (!(await inspectContainer(memberName(spec.name, c.name)))) {
-        await runMember(spec.name, c);
-        created = true;
-      }
-    }
-    return created;
-  }
-
-  // ---- the Runtime methods ---------------------------------------------------
-
-  async function createNetwork(spec: NetworkSpec): Promise<void> {
-    const res = await call(['network', 'inspect', '--format', '{{.Name}}', spec.name]);
-    // Idempotent, purely by presence: `ObservedNetwork` carries no digest to
-    // compare against (unlike a Pod), so a Network already there -- ours or
-    // not -- is used as is, exactly like `memory.ts`.
-    if (res.code === 0) return;
-    const created = await call(networkCreateArgs(spec));
-    if (created.code !== 0) throw fail(created, `network create ${spec.name}`);
-  }
-
-  async function removeNetwork(name: string): Promise<void> {
-    const res = await call(['network', 'rm', name]);
-    if (res.code !== 0 && !isNotFound(res)) throw fail(res, `network rm ${name}`);
-  }
-
-  async function createPod(spec: PodSpec): Promise<void> {
-    const wanted = digest(spec);
-    const existing = await inspectContainer(infraName(spec.name));
-
-    if (existing && existing.specDigest === wanted) {
-      idIndex.set(existing.id, { role: 'infra', pod: spec.name });
-      // The sandbox matches, but its digest covers the *whole* spec, not
-      // just itself -- a crash between creating it and finishing its members
-      // would leave the sandbox alone looking exactly like a fully realised
-      // Pod. Heal whatever member did not make it before treating this as
-      // done; if nothing was missing, this is a true no-op, same as
-      // `memory.ts`.
-      if (!(await ensureMembers(spec))) return;
-    } else {
-      if (existing) {
-        // A different digest under this name: the planner wants this Pod
-        // replaced (any change to a sandbox-defining field replaces the
-        // whole Pod rather than mutating it -- see PLAN.md's immutability
-        // model, and decision 10 for the general rule this follows). If
-        // `existing` is something this adapter never labelled at all,
-        // `removePodContainers` finds nothing to remove and the `run` below
-        // fails honestly with "name already in use" instead of guessing.
-        await removePodContainers(spec.name);
-      }
-      await runInfra(spec);
-      for (const c of spec.containers) await runMember(spec.name, c);
-    }
-
-    const pod = await inspectPod(spec.name);
-    if (pod) notify({ type: 'pod', pod });
-  }
-
-  async function removePod(name: string): Promise<void> {
-    if (await removePodContainers(name)) notify({ type: 'pod-removed', name });
-  }
-
-  async function createContainer(pod: string, spec: ContainerSpec): Promise<void> {
-    const name = memberName(pod, spec.name);
-    if (await inspectContainer(name)) return; // idempotent, by presence -- same discipline as memory.ts
-    if (!(await inspectContainer(infraName(pod)))) {
-      throw new Error(`fiber-servo: cannot create container "${spec.name}": Pod "${pod}" does not exist`);
-    }
-    await runMember(pod, spec);
-    const container = await inspectMemberContainer(pod, spec.name);
-    if (container) notify({ type: 'container', pod, container });
-  }
-
-  async function removeContainer(pod: string, name: string): Promise<void> {
-    const runtimeName = memberName(pod, name);
-    const existing = await inspectContainer(runtimeName);
-    if (!existing) return; // idempotent: nothing to remove
-    const res = await call(['rm', '-f', runtimeName]);
-    if (res.code !== 0 && !isNotFound(res)) throw fail(res, `rm ${runtimeName}`);
-    idIndex.delete(existing.id);
-    readinessTargets.delete(runtimeName);
-    // No "container removed" event exists (same reasoning as memory.ts):
-    // removal is observed as the container no longer appearing in the Pod's
-    // own `containers` list, so the Pod is what gets re-announced.
-    const observed = await inspectPod(pod);
-    if (observed) notify({ type: 'pod', pod: observed });
-  }
-
-  async function updateContainerResources(
-    pod: string,
-    container: string,
-    resources: ResourceLimits,
-  ): Promise<void> {
-    const res = await call(updateResourcesArgs(pod, container, resources));
-    if (res.code !== 0) throw fail(res, `update ${memberName(pod, container)}`);
-    // Resources are not part of ObservedContainer -- nothing here changes --
-    // but a mutation happened, so subscribers still hear about it, the same
-    // as a real runtime firing an update event. The next inspect() sees the
-    // new limits live; see `reconstructPodSpec` in parse.ts.
-    const observed = await inspectMemberContainer(pod, container);
-    if (observed) notify({ type: 'container', pod, container: observed });
-  }
-
-  async function listNetworks(): Promise<Map<string, ObservedNetwork>> {
-    const res = await call(['network', 'ls', '--format', '{{json .}}']);
-    if (res.code !== 0) throw fail(res, 'network ls');
-    const names = res.stdout
-      .split('\n')
-      .map((line) => parseJsonSafe<NetworkRow>(line))
-      .filter((r): r is NetworkRow => r !== null && Boolean(r.Name) && isManaged(r.Labels))
-      .map((r) => r.Name);
-    const networks = new Map<string, ObservedNetwork>();
-    if (names.length === 0) return networks;
-    // One batched call for every network's subnet, same trick as `liveResources`.
-    const inspected = await call([
-      'network',
-      'inspect',
-      '--format',
-      '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}',
-      ...names,
-    ]);
-    if (inspected.code !== 0) return networks; // best-effort, same reasoning as liveResources
-    for (const line of inspected.stdout.trim().split('\n')) {
-      const [name, subnet] = line.trim().split(/\s+/);
-      if (name) networks.set(name, { name, subnet: subnet || undefined });
-    }
-    return networks;
+  async function inspectOne(service: string): Promise<ObservedContainer | undefined> {
+    const containers = await readProjectContainers();
+    return containers.find((c) => c.name === service);
   }
 
   async function inspect(): Promise<ObservedState> {
-    const res = await call(['ps', '-a', '--no-trunc', '--format', '{{json .}}']);
-    if (res.code !== 0) throw fail(res, 'ps -a');
-    const rows = res.stdout
-      .split('\n')
-      .map(parsePsRow)
-      .filter((r): r is ManagedRow => r !== null);
+    const containers = await readProjectContainers();
+    // Recover a probe schedule this process never saw registered -- e.g.
+    // after a restart. `READINESS_LABEL` on the running container's own
+    // labels is the only place it survives; see parse.ts.
+    for (const c of containers) {
+      if (readinessTargets.has(c.name)) continue;
+      const probe = decodeReadiness(c.labels[READINESS_LABEL]);
+      if (probe) readinessTargets.set(c.name, { probe, ready: false });
+    }
+    return { containers: new Map(containers.map((c) => [c.name, c])), revision };
+  }
 
-    const byPod = new Map<string, ManagedRow[]>();
-    for (const r of rows) {
-      idIndex.set(
-        r.id,
-        r.role === 'infra'
-          ? { role: 'infra', pod: r.pod }
-          : { role: 'member', pod: r.pod, container: r.container! },
-      );
-      // Recover a probe schedule this process never saw created: readiness
-      // config lives nowhere in containerd except inside `SPEC_JSON_LABEL`
-      // (see `parse.ts`), decoded here so a restart resumes probing instead
-      // of leaving a container un-probed forever.
-      if (r.role === 'member' && !readinessTargets.has(r.name)) {
-        const spec = decodeSpecLabel<ContainerSpec>(r.specJson);
-        if (spec?.readiness) {
-          readinessTargets.set(r.name, {
-            pod: r.pod,
-            container: r.container!,
-            probe: spec.readiness,
-            ready: false,
-          });
-        }
+  // ---- apply / down -----------------------------------------------------------
+
+  /** `fiber-servo.spec` digest and last-known image per service, for this project alone. */
+  async function recordedState(): Promise<{ digests: Map<string, string>; images: Map<string, string> }> {
+    const containers = await readProjectContainers();
+    const digests = new Map<string, string>();
+    const images = new Map<string, string>();
+    for (const c of containers) {
+      if (c.specDigest !== undefined) digests.set(c.name, c.specDigest);
+      if (c.image !== undefined) images.set(c.name, c.image);
+    }
+    return { digests, images };
+  }
+
+  /**
+   * Registers what the prober should probe from `model`, and prunes what it
+   * should not. A service in `resetFor` (just recreated, or brand new) always
+   * starts unready; an unchanged service keeps whatever the prober already
+   * decided about it -- re-arming it here would make an already-ready
+   * container flicker unready on every `apply`, even one that changed
+   * nothing about it.
+   */
+  function syncReadinessTargets(model: ComposeApplication, resetFor: ReadonlySet<string>): void {
+    for (const service of readinessTargets.keys()) {
+      if (!(service in model.services)) readinessTargets.delete(service);
+    }
+    for (const [service, def] of Object.entries(model.services)) {
+      const probe = decodeReadiness(def.labels?.[READINESS_LABEL]);
+      if (!probe) {
+        readinessTargets.delete(service);
+        continue;
       }
-      const list = byPod.get(r.pod);
-      if (list) list.push(r);
-      else byPod.set(r.pod, [r]);
+      const existing = readinessTargets.get(service);
+      if (!existing || resetFor.has(service)) readinessTargets.set(service, { probe, ready: false });
+      else existing.probe = probe;
+    }
+  }
+
+  async function apply(model: ComposeApplication): Promise<void> {
+    // The model names the project it is; this adapter reads containers back
+    // by that same name. If the two ever disagreed, every `inspect()` would
+    // filter for a project nothing was created under, the plan would report
+    // the whole application missing on every pass, and the loop would apply
+    // it again for ever without a single error. Saying so once, loudly, is
+    // worth more than an infinite quiet retry.
+    if (model.name !== project) {
+      throw new Error(
+        `fiber-servo: this adapter reads project "${project}" but was handed a model for "${model.name}". ` +
+          `Set the project in one place — serve({ project }) passes it to the adapter for you.`,
+      );
+    }
+    const { digests, images } = await recordedState();
+    const changed = changedServices(model, digests);
+    const orphaned = orphanedServices(model, digests);
+    const toRemove = [...new Set([...changed, ...orphaned])].sort();
+
+    writeModel(withRemovalStubs(model, orphaned, images));
+
+    if (toRemove.length > 0) {
+      const res = await call(['compose', '-f', composeFile, 'rm', '-f', '-s', ...toRemove]);
+      if (res.code !== 0) throw fail(res, `compose rm -s ${toRemove.join(' ')}`);
     }
 
-    const pods = new Map<string, ObservedPod>();
-    for (const [name, podRows] of byPod) pods.set(name, await buildObservedPod(name, podRows));
+    // Whether or not there was anything to remove, the file on disk must end
+    // up exactly `model` -- dropping any removal stub -- before `up` runs, or
+    // `up` would recreate the very orphan `rm` just evicted. A no-op write
+    // when `toRemove` was empty.
+    writeModel(model);
 
-    return { pods, networks: await listNetworks(), revision };
+    // An empty application is a legitimate desired state -- it is what the
+    // last pass of `serve().stop()` asks for, and what a tree that renders
+    // nothing asks for -- but `compose up` on a file with no services is a
+    // hard error (`no service was provided`, verified live). Step (b) has
+    // already removed whatever was there, so there is genuinely nothing left
+    // for `up` to do.
+    if (Object.keys(model.services).length === 0) {
+      syncReadinessTargets(model, new Set(changed));
+      return;
+    }
+
+    const res = await call(['compose', '-f', composeFile, 'up', '-d', '--no-recreate']);
+    if (res.code !== 0) throw fail(res, 'compose up');
+
+    syncReadinessTargets(model, new Set(changed));
+  }
+
+  async function down(): Promise<void> {
+    if (!existsSync(composeFile)) return; // nothing was ever applied: down is idempotent
+    const res = await call(['compose', '-f', composeFile, 'down']);
+    if (res.code !== 0) throw fail(res, 'compose down');
+    idIndex.clear();
+    notOurs.clear();
+    readinessTargets.clear();
   }
 
   // ---- events -----------------------------------------------------------------
 
-  async function resolveId(id: string): Promise<Tracked | undefined> {
+  async function resolveId(id: string): Promise<string | undefined> {
     const known = idIndex.get(id);
     if (known) return known;
     if (notOurs.has(id)) return undefined;
-    const res = await call([
-      'inspect',
-      '--format',
-      `{{index .Config.Labels "${MANAGED_LABEL}"}} {{index .Config.Labels "${POD_LABEL}"}} {{index .Config.Labels "${CONTAINER_LABEL}"}} {{index .Config.Labels "${ROLE_LABEL}"}}`,
-      id,
-    ]);
-    if (res.code !== 0) {
+    const container = await api.getContainer(id);
+    const service = container ? serviceOf(container) : undefined;
+    if (!service) {
       notOurs.add(id);
       return undefined;
     }
-    const [managed = '', pod = '', container = '', role = ''] = res.stdout.trim().split(/\s+/);
-    if (managed !== 'true' || !pod || (role !== 'infra' && role !== 'member')) {
-      notOurs.add(id);
-      return undefined;
-    }
-    const target: Tracked = role === 'infra' ? { role: 'infra', pod } : { role: 'member', pod, container };
-    idIndex.set(id, target);
-    return target;
+    idIndex.set(id, service);
+    return service;
   }
 
-  async function handleEventLine(line: string): Promise<void> {
-    const row = parseJsonSafe<EventRow>(line);
-    if (!row?.Topic) return;
-    const event = interpretEventRow(row);
-    if (!event) return;
-    const target = await resolveId(event.id);
-    if (!target) return; // not ours
+  /**
+   * `/tasks/start`, `/tasks/exit` and `/tasks/delete` all concern one
+   * container's task, and all three are handled the same way: find out what
+   * that service looks like now, and say so. A task being gone does not mean
+   * the *container* is -- `no task -> exited` (`phaseFromTask` in parse.ts)
+   * covers that as just another phase. Only when the container itself is
+   * gone too does this report a removal, and that is `reconcileDeletion`'s
+   * job below, not this function's.
+   */
+  async function handleTaskEvent(containerId: string): Promise<void> {
+    const service = await resolveId(containerId);
+    if (!service) return; // not ours
+    const container = await inspectOne(service);
+    if (container) notify({ type: 'container', container });
+    else notify({ type: 'container-removed', name: service });
+  }
 
-    if (target.role === 'infra') {
-      if (event.kind === 'deleted') {
-        idIndex.delete(event.id);
-        notify({ type: 'pod-removed', name: target.pod });
+  /**
+   * `/containers/delete` means a container is gone. The event does name it --
+   * `ContainerDelete`'s field is `id`, not the `container_id` task events
+   * use, and `api.ts` decodes both (a difference that silently broke this
+   * topic until it was caught against a live daemon) -- but this function
+   * deliberately does not rely on that name.
+   *
+   * The reason is that one deletion rarely arrives alone: `compose rm` on
+   * three services produces three events, and Compose recreating a container
+   * produces a delete for the old one. Diffing the id index against one fresh
+   * `listContainers()` answers for all of them at once, and it answers
+   * correctly even for a deletion whose event was dropped while the stream
+   * was down. Every id in the index was put there by a list call, so the
+   * difference is exactly the set of *our* containers that disappeared -- no
+   * guessing, and no broad resync of things that did not change.
+   */
+  async function reconcileDeletion(): Promise<void> {
+    const rows = await api.listContainers();
+    const present = new Set(rows.map((r) => r.id));
+    const removed: string[] = [];
+    for (const [id, service] of idIndex) {
+      if (present.has(id)) continue;
+      idIndex.delete(id);
+      readinessTargets.delete(service);
+      removed.push(service);
+    }
+    for (const service of removed) notify({ type: 'container-removed', name: service });
+  }
+
+  async function handleApiEvent(event: ApiEvent): Promise<void> {
+    switch (event.topic) {
+      case '/tasks/start':
+      case '/tasks/exit':
+      case '/tasks/delete':
+        // An event whose payload could not be decoded (see api.ts's own
+        // comment on that) is still worth acting on by resyncing fully, the
+        // same fallback a dead stream gets below.
+        if (event.containerId) await handleTaskEvent(event.containerId);
+        else await resyncOnce();
         return;
-      }
-      // A start or exit on the sandbox changes the whole Pod's phase (see
-      // `derivePodPhase`), not one field of it, so re-derive rather than patch.
-      const pod = await inspectPod(target.pod);
-      if (pod) notify({ type: 'pod', pod });
-      else notify({ type: 'pod-removed', name: target.pod });
-      return;
+      case '/containers/delete':
+        await reconcileDeletion();
+        return;
+      default:
+        return; // containers/create, containers/update, snapshot/*, ... -- nothing this adapter acts on
     }
-
-    if (event.kind === 'deleted') {
-      idIndex.delete(event.id);
-      readinessTargets.delete(memberName(target.pod, target.container));
-      // Same "no container-removed event" rule as removeContainer.
-      const pod = await inspectPod(target.pod);
-      if (pod) notify({ type: 'pod', pod });
-      return;
-    }
-    const container = await inspectMemberContainer(target.pod, target.container);
-    if (container) notify({ type: 'container', pod: target.pod, container });
   }
 
   async function resyncOnce(): Promise<void> {
     try {
       const state = await inspect();
-      notify({ type: 'resync', state: { pods: state.pods, networks: state.networks } });
+      notify({ type: 'resync', containers: [...state.containers.values()] });
     } catch (e) {
       onError(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
+  /**
+   * Attach to the event stream once, and resolve when it ends or is aborted.
+   *
+   * Events arrive already serialised: `api.subscribe` waits for each handler
+   * to settle before delivering the next (see its contract in `api.ts`). All
+   * this has to do is route a handler failure to `finish`, which tears the
+   * attachment down so `runEventLoop` can resync and reattach.
+   */
+  function attachOnce(signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (error?: Error): void => {
+        if (done) return;
+        done = true;
+        if (error) onError(error);
+        signal.removeEventListener('abort', onAbort);
+        unsubscribe();
+        resolve();
+      };
+      const onAbort = (): void => finish();
+      const unsubscribe = api.subscribe(
+        // Returning the promise is what lets `api.subscribe` hold the next
+        // event back until this one is done.
+        (event) =>
+          handleApiEvent(event).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e)))),
+        (error) => finish(error),
+      );
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   async function runEventLoop(signal: AbortSignal): Promise<void> {
+    // Resync once up front: whatever happened while nobody was subscribed
+    // (or before this process existed) has to be caught up before trusting
+    // events alone, same as after any later reattach.
+    await resyncOnce();
     while (!signal.aborted) {
-      try {
-        for await (const line of nerdctl.stream(['events', '--format', '{{json .}}'], signal)) {
-          await handleEventLine(line);
-        }
-      } catch (e) {
-        onError(e instanceof Error ? e : new Error(String(e)));
-      }
+      await attachOnce(signal);
       if (signal.aborted) return;
-      // The stream ended on its own -- containerd restarted, nerdctl exited,
-      // the socket dropped. Nothing guarantees we saw everything up to that
-      // point, so resync fully and announce it before trying to reattach:
-      // this is the fallback the Runtime contract asks `subscribe` for, not
-      // merely a reconnect. If the stream keeps failing, this repeats, so the
-      // resync is genuinely periodic for as long as it stays down.
+      // The stream ended -- containerd restarted, the socket dropped, or
+      // handling an event threw. Nothing guarantees we saw everything up to
+      // that point, so resync fully and announce it before trying to
+      // reattach. If the stream keeps failing, this repeats, so the resync
+      // is genuinely periodic for as long as it stays down.
       await resyncOnce();
       await sleep(reconnectDelayMs, signal);
     }
@@ -596,19 +472,19 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     const lastAttempt = new Map<string, number>();
     while (!signal.aborted) {
       const t = Date.now();
-      for (const [name, target] of readinessTargets) {
+      for (const [service, target] of readinessTargets) {
         if (target.ready) continue;
         const interval = target.probe.intervalMs ?? 2000;
-        if (t - (lastAttempt.get(name) ?? 0) < interval) continue;
-        lastAttempt.set(name, t);
-        const res = await nerdctl.exec(['exec', name, ...target.probe.exec]);
+        if (t - (lastAttempt.get(service) ?? 0) < interval) continue;
+        lastAttempt.set(service, t);
+        const res = await nerdctl.exec(['compose', '-f', composeFile, 'exec', service, ...target.probe.exec]);
         // Only mark it once: a concurrent removal clears the target from the
         // map entirely, so a stale success cannot resurrect it.
-        if (res.code === 0 && readinessTargets.get(name) === target && !target.ready) {
+        if (res.code === 0 && readinessTargets.get(service) === target && !target.ready) {
           target.ready = true;
-          log(`ready ${name}`);
-          const container = await inspectMemberContainer(target.pod, target.container);
-          if (container) notify({ type: 'container', pod: target.pod, container });
+          log(`ready ${service}`);
+          const container = await inspectOne(service);
+          if (container) notify({ type: 'container', container });
         }
       }
       await sleep(probeTickMs, signal);
@@ -640,20 +516,10 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
     controller?.abort();
     controller = undefined;
     listeners.clear();
+    api.close();
   }
 
-  return {
-    createNetwork,
-    removeNetwork,
-    createPod,
-    removePod,
-    createContainer,
-    removeContainer,
-    updateContainerResources,
-    inspect,
-    subscribe,
-    close,
-  };
+  return { apply, down, inspect, subscribe, close };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

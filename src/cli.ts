@@ -2,7 +2,7 @@
 /**
  * fiber-servo CLI.
  *
- *   fiber-servo plan app.tsx           print the actions the tree would produce, without a runtime
+ *   fiber-servo plan app.tsx           print what the tree would create, without a runtime
  *   fiber-servo up   app.tsx           run the tree on containerd until Ctrl-C
  *   fiber-servo up   app.tsx --watch   ...and re-evaluate the file whenever it is saved
  *
@@ -17,14 +17,14 @@ import { listenSession, requestApply, sessionAddress, type ApplyResult } from '.
 import { loadElement } from './load.js';
 import { createSession } from './session.js';
 export { loadElement } from './load.js';
-import { formatAction } from './planner.js';
 import { containerd } from './runtime/containerd/index.js';
 import { memory } from './runtime/memory.js';
 import { serve } from './serve.js';
-import type { ObservedPod, ObservedState, RuntimeFactory } from './runtime/types.js';
+import { renderCompose, type ComposeApplication } from './compose.js';
+import type { ObservedContainer, ObservedState, RuntimeFactory } from './runtime/types.js';
 
 const USAGE = `usage:
-  fiber-servo plan <app.tsx>                       print the actions, execute nothing
+  fiber-servo plan <app.tsx> [--model]              print what would be created; --model prints the Compose file
   fiber-servo apply <app.tsx>                      re-evaluate the running session
   fiber-servo up   <app.tsx> [--watch] [--runtime containerd|memory]
                              [--namespace n] [--address sock] [--quiet]
@@ -76,24 +76,20 @@ export function watchFile(file: string, onChange: () => void, debounceMs = 100):
 
 /**
  * Prints observed state as it changes. This is the only place the CLI shows
- * reality rather than intent, and it is deliberately separate from the action
+ * reality rather than intent, and it is deliberately separate from the plan
  * log above it: one is what we asked for, the other is what happened.
  */
-function podPrinter(log: (line: string) => void): (state: ObservedState) => void {
-  const seen = new Map<string, ObservedPod>();
+function containerPrinter(log: (line: string) => void): (state: ObservedState) => void {
+  const seen = new Map<string, ObservedContainer>();
   return (state) => {
-    for (const [name, pod] of state.pods) {
-      if (seen.get(name) === pod) continue;
-      seen.set(name, pod);
-      const detail = pod.containers
-        .map(
-          (c) =>
-            `${c.name}=${c.phase}${c.ready ? '/ready' : ''}${c.exitCode !== undefined ? ` exit ${c.exitCode}` : ''}`,
-        )
-        .join(' ');
-      log(`pod ${name} ${pod.phase}${pod.ip ? ` ip=${pod.ip}` : ''}${detail ? ` [${detail}]` : ''}`);
+    for (const [name, container] of state.containers) {
+      if (seen.get(name) === container) continue;
+      seen.set(name, container);
+      const ready = container.ready ? '/ready' : '';
+      const exit = container.exitCode !== undefined ? ` exit ${container.exitCode}` : '';
+      log(`container ${name} ${container.phase}${ready}${exit}`);
     }
-    for (const name of [...seen.keys()]) if (!state.pods.has(name)) seen.delete(name);
+    for (const name of [...seen.keys()]) if (!state.containers.has(name)) seen.delete(name);
   };
 }
 
@@ -137,26 +133,49 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (command === 'plan') {
     // Planning runs the whole control plane against the in-memory runtime, which
     // always succeeds. That is what makes gated subtrees appear: <Ready on="db">
-    // only declares its children once the db Pod is observed running, and here
-    // it is observed running because the memory runtime says so. Nothing
-    // touches containerd.
-    const actions: string[] = [];
+    // only declares its children once the db container is observed running,
+    // and here it is observed running because the memory runtime says so.
+    // Nothing touches containerd.
+    //
+    // Each pass's `onApply` reports what *that* pass's apply would do; since
+    // the memory runtime genuinely applies it, a container "missing" on one
+    // pass is no longer missing on the next, so accumulating each pass's
+    // `create` lines (deduplicated by name) reconstructs the full expansion
+    // exactly the way the old action-list trace did.
+    const lines: string[] = [];
+    const created = new Set<string>();
+    // The last pass's model is the converged application: `plan.model` is
+    // always the whole desired model, never a diff, and `onApply` fires on
+    // every pass including the final empty one.
+    let model: ComposeApplication | undefined;
     const served = serve(await loadElement(canonicalFile), {
       runtime: memory(),
-      onActions: (batch) => {
-        for (const action of batch) actions.push(formatAction(action));
+      onApply: (plan) => {
+        model = plan.model;
+        for (const name of plan.missing) {
+          if (created.has(name)) continue;
+          created.add(name);
+          lines.push(`create ${name} image=${plan.model.services[name]?.image ?? '?'}`);
+        }
       },
     });
     // React commits and control-loop passes feed each other, so quiescence is
-    // "two rounds in a row produced no new action".
+    // "two rounds in a row produced no new line".
     let quiet = 0;
     for (let i = 0; i < 50 && quiet < 2; i++) {
-      const before = actions.length;
+      const before = lines.length;
       await served.root.settle();
       await served.idle();
-      quiet = actions.length === before ? quiet + 1 : 0;
+      quiet = lines.length === before ? quiet + 1 : 0;
     }
-    for (const line of actions) console.log(line);
+    // `--model` prints the Compose application itself, which is the literal
+    // thing `up` would hand to `nerdctl compose -f`. The default stays the
+    // short list, because that is what a reader checking a change wants.
+    if (flags['model'] === true) {
+      if (model) process.stdout.write(renderCompose(model));
+      return 0;
+    }
+    for (const line of lines) console.log(line);
     return 0;
   }
 
@@ -165,8 +184,8 @@ export async function main(argv: readonly string[]): Promise<number> {
       {
         runtime: pickRuntime(flags, quiet ? () => {} : stamp),
         log: quiet ? () => {} : stamp,
-        // No `onActions` here: `serve` already logs each action through `log`,
-        // and printing from both channels doubles every line.
+        // No `onApply` here: `serve` already logs a summary of each apply
+        // through `log`, and printing from both channels doubles every line.
         onError: (e) => stamp(`!! ${e.message}`),
       },
       () => loadElement(canonicalFile),
@@ -182,8 +201,8 @@ export async function main(argv: readonly string[]): Promise<number> {
         `Cannot start session at ${sessionAddress(canonicalFile)}: ${String(e)}. Another up may own it. On Unix, remove a stale socket only after confirming its owner has exited.`,
       );
     }
-    const printPods = podPrinter(stamp);
-    if (!quiet) served.observed.subscribe(() => printPods(served.observed.snapshot()));
+    const printContainers = containerPrinter(stamp);
+    if (!quiet) served.observed.subscribe(() => printContainers(served.observed.snapshot()));
 
     let unwatch = () => {};
     let exitCode = 0;

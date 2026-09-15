@@ -1,261 +1,143 @@
 /**
- * The planner: desired state in, actions out.
+ * The planner: desired state in, a human-readable plan out.
  *
- * This file owns the immutability model — the decision of whether a changed
- * field means nothing, an update in place, or a replacement. It is the reason
- * no layer above it ever says `stop`, `delete` or `start`: those are not
- * decisions React or a controller is equipped to make, because making them
- * correctly needs to know what the runtime already holds.
+ * This file used to decide whether a changed field meant nothing, an update
+ * in place, or a replacement — the entire immutability model lived here, and
+ * it was the reason no layer above it ever said `stop`, `delete` or `start`.
  *
- * It is a pure function, and the comparison it makes is worth being precise
- * about. It does *not* compare the desired spec against what is running —
- * an observation tells you a container is up, not what was asked for, so it
- * cannot tell a cpu change from an image change. It compares the desired spec
- * against **the spec the Pod was created from**, which the adapter records on
- * the Pod itself (see `ObservedPod.spec` and decision 26). Desired versus
- * recorded answers "which field changed"; observed phase answers "is it still
- * alive". The planner needs both, and they are different questions.
+ * That decision no longer belongs to fiber-servo at all. The write path is
+ * now a Compose Application Model handed whole to an actuator
+ * (`Runtime.apply`, see `runtime/types.ts`): the actuator is the one thing
+ * that knows how `nerdctl compose` actually behaves, so it is the one thing
+ * that gets to decide what a changed spec means. Concretely, under Compose
+ * there is no live-update primitive fiber-servo can reach: the old
+ * "`resources` is the one mutable field, updated in place" branch is gone
+ * along with the rest of the model, because the response to *any* spec
+ * difference — cpu and memory included — is now uniformly "this service's
+ * `fiber-servo.spec` label digest changed, so remove it and let `compose up`
+ * recreate it." A reader who remembers the old in-place-resources path and
+ * comes looking for where it went: it did not move, it was retired, because
+ * Compose gave fiber-servo nowhere to put it.
+ *
+ * What is left for this file to do is purely informational: given a desired
+ * container/network set and what is currently observed, report what
+ * `Runtime.apply` is *about to* do, for `fiber-servo plan` and for logging.
+ * It builds the same `ComposeApplication` the control loop is about to hand
+ * to the runtime and diffs it against recorded spec digests using
+ * `compose.ts`'s own `changedServices`/`orphanedServices` — the exact
+ * comparison the write path itself is built on, so this file's answer can
+ * never drift from what actually happens.
  */
 import {
-  digest,
-  specValueEquals,
-  type ContainerSpec,
-  type NetworkSpec,
-  type PodSpec,
-  type ResourceLimits,
-} from './resources.js';
-import type { ObservedPod, ObservedState } from './runtime/types.js';
-
-// ---- actions ---------------------------------------------------------------
-
-/**
- * What the control loop should ask the runtime to do.
- *
- * `because` lists the spec fields that forced the decision, so a plan can
- * explain itself: `replace-pod api-0 because [network]` is a sentence a
- * reader can act on, where a bare `replace-pod api-0` is not.
- */
-export type Action =
-  | { type: 'create-network'; spec: NetworkSpec }
-  | { type: 'remove-network'; name: string }
-  | { type: 'replace-network'; name: string; spec: NetworkSpec; because: readonly string[] }
-  | { type: 'create-pod'; spec: PodSpec }
-  | { type: 'remove-pod'; name: string }
-  | { type: 'replace-pod'; name: string; spec: PodSpec; because: readonly string[] }
-  | { type: 'create-container'; pod: string; spec: ContainerSpec }
-  | { type: 'remove-container'; pod: string; name: string }
-  | { type: 'replace-container'; pod: string; spec: ContainerSpec; because: readonly string[] }
-  | { type: 'update-container-resources'; pod: string; name: string; resources: ResourceLimits };
-
-// ---- what is mutable, and what is not --------------------------------------
+  DEFAULT_PROJECT,
+  MANAGED_LABEL,
+  SPEC_LABEL,
+  changedServices,
+  orphanedServices,
+  toComposeApplication,
+  type ComposeApplication,
+} from './compose.js';
+import type { ContainerSpec, NetworkSpec } from './resources.js';
+import type { ObservedState } from './runtime/types.js';
 
 /**
- * The only field of a container a runtime can change without replacing the
- * process behind it. Everything else — image, command, environment, root
- * filesystem — is baked in at creation.
+ * What applying the desired state would do, reported rather than decided:
+ * `Runtime.apply` is what actually creates, replaces or removes anything.
  */
-const CONTAINER_MUTABLE = ['resources'] as const;
-
-const CONTAINER_IMMUTABLE = ['image', 'command', 'env', 'ports', 'readiness'] as const;
-
-/**
- * Sandbox properties. Changing any of them replaces the Pod, because they are
- * decided when the network namespace is created.
- *
- * `labels` sits here for a weaker reason than the others: no adapter we have
- * can relabel a live sandbox. It is not conceptually immutable, and if an
- * adapter ever gains `updatePodLabels` this is the line to move.
- */
-const POD_IMMUTABLE = ['network', 'publish', 'labels'] as const;
-
-function changedFields<T>(prev: T, next: T, keys: readonly (keyof T & string)[]): string[] {
-  return keys.filter((key) => !specValueEquals(prev[key], next[key]));
+export interface Plan {
+  /** The Compose Application Model the control loop is about to hand to `Runtime.apply`. */
+  model: ComposeApplication;
+  /** Services that exist with a different spec digest than desired — will be replaced. */
+  changed: readonly string[];
+  /** Managed services the model no longer declares — will be removed. */
+  orphaned: readonly string[];
+  /** Desired services that do not exist yet — will be created. */
+  missing: readonly string[];
+  /**
+   * Services present with the *same* spec digest, but currently `exited` —
+   * will be restarted. This is not a `changedServices`/`orphanedServices`
+   * question at all: nothing about the desired spec differs, so a digest
+   * comparison alone reports these as neither missing nor changed. It is
+   * `Runtime.apply`'s own idempotence contract (see `runtime/memory.ts`)
+   * that treats "same spec, but exited" as needing a restart, so this list
+   * is built by asking observed phase directly, the one thing a spec digest
+   * can never encode.
+   */
+  restarting: readonly string[];
 }
 
-// ---- one pod ---------------------------------------------------------------
+/**
+ * Which recorded services `changedServices`/`orphanedServices` are even
+ * allowed to have an opinion about: only containers fiber-servo can prove it
+ * made. A container with no `fiber-servo.spec` digest at all — unmanaged, or
+ * adopted from outside — must never be reported as "will be removed" just
+ * because the tree does not mention it; that is the same "don't touch what
+ * we can't prove we made" rule the old planner applied to a Pod with no
+ * recorded spec or digest.
+ */
+function recordedSpecDigests(observed: ObservedState): Map<string, string> {
+  const recorded = new Map<string, string>();
+  for (const container of observed.containers.values()) {
+    if (container.labels[MANAGED_LABEL] !== 'true') continue;
+    const digest = container.specDigest ?? container.labels[SPEC_LABEL];
+    if (digest !== undefined) recorded.set(container.name, digest);
+  }
+  return recorded;
+}
 
 /**
- * Actions for a single Pod. `observed` undefined means it does not exist yet.
- *
- * Order within a Pod matters: the Pod-level verdict is decided first, because
- * replacing the sandbox makes every container-level action moot.
+ * Build the desired Compose model and report what applying it would change,
+ * against what is currently observed. Pure and synchronous, like the
+ * controllers this sits downstream of — it makes no runtime calls itself.
  */
-export function planPod(desired: PodSpec, observed: ObservedPod | undefined): Action[] {
-  if (observed === undefined) return [{ type: 'create-pod', spec: desired }];
-
-  // A Pod that died needs the same treatment as one whose spec changed, and it
-  // needs it regardless of what its spec says. This single line is where
-  // "controllers reconcile runtime resources" stops being a slogan: nothing
-  // about the desired state changed, and yet there is work to do.
-  if (observed.phase === 'exited') {
-    return [{ type: 'replace-pod', name: desired.name, spec: desired, because: ['phase'] }];
-  }
-
-  const recorded = observed.spec;
-  if (recorded === undefined) {
-    // We have no record of creating this Pod with a given spec.
-    if (observed.specDigest === undefined) {
-      // Not ours at all. Adopt it rather than fight it — deleting a container
-      // we cannot prove we made is the one mistake with no undo.
-      return [];
-    }
-    // Ours, but from a version that recorded only a digest. We can tell that
-    // something differs, never which field, so we must not guess at an
-    // in-place update.
-    return observed.specDigest === digest(desired)
-      ? []
-      : [{ type: 'replace-pod', name: desired.name, spec: desired, because: ['spec'] }];
-  }
-
-  const sandboxChanged = changedFields(recorded, desired, POD_IMMUTABLE);
-  if (sandboxChanged.length > 0) {
-    return [{ type: 'replace-pod', name: desired.name, spec: desired, because: sandboxChanged }];
-  }
-
-  return planContainers(desired, recorded);
-}
-
-/** The container set of a Pod whose sandbox is already correct. */
-function planContainers(desired: PodSpec, recorded: PodSpec): Action[] {
-  const actions: Action[] = [];
-  const recordedByName = new Map(recorded.containers.map((c) => [c.name, c]));
-
-  for (const next of desired.containers) {
-    const prev = recordedByName.get(next.name);
-    if (prev === undefined) {
-      actions.push({ type: 'create-container', pod: desired.name, spec: next });
-      continue;
-    }
-    const immutable = changedFields(prev, next, CONTAINER_IMMUTABLE);
-    if (immutable.length > 0) {
-      actions.push({ type: 'replace-container', pod: desired.name, spec: next, because: immutable });
-      continue;
-    }
-    // Nothing immutable moved, so whatever is left can be applied in place.
-    // This is the only branch in the entire system that mutates a live
-    // resource rather than replacing it.
-    const mutable = changedFields(prev, next, CONTAINER_MUTABLE);
-    if (mutable.length > 0) {
-      actions.push({
-        type: 'update-container-resources',
-        pod: desired.name,
-        name: next.name,
-        resources: next.resources ?? {},
-      });
-    }
-  }
-
-  const desiredNames = new Set(desired.containers.map((c) => c.name));
-  for (const prev of recorded.containers) {
-    if (!desiredNames.has(prev.name)) {
-      actions.push({ type: 'remove-container', pod: desired.name, name: prev.name });
-    }
-  }
-
-  return actions;
-}
-
-// ---- one network -----------------------------------------------------------
-
-function planNetwork(
-  desired: NetworkSpec,
-  observed: { name: string; subnet?: string } | undefined,
-): Action[] {
-  if (observed === undefined) return [{ type: 'create-network', spec: desired }];
-  // Observation of a network is thin — a name and a subnet is all a runtime
-  // reliably reports — so the subnet is all there is to compare. A label
-  // change is invisible here, which is acceptable: nothing routes on it.
-  // A desired spec that does not name a subnet accepts whatever it was given.
-  if (desired.subnet !== undefined && desired.subnet !== observed.subnet) {
-    return [{ type: 'replace-network', name: desired.name, spec: desired, because: ['subnet'] }];
-  }
-  return [];
-}
-
-// ---- the whole reconcile ---------------------------------------------------
-
-/**
- * Everything that must happen for reality to match `desired`.
- *
- * The ordering is the interesting part, and it is fixed rather than clever:
- *
- *   1. networks created and replaced first, so a Pod always has the network it
- *      references by the time it is created;
- *   2. pod-level work next, creations before removals, so a rolling
- *      replacement never dips below capacity longer than it must;
- *   3. networks removed last, after the Pods that were attached to them are
- *      gone — removing a network out from under a live Pod is how you get a
- *      runtime that refuses and a reconcile that never converges.
- */
-export function planAll(
-  desired: { networks: readonly NetworkSpec[]; pods: readonly PodSpec[] },
+export function planApply(
+  desired: { networks: readonly NetworkSpec[]; containers: readonly ContainerSpec[] },
   observed: ObservedState,
-): Action[] {
-  const networkCreates: Action[] = [];
-  const networkRemovals: Action[] = [];
-  const podActions: Action[] = [];
-  const podRemovals: Action[] = [];
-
-  for (const network of desired.networks) {
-    networkCreates.push(...planNetwork(network, observed.networks.get(network.name)));
-  }
-
-  const desiredNetworks = new Set(desired.networks.map((n) => n.name));
-  for (const name of observed.networks.keys()) {
-    if (!desiredNetworks.has(name)) networkRemovals.push({ type: 'remove-network', name });
-  }
-
-  for (const pod of desired.pods) {
-    podActions.push(...planPod(pod, observed.pods.get(pod.name)));
-  }
-
-  const desiredPods = new Set(desired.pods.map((p) => p.name));
-  for (const [name, pod] of observed.pods) {
-    if (desiredPods.has(name)) continue;
-    // Same caution as in `planPod`: a Pod with no sign of our ownership is
-    // left alone. fiber-servo shares a machine; it does not own it.
-    if (pod.spec === undefined && pod.specDigest === undefined) continue;
-    podRemovals.push({ type: 'remove-pod', name });
-  }
-
-  return [...networkCreates, ...podActions, ...podRemovals, ...networkRemovals];
+  project: string = DEFAULT_PROJECT,
+): Plan {
+  const model = toComposeApplication(desired.containers, desired.networks, project);
+  const recorded = recordedSpecDigests(observed);
+  const changed = changedServices(model, recorded);
+  const orphaned = orphanedServices(model, recorded);
+  const missing = Object.keys(model.services)
+    .filter((name) => !recorded.has(name))
+    .sort();
+  const changedOrMissing = new Set([...changed, ...missing]);
+  const restarting = Object.keys(model.services)
+    .filter((name) => !changedOrMissing.has(name) && recorded.has(name))
+    .filter((name) => observed.containers.get(name)?.phase === 'exited')
+    .sort();
+  return { model, changed, orphaned, missing, restarting };
 }
 
-// ---- rendering -------------------------------------------------------------
-
-/** One line per action, for `fiber-servo plan`, logs and test failure messages. */
-export function formatAction(action: Action): string {
-  switch (action.type) {
-    case 'create-network':
-      return `create-network ${action.spec.name}`;
-    case 'remove-network':
-      return `remove-network ${action.name}`;
-    case 'replace-network':
-      return `replace-network ${action.name} because [${action.because.join(',')}]`;
-    case 'create-pod':
-      return `create-pod ${action.spec.name}`;
-    case 'remove-pod':
-      return `remove-pod ${action.name}`;
-    case 'replace-pod':
-      return `replace-pod ${action.name} because [${action.because.join(',')}]`;
-    case 'create-container':
-      return `create-container ${action.pod}/${action.spec.name} image=${action.spec.image}`;
-    case 'remove-container':
-      return `remove-container ${action.pod}/${action.name}`;
-    case 'replace-container':
-      return `replace-container ${action.pod}/${action.spec.name} because [${action.because.join(',')}]`;
-    case 'update-container-resources':
-      return `update-container-resources ${action.pod}/${action.name} ${formatLimits(action.resources)}`;
-  }
-}
-
-function formatLimits(resources: ResourceLimits): string {
+/**
+ * True when applying this plan would change nothing.
+ *
+ * The control loop uses it to skip the `apply` call entirely — recomputing
+ * the plan is exactly how the runtime itself would answer "does anything need
+ * to change", so a whole `nerdctl compose up` invocation would only prove
+ * what this already proves for free. Callers logging plans want the same
+ * question, which is why it is exported rather than being an inline sum.
+ */
+export function planIsEmpty(plan: Plan): boolean {
   return (
-    [
-      resources.cpu !== undefined ? `cpu=${resources.cpu}` : undefined,
-      resources.memory !== undefined ? `memory=${resources.memory}` : undefined,
-    ]
-      .filter(Boolean)
-      .join(' ') || 'cleared'
+    plan.missing.length === 0 &&
+    plan.changed.length === 0 &&
+    plan.orphaned.length === 0 &&
+    plan.restarting.length === 0
   );
+}
+
+// ---- rendering ---------------------------------------------------------------
+
+/** One line per pending change, for `fiber-servo plan`, logs and test failure messages. */
+export function formatPlan(plan: Plan): string {
+  const lines: string[] = [];
+  for (const name of plan.missing) {
+    lines.push(`create ${name} image=${plan.model.services[name]?.image ?? '?'}`);
+  }
+  for (const name of plan.changed) lines.push(`replace ${name}`);
+  for (const name of plan.restarting) lines.push(`restart ${name}`);
+  for (const name of plan.orphaned) lines.push(`remove ${name}`);
+  return lines.length > 0 ? lines.join('\n') : '(nothing to do)';
 }

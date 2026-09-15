@@ -1,13 +1,14 @@
 {
   "name": "fiber-servo",
   "version": "0.1.0",
-  "description": "React Fiber as the control plane for a single-node container orchestrator: Pods, ReplicaSets and Services reconciled against containerd.",
+  "description": "React Fiber as the control plane for a single-node container orchestrator: containers, ReplicaSets and Services, applied through nerdctl compose and observed through containerd.",
   "keywords": [
     "react",
     "react-reconciler",
     "containers",
     "containerd",
     "nerdctl",
+    "compose",
     "orchestration",
     "reconciler",
     "declarative",
@@ -46,7 +47,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/copy-protos.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -64,7 +65,10 @@
     "react": "^19.3.0"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
     "esbuild": "^0.28.2",
+    "protobufjs": "^8.8.0",
     "react-reconciler": "^0.34.0",
     "tsx": "^4.23.13"
   },

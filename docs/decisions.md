@@ -114,6 +114,9 @@ it lets the tree retry with backoff instead of stalling.
 
 ## 9. nerdctl, not gRPC
 
+**Amended by decision 29.** The conclusion held for writes and did not hold
+for reads: the two halves are now split.
+
 **Decision.** Drive containerd through the nerdctl CLI behind a two-method
 interface (`exec`, `stream`).
 
@@ -386,6 +389,14 @@ costs one extra container per Pod.
 a container sharing a namespace cannot publish. Container-level networking is
 not offered at all.
 
+**Retired by decision 32.** There is no Pod. A container is the unit and maps
+one-to-one onto a Compose service. What this decision got right is that a Pod
+had to be _built_: neither containerd nor Compose has one, and the emulation
+was ours to maintain. What it got wrong was the price — an extra container per
+Pod, a naming scheme, a rule about which member may publish a port, and a
+whole level of nesting in observed state, all in exchange for sidecars, which
+nothing in the project used.
+
 ## 24. Ownership is nesting; everything else is a reference
 
 **Decision.** JSX nesting means ownership only. A Pod joins a Network with
@@ -401,6 +412,11 @@ appear.
 **Consequences.** `<Network>` no longer wraps anything, and a typo in a
 `network=` or a selector is a runtime miss rather than a compile error. That
 is the price of modelling a graph.
+
+**Still current after decision 32**, with one level fewer in the tree: a
+ReplicaSet now owns a `<Container>` template directly. The rule itself —
+nesting is ownership, everything else is a name — is what let the Pod level be
+removed without touching a single reference.
 
 ## 25. A Service selects; it does not list
 
@@ -441,6 +457,15 @@ rewrite the record, or the next reconcile sees a difference that is not there.
 A Pod with no record is adopted rather than replaced: we do not delete what we
 cannot prove we made.
 
+**Amended by decision 31.** The mechanism survives and is now load-bearing for
+the write path, but it carries _less_: a digest, not the spec itself. Under
+Compose the answer to any difference is the same — remove that one service and
+let `up` recreate it — so "which field changed" stopped being a question
+anyone asks, and with it went `fiber-servo.spec-json` and the percent-encoding
+it needed to survive a label column. What remains is `fiber-servo.spec`, an
+eight-character hash, and the "adopt what we cannot prove we made" rule, which
+is unchanged.
+
 ## 27. Backoff lives in the control loop
 
 **Decision.** The restart gate is state in `serve()`. Controllers and the
@@ -470,3 +495,224 @@ property that scaling 3 to 5 touches only the two new Pods.
 the same ones and adopts its own Pods. A trivial template edit (reordering
 env keys is normalised away, but a whitespace change in a command is not)
 triggers a rollout, which is the honest reading of "the template changed".
+
+## 29. Writes through nerdctl, reads through containerd's API
+
+**Decision.** Mutations (`run`, `rm`, `update`, `network create/rm`) keep
+going through the nerdctl CLI. State is read from containerd's own gRPC API —
+`Containers`, `Tasks` and `Events` — with its `.proto` files vendored into the
+repo. Networks are read from CNI configuration files, because containerd has
+no notion of one.
+
+**Why.** Decision 9 weighed gRPC against nerdctl as a single choice and
+answered for the whole adapter. That was one question too few: the two halves
+have almost nothing in common.
+
+Writing genuinely needs what nerdctl brings. Creating a container means
+resolving and unpacking an image, generating an OCI runtime spec, attaching
+CNI, and programming published ports. Reimplementing that is a project in
+itself, and it is not this project.
+
+Reading needs none of it, and pays for the CLI three times over:
+
+- _Wording is a contract nobody agreed to._ `nerdctl inspect --format` answers
+  with a string, and "does this error mean it is already gone" is a guess
+  about phrasing. `removeNetwork` shipped broken for exactly this reason: the
+  test fake answered `no such network`, a string nerdctl never emits, so the
+  suite passed and the adapter threw against the first real daemon it met. A
+  field is not open to interpretation.
+- _A process per read._ `Containers.List` measures about 20ms against the
+  local socket; forking nerdctl costs several times that, and a reconcile pass
+  reads once per Pod.
+- _Events arrive typed._ `Events.Subscribe` delivers a container id and an
+  exit status in fields, replacing a line-oriented parse of `nerdctl events`
+  output — the most fragile code in the old adapter.
+
+**Consequences.** Three runtime dependencies (`@grpc/grpc-js`,
+`@grpc/proto-loader`, `protobufjs`) and 88K of vendored Apache-2.0 `.proto`
+files. They are vendored rather than fetched because they are the wire
+contract state is decoded through, and an `npm install` should not be able to
+change that quietly; `tsc` does not copy them, so the build carries them into
+`dist` explicitly.
+
+The adapter now talks to containerd two ways at once, which is a real cost in
+comprehension, paid for by never parsing a sentence again.
+
+**The one exception.** A Pod's IP address is a CNI result, not containerd
+state, so it is still read with `nerdctl inspect`. It is the only surviving
+read, and it is marked as such in the code.
+
+**Scope.** `Images`, `Snapshots` and everything else containerd exposes stay
+unused; only the three services actually read are vendored. Writing over gRPC
+remains out of scope, and decision 9's reasoning for that is unchanged.
+
+**Amended by decisions 30 and 33.** The read half is exactly right and is kept
+whole. The rest of this decision does not survive:
+
+- _Networks from CNI files_ is gone. It replaced parsing something
+  user-facing with parsing something private, and the answer was in a
+  container label (`nerdctl/networks`) the whole time. Networks are Compose's
+  to create and remove.
+- _The one exception_ is gone with it. Compose sets a container's hostname to
+  its service name, so a `<Service>` proxy targets `api-0:8080` by name and
+  nothing needs an IP address. `nerdctl inspect` has left the adapter
+  entirely.
+- _Writes through nerdctl_ is still true of the process being run, but the
+  vocabulary is now `compose`, not `run`/`rm`/`network create`.
+
+The justification given here for keeping the CLI on writes was also wrong on
+its own terms: it cited the `removeNetwork` wording bug, but that bug was in a
+_write_ path, so moving reads to the API could never have prevented it. The
+wording argument stands as an argument about reads; it was never an argument
+about the seam.
+
+## 30. Compose is the write path
+
+**Decision.** fiber-servo does not create containers. It produces a **Compose
+application model** — services, networks, labels — and `nerdctl compose`
+applies it. The adapter's whole write vocabulary is `apply(model)` and
+`down()`. There is no `createContainer`, no `startTask`, no argv built from a
+spec.
+
+**Why.** The previous adapter decomposed every spec into a `nerdctl run`
+invocation: flag by flag, it re-implemented the front half of Compose. That
+put fiber-servo in the business of image resolution policy, port syntax, CNI
+attachment and the order in which a sandbox and its members come up — none of
+which is what this project is about. The project is about **React as a control
+plane**. Everything below "what should exist" is someone else's solved problem.
+
+It also settles what fiber-servo _is_: a layer between Compose and Kubernetes.
+Compose describes an application but has no controller — it cannot count
+replicas, roll a new generation out, or bring a dead container back on its
+own. Kubernetes has all of that and a cluster's worth of machinery around it.
+fiber-servo keeps the controllers and hands the application to Compose.
+
+**Consequences.**
+
+- The immutability model largely moves into the actuator. Changing an image
+  means removing that one service and letting `up` recreate it; fiber-servo
+  keeps only the decisions Compose cannot make — how many replicas, which
+  generation, when to roll.
+- `fiber-servo plan` prints the Compose model, which is better than an action
+  list because it is literally what will be applied.
+- Sidecars go (decision 32), as does anything else Compose has no word for.
+- The word "service" now means two things. `ComposeService` — a container
+  definition — lives in `src/compose.ts` and nowhere else; `<Service>` stays
+  the Kubernetes-style endpoint it always was. Two meanings for one word in one
+  codebase is how a reader gets lost, so the boundary is enforced by which file
+  a name may appear in.
+
+## 31. `compose up` is not idempotent, so `apply` is two steps
+
+**Decision.** `apply()` runs `compose rm -f -s <service>` for each service
+whose recorded digest differs from the desired one, then
+`compose up -d --no-recreate`.
+
+**Why.** Measured against nerdctl 2.1.2, not assumed. A plain `compose up -d`
+on an **unchanged** model re-creates every container — every id changes.
+Docker Compose compares a config hash and reports "up-to-date"; nerdctl does
+not implement that. Under a level-triggered loop that would churn the entire
+application on every pass, for ever.
+
+`--no-recreate` fixes it, and does more than its name suggests:
+
+| command                                  | behaviour                                      |
+| ---------------------------------------- | ---------------------------------------------- |
+| `compose up -d`                          | recreates everything, always — unusable here   |
+| `compose up -d --no-recreate`            | zero re-creations, ids stable — idempotent     |
+| the same, after `nerdctl kill`           | runs `start` on the dead one — self-healing    |
+| `compose rm -f -s <svc>`, then the above | replaces that service only                     |
+| `compose down`                           | removes the containers and the project network |
+
+So step two alone creates what is missing and restarts what died; step one is
+what makes a _changed_ spec take effect. Which services changed is decided by
+comparing the desired digest against the `fiber-servo.spec` label read back
+from containerd — decision 26's mechanism, now carrying the write path too.
+
+**Consequences.** One measurement invalidated the premise the design had been
+approved with, which is the argument for running the actuator by hand before
+building on it. A service being removed must still appear in the file handed
+to `-f`, or `compose rm` answers "no such service" — so `apply()` writes the
+model plus a stub entry for each orphan, removes them, then rewrites the file
+as the model itself.
+
+## 32. There is no Pod; the container is the unit
+
+**Decision.** `<Pod>` is removed. `<ReplicaSet>` and `<Deployment>` own a
+`<Container>` template directly, and `network`, `labels` and `publish` move
+onto `ContainerSpec`. One container is one Compose service.
+
+**Why.** A Pod buys exactly one thing: several containers sharing a network
+namespace. Compose has no Pod, containerd has no Pod, and the emulation
+(decision 23) was ours to build and maintain — an infra container per Pod, a
+naming scheme, a rule about which member may publish a port, a level of
+nesting in every observed-state type, and an entire file of name assembly.
+Nothing in the examples used a sidecar.
+
+Removing it collapses the model onto the one Compose already has, which is
+what makes decision 30 cheap rather than a translation layer.
+
+**Consequences.** Sidecars are gone and are not coming back through the front
+door; a future one would be a Compose feature (`network_mode:
+service:<name>`), not a fiber-servo resource kind. `ObservedState` flattens to
+a map of containers. `<Ready on="db">` names a container. A ReplicaSet still
+counts, a Service still selects — neither ever cared what a Pod was.
+
+## 33. The seam is ownership, not read-versus-write
+
+**Decision.** The runtime boundary splits by **who owns the resource**:
+Compose owns containers and networks and is written to; containerd owns what
+is actually running and is read from. containerd is never mutated —
+`Containers.Create/Update/Delete`, every `Tasks` write, image pull, snapshot
+creation and namespace creation are all out of bounds, and the observer has no
+code that could perform one.
+
+**Why.** Decision 29 split by read-versus-write, and the shape of the result
+is what gave it away: three transports to one dependency (the nerdctl CLI,
+containerd's gRPC API, and nerdctl's on-disk CNI files), and a headline rule
+with an exception at the very first requirement. A rule that needs an
+exception to state is usually the wrong cut.
+
+Ownership makes the same three parties fall out cleanly, and each gets one
+transport:
+
+```text
+fiber-servo   decides what should exist         React + controllers
+nerdctl       makes it so                       compose up / rm / down
+containerd    says what is actually running     Containers, Tasks, Events
+```
+
+Writing through Compose while reading underneath it is not a layering
+violation, because the two answer different questions. Compose answers "did
+the application get applied"; containerd answers "is this process alive right
+now, and with what exit code" — which is the input a control loop needs, at the
+rate it needs it, and which no CLI invocation can deliver as a stream.
+
+**Consequences.** One configuration object owns both halves: the namespace
+goes to `nerdctl --namespace <ns> compose` _and_ into the gRPC
+`containerd-namespace` metadata, because a read path pointed at a different
+namespace than the write path would observe an empty world and reconcile
+for ever. The socket address is configurable for the same reason rootless
+containerd exists.
+
+## 34. Everything is a replacement now
+
+**Decision.** There is no in-place update. Any difference between a desired
+`ContainerSpec` and the one a container was created from — image, command,
+env, network, labels, published ports, **and now cpu and memory** — is
+answered the same way: remove that one service and let `compose up` recreate
+it.
+
+**Why.** The in-place path existed because containerd can change a cgroup
+limit under a running process, and `nerdctl update` exposed it. Compose has no
+live-update primitive at all: the model describes what should exist, and the
+way a changed model takes effect is that the container is made again. Keeping
+an in-place branch would mean reaching past the actuator to mutate something
+it believes it owns, which is precisely the seam decision 33 draws.
+
+**Consequences.** Raising a memory limit now restarts the process. That is a
+real loss and it should be stated rather than discovered: it is the price of
+having one write path instead of two, and of the planner no longer needing to
+know _which_ field changed — a digest comparison answers "same or different",
+and nothing above the adapter asks anything finer. Decision 26's recorded spec
+shrinks to that digest for the same reason.

@@ -1,6 +1,6 @@
 /**
- * A small application: a database Pod, a rolled-out API, and one Service in
- * front of the replicas.
+ * A small application: a database, a rolled-out API, and one Service in front
+ * of the replicas.
  *
  * Three things worth noticing:
  *
@@ -17,10 +17,10 @@ import {
   Container,
   Deployment,
   Network,
-  Pod,
   Ready,
   Service,
-  formatAction,
+  formatPlan,
+  planIsEmpty,
   memory,
   serve,
 } from '../src/index.js';
@@ -29,31 +29,28 @@ const app = (
   <>
     <Network name="backend" />
 
-    <Pod name="db" network="backend" labels={{ app: 'db' }}>
-      <Container
-        name="postgres"
-        image="docker.io/library/postgres:16"
-        env={{ POSTGRES_PASSWORD: 'dev' }}
-        ports={[5432]}
-        readiness={{ exec: ['pg_isready', '-U', 'postgres'] }}
-      />
-    </Pod>
+    <Container
+      name="db"
+      image="docker.io/library/postgres:16"
+      network="backend"
+      labels={{ app: 'db' }}
+      env={{ POSTGRES_PASSWORD: 'dev' }}
+      ports={[5432]}
+      readiness={{ exec: ['pg_isready', '-U', 'postgres'] }}
+    />
 
     {/* Declared only once the database reports ready. */}
     <Ready on="db" until="ready">
-      <Pod name="migrate" network="backend">
-        <Container name="migrate" image="api:v2" command={['./migrate']} />
-      </Pod>
+      <Container name="migrate" image="api:v2" network="backend" command={['./migrate']} />
 
       <Deployment name="api" replicas={3} strategy={{ maxSurge: 1 }}>
-        <Pod network="backend" labels={{ app: 'api' }}>
-          <Container
-            name="app"
-            image="api:v2"
-            env={{ DATABASE_URL: 'postgres://postgres:dev@db:5432/postgres' }}
-            ports={[8080]}
-          />
-        </Pod>
+        <Container
+          image="api:v2"
+          network="backend"
+          labels={{ app: 'api' }}
+          env={{ DATABASE_URL: 'postgres://postgres:dev@db:5432/postgres' }}
+          ports={[8080]}
+        />
       </Deployment>
 
       <Service
@@ -70,8 +67,9 @@ const app = (
 
 const served = serve(app, {
   runtime: memory(),
-  onActions: (actions) => {
-    for (const action of actions) console.log(`  ${formatAction(action)}`);
+  onApply: (plan) => {
+    if (planIsEmpty(plan)) return;
+    for (const line of formatPlan(plan).split('\n')) console.log(`  ${line}`);
   },
 });
 
@@ -82,8 +80,8 @@ for (let i = 0; i < 20; i++) {
 }
 
 console.log('\nobserved:');
-for (const pod of served.observed.snapshot().pods.values()) {
-  console.log(`  ${pod.name} ${pod.phase}`);
+for (const container of served.observed.snapshot().containers.values()) {
+  console.log(`  ${container.name} ${container.phase}`);
 }
 
 await served.stop();
