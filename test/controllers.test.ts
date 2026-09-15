@@ -2,13 +2,24 @@ import { describe, expect, it } from 'vitest';
 import {
   GENERATION_LABEL,
   OWNER_LABEL,
+  TEMPLATE_LABEL,
+  decodeTemplate,
+  encodeTemplate,
   expandDeployment,
   expandReplicaSet,
   runControllers,
   serviceEndpoints,
   serviceProxyContainer,
 } from '../src/controllers.js';
-import { digest, type DeploymentSpec, type DesiredState, type ReplicaSetSpec } from '../src/resources.js';
+import {
+  digest,
+  shortDigest,
+  SHORT_DIGEST_LENGTH,
+  type ContainerTemplate,
+  type DeploymentSpec,
+  type DesiredState,
+  type ReplicaSetSpec,
+} from '../src/resources.js';
 import type { ObservedContainer, ObservedState } from '../src/runtime/types.js';
 
 // ---- small builders, matching the style of test/observed.test.ts ----------
@@ -24,18 +35,33 @@ function container(overrides: Partial<ObservedContainer> = {}): ObservedContaine
   };
 }
 
-/** An observed container owned by a ReplicaSet/Deployment generation, as a real controller would stamp it. */
+/**
+ * An observed container owned by a Deployment generation, labelled the way a
+ * real controller labels one.
+ *
+ * It takes the *template*, not a generation string, because that is what the
+ * real thing has: `expandReplicaSet` derives the generation from
+ * `digest(template)` and carries the template itself in `TEMPLATE_LABEL`. A
+ * fixture that made up a generation with no template behind it would be
+ * describing a container fiber-servo cannot produce -- and the recovery this
+ * file tests would have nothing to recover.
+ */
 function ownedContainer(
   name: string,
   owner: string,
-  generation: string,
+  template: ContainerTemplate,
   overrides: Partial<ObservedContainer> = {},
 ): ObservedContainer {
   return container({
     name,
     phase: 'running',
-    labels: { [OWNER_LABEL]: owner, [GENERATION_LABEL]: generation },
-    image: 'api:v1',
+    labels: {
+      ...template.labels,
+      [OWNER_LABEL]: owner,
+      [GENERATION_LABEL]: shortDigest(template),
+      [TEMPLATE_LABEL]: encodeTemplate(template),
+    },
+    image: template.image,
     ...overrides,
   });
 }
@@ -57,8 +83,8 @@ describe('expandReplicaSet', () => {
     // observed at all (the third is missing/dead) — desired state must not
     // react to that.
     const observed = observedOf(
-      ownedContainer('web-0', 'web', digest(template)),
-      ownedContainer('web-1', 'web', digest(template)),
+      ownedContainer('web-0', 'web', template),
+      ownedContainer('web-1', 'web', template),
     );
     const containers = expandReplicaSet(spec, observed);
     expect(containers.map((c) => c.name)).toEqual(['web-0', 'web-1', 'web-2']);
@@ -76,7 +102,7 @@ describe('expandReplicaSet', () => {
     expect(at5).toEqual(['web-0', 'web-1', 'web-2', 'web-3', 'web-4']);
   });
 
-  it('stamps OWNER_LABEL and GENERATION_LABEL alongside the template labels', () => {
+  it('stamps the three controller labels alongside the template labels', () => {
     const spec: ReplicaSetSpec = {
       name: 'web',
       replicas: 1,
@@ -86,8 +112,29 @@ describe('expandReplicaSet', () => {
     expect(c!.labels).toEqual({
       app: 'web',
       [OWNER_LABEL]: 'web',
-      [GENERATION_LABEL]: digest(spec.template),
+      [GENERATION_LABEL]: shortDigest(spec.template),
+      [TEMPLATE_LABEL]: encodeTemplate(spec.template),
     });
+  });
+
+  // The template on the label is the one the generation is named after, so a
+  // later pass can recover it and prove it recovered the right one.
+  it('carries a template that round-trips back to the generation it names', () => {
+    const rich: ContainerTemplate = {
+      image: 'api:v1',
+      command: ['./server'],
+      env: { A: '1' },
+      network: 'backend',
+      ports: [8080],
+      publish: [{ host: 8080, target: 80 }],
+      resources: { cpu: 0.25, memory: '64m' },
+      readiness: { exec: ['/health'] },
+      labels: { app: 'web' },
+    };
+    const [c] = expandReplicaSet({ name: 'web', replicas: 1, template: rich }, EMPTY);
+    const recovered = decodeTemplate(c!.labels?.[TEMPLATE_LABEL]);
+    expect(recovered).toEqual(rich);
+    expect(shortDigest(recovered)).toBe(c!.labels?.[GENERATION_LABEL]);
   });
 
   it('rejects a negative or non-integer replica count', () => {
@@ -109,15 +156,43 @@ describe('expandReplicaSet', () => {
 
 describe('expandDeployment', () => {
   const deploymentTemplate = { image: 'api:v2' };
-  const newGen = digest(deploymentTemplate);
-  const oldGen = 'aaaaaaaa'; // stand-in for a previous template's digest
+  const newGen = shortDigest(deploymentTemplate);
+  // A real previous template, not a made-up digest: the generation IS
+  // `digest(template)`, and an old generation is only drainable because its
+  // containers still carry the template that named it.
+  const oldTemplate: ContainerTemplate = {
+    image: 'api:v1',
+    command: ['./server', '--legacy'],
+    env: { MODE: 'prod' },
+    network: 'backend',
+    resources: { cpu: 0.5, memory: '512m' },
+    readiness: { exec: ['/health'] },
+  };
+  const oldGen = shortDigest(oldTemplate);
 
+  /**
+   * The three containers generation `oldGen` actually produced -- built by
+   * running the real `expandReplicaSet` and recording what a runtime would
+   * observe back, rather than by hand, so `specDigest` is the digest of a
+   * spec this codebase can genuinely produce.
+   */
   function threeOldContainers(readyOverrides: Partial<ObservedContainer> = {}): ObservedContainer[] {
-    return [
-      ownedContainer('web-aaaaaaaa-0', 'web', oldGen, { at: 1, ...readyOverrides }),
-      ownedContainer('web-aaaaaaaa-1', 'web', oldGen, { at: 2, ...readyOverrides }),
-      ownedContainer('web-aaaaaaaa-2', 'web', oldGen, { at: 3, ...readyOverrides }),
-    ];
+    const produced = expandReplicaSet({ name: `web-${oldGen}`, replicas: 3, template: oldTemplate }, EMPTY);
+    return produced.map((c, i) =>
+      container({
+        name: c.name,
+        phase: 'running',
+        image: c.image,
+        networks: c.network ? [c.network] : [],
+        labels: { ...c.labels, [OWNER_LABEL]: 'web', [GENERATION_LABEL]: oldGen },
+        specDigest: digest({
+          ...c,
+          labels: { ...c.labels, [OWNER_LABEL]: 'web', [GENERATION_LABEL]: oldGen },
+        }),
+        at: i + 1,
+        ...readyOverrides,
+      }),
+    );
   }
 
   it('no new containers ready yet: surges by maxSurge, old generation holds all its containers', () => {
@@ -132,8 +207,8 @@ describe('expandDeployment', () => {
   it('some new containers ready: replicas split proportionally between generations', () => {
     const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
     const observed = observedOf(
-      ownedContainer('web-' + newGen + '-0', 'web', newGen, { phase: 'running' }),
-      ownedContainer('web-' + newGen + '-1', 'web', newGen, { phase: 'waiting' }), // not ready yet
+      ownedContainer(`web-${newGen}-0`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newGen}-1`, 'web', deploymentTemplate, { phase: 'waiting' }), // not ready yet
       ...threeOldContainers(),
     );
     const result = expandDeployment(spec, observed);
@@ -144,9 +219,9 @@ describe('expandDeployment', () => {
   it('all new containers ready: old generation is driven to zero and therefore disappears from the running set', () => {
     const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
     const observed = observedOf(
-      ownedContainer('web-' + newGen + '-0', 'web', newGen, { phase: 'running' }),
-      ownedContainer('web-' + newGen + '-1', 'web', newGen, { phase: 'running' }),
-      ownedContainer('web-' + newGen + '-2', 'web', newGen, { phase: 'running' }),
+      ownedContainer(`web-${newGen}-0`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newGen}-1`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newGen}-2`, 'web', deploymentTemplate, { phase: 'running' }),
       ...threeOldContainers(),
     );
     const result = expandDeployment(spec, observed);
@@ -179,6 +254,168 @@ describe('expandDeployment', () => {
     expect(expandDeployment(spec, EMPTY)).toEqual([
       { name: `web-${newGen}`, replicas: 2, template: deploymentTemplate },
     ]);
+  });
+
+  // The whole point of TEMPLATE_LABEL. Before it, an old generation was
+  // reconstructed from `image` + `labels` alone, so the moment a rollout
+  // started every surviving old container had a desired spec thinner than
+  // the one it was created from -- a different digest, so the planner
+  // replaced them all, without their command, env, network, resources or
+  // readiness probe.
+  describe('draining an old generation', () => {
+    const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
+
+    /**
+     * What `runControllers` produces for this Deployment: the ReplicaSets it
+     * expands, with the owner and generation labels corrected to the
+     * Deployment's own name the way that function corrects them.
+     */
+    function desiredContainers(observed: ObservedState) {
+      return expandDeployment(spec, observed).flatMap((rs) =>
+        expandReplicaSet(rs, observed).map((c) => ({
+          ...c,
+          labels: {
+            ...c.labels,
+            [OWNER_LABEL]: 'web',
+            [GENERATION_LABEL]: rs.name.slice(-SHORT_DIGEST_LENGTH),
+          },
+        })),
+      );
+    }
+
+    function oldReplicaSet(): ReplicaSetSpec {
+      const observed = observedOf(...threeOldContainers());
+      const found = expandDeployment(spec, observed).find((rs) => rs.name === `web-${oldGen}`);
+      if (!found) throw new Error('the old generation was not returned at all');
+      return found;
+    }
+
+    it('recovers the old template exactly, field for field', () => {
+      expect(oldReplicaSet().template).toEqual(oldTemplate);
+    });
+
+    it.each([
+      ['env', (t: ContainerTemplate) => t.env],
+      ['command', (t: ContainerTemplate) => t.command],
+      ['network', (t: ContainerTemplate) => t.network],
+      ['resources', (t: ContainerTemplate) => t.resources],
+      ['readiness', (t: ContainerTemplate) => t.readiness],
+    ])('keeps %s, which the old reconstruction dropped', (_name, read) => {
+      expect(read(oldReplicaSet().template)).toEqual(read(oldTemplate));
+    });
+
+    // The strongest statement of the fix: a container recreated mid-drain is
+    // byte-identical to the one it replaces, so nothing downstream can tell
+    // that it was ever gone.
+    it('regenerates a container that died mid-rollout with an unchanged spec', () => {
+      const alive = threeOldContainers();
+      const [killed] = alive;
+      const observed = observedOf(...alive.slice(1)); // `web-<oldGen>-0` has died
+      const regenerated = desiredContainers(observed).find((c) => c.name === killed!.name);
+
+      expect(regenerated).toBeDefined();
+      expect(digest(regenerated)).toBe(killed!.specDigest);
+    });
+
+    // And the completion criterion: merely starting a rollout must not mark
+    // a single old container as changed.
+    it('replaces no old container just because a rollout started', () => {
+      const observed = observedOf(...threeOldContainers());
+      const desired = desiredContainers(observed);
+      for (const [name, was] of observed.containers) {
+        const now = desired.find((c) => c.name === name);
+        expect(now, `${name} vanished from the desired set`).toBeDefined();
+        expect(digest(now), `${name} would be replaced`).toBe(was.specDigest);
+      }
+    });
+
+    // A container whose template cannot be reproduced is not kept under a
+    // spec this code invented; see `TEMPLATE_LABEL`.
+    it('drops a generation whose template cannot be recovered rather than guessing at it', () => {
+      const [first, ...rest] = threeOldContainers();
+      const stripped = { ...first!, labels: { ...first!.labels, [TEMPLATE_LABEL]: 'not decodable' } };
+      const withoutLabel = rest.map((c) => {
+        const { [TEMPLATE_LABEL]: _gone, ...labels } = c.labels;
+        return { ...c, labels };
+      });
+      const result = expandDeployment(spec, observedOf(stripped, ...withoutLabel));
+      expect(result.map((rs) => rs.name)).toEqual([`web-${newGen}`]);
+    });
+  });
+
+  // "the process started" and "it can serve traffic" are different facts, and
+  // a rollout that conflates them defeats maxUnavailable exactly when it
+  // matters: the old generation is drained during the window in which the
+  // new one is up but cannot answer anything.
+  describe('readiness-aware progress', () => {
+    const probed: ContainerTemplate = { image: 'api:v2', readiness: { exec: ['/health'] } };
+    const probedGen = shortDigest(probed);
+    const spec: DeploymentSpec = {
+      name: 'web',
+      replicas: 3,
+      template: probed,
+      strategy: { maxUnavailable: 0 },
+    };
+
+    function newContainers(ready: boolean | undefined, count: number): ObservedContainer[] {
+      return Array.from({ length: count }, (_, i) =>
+        ownedContainer(`web-${probedGen}-${i}`, 'web', probed, { phase: 'running', ready }),
+      );
+    }
+
+    it('does not shrink the old generation for a container that is running but not ready', () => {
+      const observed = observedOf(...newContainers(false, 2), ...threeOldContainers());
+      const result = expandDeployment(spec, observed);
+      // newReady is 0, so the old generation keeps all three: 3 - 0 - 0.
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(3);
+    });
+
+    it('resumes progress once those containers report ready', () => {
+      const observed = observedOf(...newContainers(true, 2), ...threeOldContainers());
+      const result = expandDeployment(spec, observed);
+      expect(result.find((rs) => rs.name === `web-${probedGen}`)?.replicas).toBe(3); // min(3, 2+1)
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+    });
+
+    // The guarantee stated plainly: at no point does ready-new plus kept-old
+    // fall below `replicas`.
+    it('never lets availability dip below replicas while maxUnavailable is 0', () => {
+      for (const [readyCount, unready] of [
+        [0, 3],
+        [1, 2],
+        [2, 1],
+        [3, 0],
+      ]) {
+        const observed = observedOf(
+          ...newContainers(true, readyCount!),
+          ...newContainers(false, unready!).map((c, i) => ({
+            ...c,
+            name: `web-${probedGen}-${readyCount! + i}`,
+          })),
+          ...threeOldContainers(),
+        );
+        const keptOld = expandDeployment(spec, observed).find((rs) => rs.name === `web-${oldGen}`);
+        expect(
+          readyCount! + (keptOld?.replicas ?? 0),
+          `with ${String(readyCount)} ready`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    });
+
+    it('still counts a merely running container when the template has no probe', () => {
+      const unprobed: ContainerTemplate = { image: 'api:v2' };
+      const gen = shortDigest(unprobed);
+      const observed = observedOf(
+        ownedContainer(`web-${gen}-0`, 'web', unprobed, { phase: 'running' }), // ready is undefined
+        ownedContainer(`web-${gen}-1`, 'web', unprobed, { phase: 'running' }),
+        ...threeOldContainers(),
+      );
+      const result = expandDeployment(
+        { name: 'web', replicas: 3, template: unprobed, strategy: { maxUnavailable: 0 } },
+        observed,
+      );
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+    });
   });
 
   it('feeding a generated ReplicaSet through expandReplicaSet yields deterministic container names', () => {
@@ -309,7 +546,7 @@ describe('runControllers', () => {
     expect(result.containers).toHaveLength(2);
     for (const c of result.containers) {
       expect(c.labels?.[OWNER_LABEL]).toBe('web'); // the Deployment's name, not the generated ReplicaSet's
-      expect(c.labels?.[GENERATION_LABEL]).toBe(digest(template));
+      expect(c.labels?.[GENERATION_LABEL]).toBe(shortDigest(template));
     }
   });
 

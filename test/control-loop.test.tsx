@@ -64,6 +64,44 @@ describe('a single container', () => {
     await served.stop();
   });
 
+  // A network-only tree changes no service, so before networks entered the
+  // plan it produced an empty plan and nothing reached the runtime at all:
+  // declaring a network created nothing.
+  it('applies a tree that declares only a network', async () => {
+    const { served, runtime } = start(<Network name="solo" subnet="10.77.0.0/24" />);
+    await settle(served);
+
+    const applied = runtime.calls.filter((c) => c.startsWith('apply '));
+    expect(applied.length).toBeGreaterThan(0);
+
+    await served.stop();
+  });
+
+  it('applies again when only a network changed', async () => {
+    const { served, runtime } = start(
+      <>
+        <Network name="demo" subnet="10.1.0.0/24" />
+        <Container name="web" image="nginx:alpine" network="demo" />
+      </>,
+    );
+    await settle(served);
+    const before = runtime.calls.filter((c) => c.startsWith('apply ')).length;
+
+    served.root.render(
+      <>
+        <Network name="demo" subnet="10.2.0.0/24" />
+        <Container name="web" image="nginx:alpine" network="demo" />
+      </>,
+    );
+    await settle(served);
+
+    expect(runtime.calls.filter((c) => c.startsWith('apply ')).length).toBeGreaterThan(before);
+    // And the container itself was not disturbed by it.
+    expect(served.observed.get('web')?.phase).toBe('running');
+
+    await served.stop();
+  });
+
   it('removes the container when it leaves the tree', async () => {
     const { served, runtime } = start(<Container name="web" image="nginx:alpine" />);
     await settle(served);
@@ -423,6 +461,80 @@ describe('restart backoff gate', () => {
 
     await served.stop();
   }, 10_000);
+
+  // A restart history is about a thing that was run, not about a name. The
+  // failure this guards against is silent: a container that crash-looped to
+  // `maxRestarts` under a broken image stayed given up on after the image
+  // was fixed, because the give-up was keyed on the name alone — and the
+  // warning had already been logged, so nothing said anything ever again.
+  describe('spec identity', () => {
+    async function crashToGiveUp(runtime: MemoryRuntime, served: Served): Promise<void> {
+      await served.reconcile();
+      runtime.kill('app'); // 1st crash: consumes the single allowed restart
+      await served.idle();
+      runtime.kill('app'); // 2nd: over the cap
+      await served.idle();
+      expect(served.observed.get('app')).toBeUndefined();
+    }
+
+    it('starts a fixed container again even after the broken one was given up on', async () => {
+      const runtime = createMemoryRuntime();
+      const served = serve(<Container name="app" image="broken:v1" />, {
+        runtime: () => runtime,
+        restart: { baseDelayMs: 20, factor: 1, maxRestarts: 1 },
+      });
+      await crashToGiveUp(runtime, served);
+
+      // The fix: same container, different image. It has never failed.
+      served.root.render(<Container name="app" image="fixed:v2" />);
+      await settle(served);
+
+      expect(served.observed.get('app')?.phase).toBe('running');
+      expect(served.observed.get('app')?.image).toBe('fixed:v2');
+
+      await served.stop();
+    }, 10_000);
+
+    it('keeps giving up while the spec is unchanged', async () => {
+      const runtime = createMemoryRuntime();
+      const served = serve(<Container name="app" image="broken:v1" />, {
+        runtime: () => runtime,
+        restart: { baseDelayMs: 20, factor: 1, maxRestarts: 1 },
+      });
+      await crashToGiveUp(runtime, served);
+
+      // Re-rendering the very same spec is not a fix, and must not read as one.
+      served.root.render(<Container name="app" image="broken:v1" />);
+      await settle(served);
+      await sleep(300);
+      await served.idle();
+
+      expect(served.observed.get('app')).toBeUndefined();
+      await served.stop();
+    }, 10_000);
+
+    it('does not carry a held backoff across a spec change either', async () => {
+      const runtime = createMemoryRuntime();
+      const served = serve(<Container name="app" image="broken:v1" />, {
+        runtime: () => runtime,
+        // A 30s window: if the fixed spec inherited this hold, it could not
+        // possibly come back inside this test.
+        restart: { baseDelayMs: 30_000, factor: 1, maxDelayMs: 60_000 },
+      });
+      await served.reconcile();
+      runtime.kill('app'); // free restart, opens a 30s window
+      await served.idle();
+      runtime.kill('app'); // held for 30s
+      await served.idle();
+      expect(served.observed.get('app')).toBeUndefined();
+
+      served.root.render(<Container name="app" image="fixed:v2" />);
+      await settle(served);
+
+      expect(served.observed.get('app')?.image).toBe('fixed:v2');
+      await served.stop();
+    }, 10_000);
+  });
 
   it('resets the backoff after the container has stayed up for resetAfterMs', async () => {
     const runtime = createMemoryRuntime();

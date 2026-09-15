@@ -30,12 +30,12 @@
  * this pass's model at all.
  */
 import type { ReactNode } from 'react';
-import { DEFAULT_PROJECT, renderCompose } from './compose.js';
+import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
 import { runControllers } from './controllers.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
-import type { ContainerSpec, DesiredState } from './resources.js';
+import { digest, type ContainerSpec, type DesiredState } from './resources.js';
 import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
 // ---- restart backoff --------------------------------------------------------
@@ -84,6 +84,17 @@ export function backoffDelay(consecutive: number, policy: ResolvedPolicy): numbe
 const MAX_IDENTICAL_PASSES = 20;
 
 interface RestartRecord {
+  /**
+   * `digest()` of the `ContainerSpec` these failures belong to.
+   *
+   * A restart history is a statement about *a thing that was run*, not about
+   * a name. Keyed on the name alone, a container that crash-looped to
+   * `maxRestarts` under a broken image stayed given up on after the image
+   * was fixed: the fix is a different spec, it has never failed once, and
+   * nothing would ever try it. Worse, it is silent — the give-up warning was
+   * already logged, so the corrected version simply never starts.
+   */
+  specDigest: string;
   consecutive: number;
   /** Earliest time this container may be admitted again after an exit. */
   nextAt: number;
@@ -136,19 +147,39 @@ class RestartGate {
     private readonly now: () => number,
   ) {}
 
-  /** `true` to include `name` this pass; a retry time; or `null` to give up permanently. */
-  admit(name: string, phase: ContainerPhase | 'absent'): true | { retryAt: number } | null {
+  /**
+   * `true` to include `name` this pass; a retry time; or `null` to give up
+   * permanently.
+   *
+   * `specDigest` identifies *what* is being asked for, and a record only
+   * applies while it still matches: edit the image, the command, the env —
+   * anything — and the history of the previous spec is dropped rather than
+   * held against its replacement. That is the difference between "this
+   * container keeps dying" and "this name keeps dying", and only the first
+   * is a reason to hold anything back.
+   */
+  admit(
+    name: string,
+    specDigest: string,
+    phase: ContainerPhase | 'absent',
+  ): true | { retryAt: number } | null {
     if (phase !== 'exited' && phase !== 'absent') return true; // running/waiting/unknown: never gated
-    const record = this.records.get(name);
+    const record = this.forSpec(name, specDigest);
     if (phase === 'absent' && record === undefined) return true; // never created yet: nothing to gate
 
     const now = this.now();
 
     if (record === undefined || now - record.lastAt >= this.policy.resetAfterMs) {
-      // A first-ever crash, or one far enough past the last restart to count
-      // as a fresh problem rather than a continuation of the old one: always
-      // let the first restart through immediately.
-      this.records.set(name, { consecutive: 1, nextAt: now + backoffDelay(1, this.policy), lastAt: now });
+      // A first-ever crash, a crash of a spec this gate has not seen fail
+      // before, or one far enough past the last restart to count as a fresh
+      // problem rather than a continuation: let the first restart through
+      // immediately.
+      this.records.set(name, {
+        specDigest,
+        consecutive: 1,
+        nextAt: now + backoffDelay(1, this.policy),
+        lastAt: now,
+      });
       return true;
     }
     if (record.consecutive >= this.policy.maxRestarts) return null;
@@ -157,6 +188,20 @@ class RestartGate {
     record.lastAt = now;
     record.nextAt = now + backoffDelay(record.consecutive, this.policy);
     return true;
+  }
+
+  /**
+   * The record for this name *if it is still about this spec*. A record for
+   * a spec that is no longer wanted is deleted here rather than left to be
+   * skipped over, so nothing downstream can read it by accident and so a
+   * later crash of the new spec starts a genuinely fresh streak.
+   */
+  private forSpec(name: string, specDigest: string): RestartRecord | undefined {
+    const record = this.records.get(name);
+    if (record === undefined) return undefined;
+    if (record.specDigest === specDigest) return record;
+    this.records.delete(name);
+    return undefined;
   }
 
   /** Drop bookkeeping for a container the tree no longer wants at all. */
@@ -216,6 +261,19 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   // Loop-guard state; see `wedged` below.
   let lastModel = '';
+  /**
+   * The model most recently handed to `runtime.apply`.
+   *
+   * Only the networks in it are read back (see `Plan.networks`): they are the
+   * one part of the model with nothing observable behind it, because Compose
+   * owns their lifecycle and `ObservedState` therefore carries none. Keeping
+   * it here rather than deriving it is a deliberate, bounded exception to
+   * "every pass recomputes from observed state" — and a safe one, since a
+   * process that has just started has no previous model, treats every
+   * declared network as new, and applies once. The cost of that is a single
+   * idempotent `compose up`.
+   */
+  let lastApplied: ComposeApplication | undefined;
   let repeats = 0;
   let stalled = false;
 
@@ -285,11 +343,14 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     const included: ContainerSpec[] = [];
     for (const spec of target.containers) {
       const phase = snapshot.containers.get(spec.name)?.phase ?? 'absent';
-      const verdict = gate.admit(spec.name, phase);
+      // The same digest the runtime records in `SPEC_LABEL`, so "has this
+      // changed" means one thing across the whole write path.
+      const specDigest = digest(spec);
+      const verdict = gate.admit(spec.name, specDigest, phase);
       if (verdict === null) {
         if (!warnedGiveUp.has(spec.name)) {
           warnedGiveUp.add(spec.name);
-          log(`giving up on ${spec.name} after ${policy.maxRestarts} restarts`);
+          log(`giving up on ${spec.name} after ${policy.maxRestarts} restarts; edit its spec to try again`);
         }
         continue;
       }
@@ -304,7 +365,12 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
 
     // 3. Build the Compose Application Model this pass would apply, and stop
     //    if reconciling it is not converging (see `wedged` below).
-    const plan = planApply({ networks: target.networks, containers: included }, snapshot, project);
+    const plan = planApply(
+      { networks: target.networks, containers: included },
+      snapshot,
+      project,
+      lastApplied,
+    );
     if (wedged(plan)) return;
 
     options.onApply?.(plan);
@@ -327,6 +393,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     // 4. Hand the whole model to the runtime. It decides create vs. replace
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
+    lastApplied = plan.model;
   }
 
   /**

@@ -38,6 +38,8 @@
 import {
   digest,
   selectorMatches,
+  shortDigest,
+  SHORT_DIGEST_LENGTH,
   type ContainerSpec,
   type ContainerTemplate,
   type DeploymentSpec,
@@ -51,6 +53,42 @@ import type { ObservedContainer, ObservedState } from './runtime/types.js';
 /** Label keys the controllers stamp on the Containers they own, so ownership is visible at runtime. */
 export const OWNER_LABEL = 'fiber-servo.owner';
 export const GENERATION_LABEL = 'fiber-servo.generation';
+
+/**
+ * The `ContainerTemplate` a replica was stamped from, as percent-encoded JSON.
+ *
+ * This exists for exactly one reader: `expandDeployment`, draining an old
+ * generation. A Deployment carries one template — the current one — and these
+ * controllers keep nothing between calls, so when a rollout starts there is
+ * no longer anywhere in the process that remembers what the *previous*
+ * generation's template said. Without this label the only recoverable fields
+ * were `image` and `labels`, which is not a partial answer but a wrong one:
+ * the reconstructed template digests differently from the real one, so every
+ * surviving old-generation container is seen as out of date and replaced —
+ * with a spec missing its command, env, network, resources and readiness
+ * probe. Starting a rollout was enough to trigger it.
+ *
+ * Putting it on the resource rather than in a cache is the same choice
+ * decision 26 makes for `fiber-servo.spec`, and for the same reason: a
+ * fiber-servo restart mid-rollout must not lose it. Percent-encoded because
+ * the value is JSON and a label is a flat string.
+ */
+export const TEMPLATE_LABEL = 'fiber-servo.template';
+
+export function encodeTemplate(template: ContainerTemplate): string {
+  return encodeURIComponent(JSON.stringify(template));
+}
+
+/** Inverse of `encodeTemplate`. A foreign or corrupt value reads as "not recoverable", never as a throw. */
+export function decodeTemplate(value: string | undefined): ContainerTemplate | undefined {
+  if (!value) return undefined;
+  try {
+    const template = JSON.parse(decodeURIComponent(value)) as ContainerTemplate;
+    return typeof template?.image === 'string' ? template : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ---- ReplicaSet -------------------------------------------------------------
 
@@ -102,7 +140,15 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: ReplicaSet "${spec.name}" replicas must be a non-negative integer`);
   }
-  const labels = ownedLabels(spec.template.labels, spec.name, digest(spec.template));
+  const labels = {
+    ...ownedLabels(spec.template.labels, spec.name, shortDigest(spec.template)),
+    // The template travels with the replica, so a later pass — or a later
+    // process — can reproduce it exactly; see `TEMPLATE_LABEL`. Encoded from
+    // `spec.template`, never from the labels being built here, so there is
+    // no recursion: a template's own labels are the user's, and the three
+    // controller labels are added on top.
+    [TEMPLATE_LABEL]: encodeTemplate(spec.template),
+  };
   const containers: ContainerSpec[] = [];
   for (let i = 0; i < spec.replicas; i++) {
     containers.push({ ...spec.template, name: `${spec.name}-${i}`, labels });
@@ -113,43 +159,65 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
 // ---- Deployment ---------------------------------------------------------
 
 /**
- * `digest()` always renders as exactly 8 lowercase hex characters (32-bit
- * FNV-1a, `padStart(8, '0')` — see resources.ts), so it can be recovered
- * from the end of `${deployment.name}-${digest}` without re-parsing the
- * deployment name, which may itself contain hyphens.
+ * A generation id is `shortDigest()`, which is always exactly
+ * `SHORT_DIGEST_LENGTH` lowercase hex characters (see resources.ts), so it
+ * can be recovered from the end of `${deployment.name}-${generation}`
+ * without re-parsing the deployment name, which may itself contain hyphens.
  */
-const DIGEST_LENGTH = 8;
+const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
 
 /**
- * Reconstruct a best-effort `ContainerTemplate` for an old generation from
- * its observed Containers, because `expandDeployment` is a pure function of
- * the *current* `DeploymentSpec` — a Deployment carries one template, not a
- * history of them, and this module keeps no state of its own between calls
- * (see the module doc comment). So the only place an old generation's shape
- * can still be read from is the Containers it already produced.
+ * Recover an old generation's `ContainerTemplate` from the Containers it
+ * produced.
  *
- * `ObservedContainer` carries no full spec any more — only a `specDigest`,
- * an opaque hash — because under the Compose write path the response to any
- * spec difference is uniformly "remove this service, let it be recreated",
- * so nothing downstream ever needed to know *which* field moved, and the
- * full spec stopped being worth carrying in observed state at all. That
- * leaves `image` and `labels` as the only fields this function can recover
- * — not command, env, ports, resources or a readiness probe. That is enough
- * for this function's one job, draining a generation to zero: every
- * old-generation container this template could produce already exists, so
- * its content is only ever read again if the control loop needs to recreate
- * one that died mid-drain, in which case it comes back thinner than it
- * started. Carrying the real template forward instead would mean caching it
- * somewhere across calls, which is precisely the statefulness this module
- * trades away.
+ * `expandDeployment` is a pure function of the *current* `DeploymentSpec`,
+ * and a Deployment carries one template, not a history of them — so the only
+ * place an old generation's shape survives is the Containers themselves,
+ * which carry it in `TEMPLATE_LABEL`.
+ *
+ * The recovered template is checked against the generation it claims to be:
+ * `shortDigest(template)` is what named the generation in the first place, so if
+ * the two agree the recovery is exact, not approximate. That check is what
+ * makes it safe to hand the result back to `expandReplicaSet` as if it were
+ * the original template, because it provably is one.
+ *
+ * `undefined` means this generation cannot be reproduced — no label (a
+ * container from before this label existed, or one relabelled by hand) or a
+ * digest that does not match. Guessing at the rest of the spec is what the
+ * previous version of this function did, and the guess was worse than
+ * nothing: see `TEMPLATE_LABEL`.
  */
-function reconstructTemplate(containers: readonly ObservedContainer[]): ContainerTemplate {
-  const [sample] = [...containers].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  if (!sample) {
-    throw new Error('fiber-servo: internal: reconstructTemplate called with no observed containers');
+function recoverTemplate(
+  containers: readonly ObservedContainer[],
+  generation: string,
+): ContainerTemplate | undefined {
+  const sorted = [...containers].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const container of sorted) {
+    const template = decodeTemplate(container.labels[TEMPLATE_LABEL]);
+    if (template && shortDigest(template) === generation) return template;
   }
-  const { [OWNER_LABEL]: _owner, [GENERATION_LABEL]: _generation, ...labels } = sample.labels;
-  return { image: sample.image ?? '', labels };
+  return undefined;
+}
+
+/**
+ * Whether a Container counts towards a rollout's progress.
+ *
+ * `running` means a process started. When the template declares a readiness
+ * probe it does *not* mean the process can do its job yet — that is the whole
+ * reason the probe was written — so a generation with a probe counts only
+ * Containers that have actually answered it. Without the distinction,
+ * `maxUnavailable: 0` guarantees nothing: the rollout would shrink the old
+ * generation as soon as the new one's processes existed, which is precisely
+ * the window in which the new ones cannot serve anything.
+ *
+ * A template with no probe has nothing to wait for, so `running` is the whole
+ * answer — and `ready` is left `undefined` in that case anyway (see
+ * `ObservedContainer.ready`), which is why this asks the template rather than
+ * inferring the rule from the observation.
+ */
+function isReady(container: ObservedContainer, template: ContainerTemplate): boolean {
+  if (container.phase !== 'running') return false;
+  return template.readiness === undefined || container.ready === true;
 }
 
 /** The oldest of a generation's Containers, by observation time — the best proxy available, since `ObservedContainer` records when it was last seen, not when it was created. */
@@ -161,14 +229,15 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  * A Deployment becomes one ReplicaSet per template generation: `newRS` for
  * `spec.template` as it reads right now, and one `oldRS` per generation that
  * still has Containers running from an earlier apply. A generation's
- * identity is `digest(template)` (decision 4's naming discipline, extended:
+ * identity is `shortDigest(template)` (decision 4's naming discipline, extended:
  * an unchanged template keeps the same name, and therefore the same
  * ReplicaSet, for free; an edited one gets a new name and therefore a new
  * rollout instead of mutating Containers in place).
  *
  * Rollout math (PLAN.md "Deployment rollout semantics", step 8): let
  * `newReady` be the observed count of the new generation's Containers that
- * are `running`, `maxSurge` (default 1) the Containers allowed above
+ * are ready — `running`, and answering their readiness probe if the template
+ * declares one (see `isReady`) — `maxSurge` (default 1) the Containers allowed above
  * `replicas`, and `maxUnavailable` (default 0) the Containers allowed
  * missing below it.
  *
@@ -194,7 +263,7 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: Deployment "${spec.name}" replicas must be a non-negative integer`);
   }
-  const newGeneration = digest(spec.template);
+  const newGeneration = shortDigest(spec.template);
   const maxSurge = spec.strategy?.maxSurge ?? 1;
   const maxUnavailable = spec.strategy?.maxUnavailable ?? 0;
 
@@ -211,7 +280,7 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
     else byGeneration.set(generation, [container]);
   }
 
-  const newReady = (byGeneration.get(newGeneration) ?? []).filter((c) => c.phase === 'running').length;
+  const newReady = (byGeneration.get(newGeneration) ?? []).filter((c) => isReady(c, spec.template)).length;
   const newReplicas = Math.min(spec.replicas, newReady + maxSurge);
 
   const result: ReplicaSetSpec[] = [];
@@ -225,13 +294,19 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
 
   let oldBudget = Math.max(0, spec.replicas - newReady - maxUnavailable);
   for (const [generation, containers] of oldGenerations) {
+    const template = recoverTemplate(containers, generation);
+    // A generation whose template cannot be reproduced is left out of the
+    // desired set entirely, which removes its Containers. That is a real
+    // loss and it is the lesser one: the alternative is to keep them alive
+    // under a spec this function invented, and "running a container nobody
+    // asked for" is the failure this whole model exists to avoid. In
+    // practice it means Containers created before `TEMPLATE_LABEL` existed
+    // are drained by the first rollout after an upgrade rather than
+    // recreated as something else.
+    if (!template) continue;
     const allocated = Math.min(containers.length, oldBudget);
     oldBudget -= allocated;
-    result.push({
-      name: `${spec.name}-${generation}`,
-      replicas: allocated,
-      template: reconstructTemplate(containers),
-    });
+    result.push({ name: `${spec.name}-${generation}`, replicas: allocated, template });
   }
   return result;
 }
@@ -388,7 +463,7 @@ export function runControllers(
           // after `replicaSet.name`, which is `${deployment}-${digest}`, so
           // it is corrected here to the Deployment's own name. The
           // generation label it stamped is already right — it recomputed
-          // `digest(replicaSet.template)`, which for the new generation
+          // `shortDigest(replicaSet.template)`, which for the new generation
           // *is* `spec.template` and for an old one is what named this very
           // ReplicaSet in the first place — but pulling it straight from
           // the name (see `DIGEST_LENGTH`) avoids trusting a second

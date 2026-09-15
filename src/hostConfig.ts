@@ -206,7 +206,7 @@ function toResource(instance: Instance): Resource {
     case 'network': {
       const name = requireName('network', instance.props);
       const spec: NetworkSpec = {
-        ...pick<Omit<NetworkSpec, 'name'>>(instance.props, ['subnet', 'labels']),
+        ...pick<Omit<NetworkSpec, 'name'>>(instance.props, ['subnet']),
         name,
       };
       return { kind: 'network', name, spec };

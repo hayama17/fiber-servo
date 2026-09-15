@@ -20,6 +20,7 @@
  * Container attaches to a Network, a Service selects Containers) and they are
  * expressed by *name*, never by nesting.
  */
+import { createHash } from 'node:crypto';
 
 /** A host port bound to a port inside the container. */
 export interface PortMapping {
@@ -37,6 +38,17 @@ export interface ReadinessProbe {
   exec: readonly string[];
   /** Time between attempts. Default 2000. */
   intervalMs?: number;
+  /**
+   * Give up on one attempt after this long and count it as a failure.
+   * Default 2000.
+   *
+   * A probe runs against a container that may be unwell, so "the probe never
+   * returns" is a case to design for rather than an exotic one. Without a
+   * bound, one stuck probe leaves the container permanently un-ready (so
+   * anything waiting on it waits for ever) and holds a runtime lock that
+   * teardown then blocks behind.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -90,13 +102,19 @@ export type ContainerTemplate = Omit<ContainerSpec, 'name'>;
 
 /**
  * A local bridge network: roughly a Docker user-defined network. Containers on
- * the same Network reach each other by name; the fields other than `name` are immutable
- * once created, so changing one replaces the Network.
+ * the same Network reach each other by name; the fields other than `name` are
+ * immutable once created, so changing one replaces the Network.
+ *
+ * There is no `labels` here, and the omission is deliberate: a Compose network
+ * can declare labels, but nerdctl does not pass them on — verified against
+ * nerdctl 2.1.2 in both the map and the list syntax, and the created network
+ * carries only Compose's own two labels either way. A field you can set that
+ * provably does nothing is worse than no field, so it is not offered.
  */
 export interface NetworkSpec {
   name: string;
+  /** CIDR for the bridge, e.g. `10.88.0.0/24`. The gateway is chosen by the runtime. */
   subnet?: string;
-  labels?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -214,20 +232,45 @@ export function specValueEquals(a: unknown, b: unknown): boolean {
 }
 
 /**
- * A short, stable hash of a spec. Used for two things: naming a template
- * generation (a Deployment's ReplicaSets are keyed by it) and recognising a
- * resource the runtime already holds as the one we meant to create.
+ * A stable hash of a spec: 64 lowercase hex characters of SHA-256 over the
+ * spec's key-sorted JSON.
+ *
+ * This is load-bearing in three places — it decides whether a running
+ * container is still the one that was asked for (`fiber-servo.spec`), whether
+ * a restart history still applies to what is being run, and which template
+ * generation a Deployment replica belongs to — so a collision is not a
+ * cosmetic problem. It would mean a changed spec that reconciles as
+ * unchanged: the container keeps running the old image and no layer ever
+ * notices, because "same digest" is the only question anyone asks.
+ *
+ * An earlier version used 32-bit FNV-1a, eight hex characters, and waved the
+ * risk away as "only costs an unnecessary rollout" — which had it exactly
+ * backwards, since the failure is a rollout that does not happen. With a
+ * 32-bit space, a few tens of thousands of distinct specs make a collision
+ * likelier than not; with SHA-256 the assumption needs no defending at all.
+ *
+ * Where a digest has to be part of a *name* rather than a comparison, use
+ * `shortDigest`: that is a readability decision about names, and keeping the
+ * two functions separate is what stops it from quietly becoming a
+ * correctness decision about identity.
  */
 export function digest(value: unknown): string {
-  const json = stableJson(value);
-  // FNV-1a, 32 bit. Short and readable in a container name; collisions here
-  // only cost an unnecessary rollout, never correctness of identity.
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < json.length; i++) {
-    hash ^= json.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash.toString(16).padStart(8, '0');
+  return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+/**
+ * How much of a digest is used where it becomes part of a name — a
+ * Deployment generation, and therefore a ReplicaSet and container name.
+ *
+ * 16 hex characters is 64 bits: short enough to read in `nerdctl ps`, and far
+ * past the point where an accidental collision between the handful of
+ * template generations one Deployment ever has is worth thinking about.
+ */
+export const SHORT_DIGEST_LENGTH = 16;
+
+/** `digest`, truncated for use in a name. Never for deciding whether two specs match. */
+export function shortDigest(value: unknown): string {
+  return digest(value).slice(0, SHORT_DIGEST_LENGTH);
 }
 
 /** JSON with object keys sorted, so a digest does not depend on key order. */

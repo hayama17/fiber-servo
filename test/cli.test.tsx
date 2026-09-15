@@ -79,7 +79,7 @@ describe('cli plan', () => {
       // content-addressed, so the digest cannot be hardcoded, only shown to be
       // one generation across both replicas.
       const replicas = gated
-        .map((l) => /^create web-([0-9a-f]{8})-([01]) image=nginx:alpine$/.exec(l))
+        .map((l) => /^create web-([0-9a-f]{16})-([01]) image=nginx:alpine$/.exec(l))
         .filter((m): m is RegExpExecArray => m !== null);
       expect(replicas, `expected two replica containers in:\n${gated.join('\n')}`).toHaveLength(2);
       expect(replicas[1]![1]).toBe(replicas[0]![1]);

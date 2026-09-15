@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MANAGED_LABEL, SPEC_LABEL, toComposeApplication } from '../src/compose.js';
-import { formatPlan, planApply } from '../src/planner.js';
+import { formatPlan, planApply, planIsEmpty } from '../src/planner.js';
 import { digest, type ContainerSpec } from '../src/resources.js';
 import type { ObservedContainer, ObservedState } from '../src/runtime/types.js';
 
@@ -100,6 +100,80 @@ describe('planApply', () => {
     const plan = planApply({ networks: [{ name: 'backend' }], containers: [app] }, EMPTY, 'myproj');
     const direct = toComposeApplication([app], [{ name: 'backend' }], 'myproj');
     expect(plan.model).toEqual(direct);
+  });
+});
+
+// Networks are the one part of the model with no observation behind them:
+// Compose owns their lifecycle, so `ObservedState` carries none and there is
+// nothing to diff a declaration against. They are compared against the last
+// applied model instead -- and without that comparison, a network-only edit
+// changes no service, produces an empty plan, and is never applied at all.
+describe('planApply: networks', () => {
+  const app = (networks: { name: string; subnet?: string }[]) =>
+    toComposeApplication([], networks, 'fiber-servo');
+
+  it('reports a network the previous model did not declare', () => {
+    const plan = planApply(
+      { networks: [{ name: 'backend' }], containers: [] },
+      EMPTY,
+      'fiber-servo',
+      app([]),
+    );
+    expect(plan.networks).toEqual({ added: ['backend'], changed: [], removed: [] });
+  });
+
+  it('reports a network the model no longer declares', () => {
+    const previous = app([{ name: 'backend' }]);
+    const plan = planApply({ networks: [], containers: [] }, EMPTY, 'fiber-servo', previous);
+    expect(plan.networks).toEqual({ added: [], changed: [], removed: ['backend'] });
+  });
+
+  it('reports a changed subnet', () => {
+    const previous = app([{ name: 'backend', subnet: '10.1.0.0/24' }]);
+    const plan = planApply(
+      { networks: [{ name: 'backend', subnet: '10.2.0.0/24' }], containers: [] },
+      EMPTY,
+      'fiber-servo',
+      previous,
+    );
+    expect(plan.networks).toEqual({ added: [], changed: ['backend'], removed: [] });
+  });
+
+  it('reports nothing when the networks are unchanged', () => {
+    const previous = app([{ name: 'backend', subnet: '10.1.0.0/24' }]);
+    const plan = planApply(
+      { networks: [{ name: 'backend', subnet: '10.1.0.0/24' }], containers: [] },
+      EMPTY,
+      'fiber-servo',
+      previous,
+    );
+    expect(plan.networks).toEqual({ added: [], changed: [], removed: [] });
+    expect(planIsEmpty(plan)).toBe(true);
+  });
+
+  // The point of all of the above: a plan that only touches networks must
+  // still be applied.
+  it('is not an empty plan when only a network changed', () => {
+    const previous = app([{ name: 'backend' }]);
+    const plan = planApply(
+      { networks: [{ name: 'backend', subnet: '10.9.0.0/24' }], containers: [] },
+      EMPTY,
+      'fiber-servo',
+      previous,
+    );
+    expect(plan.missing).toEqual([]);
+    expect(plan.changed).toEqual([]);
+    expect(planIsEmpty(plan)).toBe(false);
+    expect(formatPlan(plan)).toContain('replace network backend');
+  });
+
+  // A fresh process has no previous model. Treating everything as new is the
+  // safe direction: it costs one idempotent `compose up`, where the opposite
+  // would leave a declared network uncreated until something else changed.
+  it('treats every declared network as new when there is no previous model', () => {
+    const plan = planApply({ networks: [{ name: 'backend' }], containers: [] }, EMPTY);
+    expect(plan.networks.added).toEqual(['backend']);
+    expect(planIsEmpty(plan)).toBe(false);
   });
 });
 

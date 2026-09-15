@@ -13,14 +13,21 @@ import { Container, Network, ReplicaSet, Service, serve, containerd } from 'fibe
 ### `<Network>`
 
 ```tsx
-<Network name="backend" subnet="10.88.0.0/24" labels={{ tier: 'app' }} />
+<Network name="backend" subnet="10.88.0.0/24" />
 ```
 
 A local bridge network. Containers join it by name. Networks have no children —
 a Network does not own the containers on it.
 
 Compose creates and removes networks as part of applying the model, so nothing
-in fiber-servo decides anything about their lifecycle.
+in fiber-servo decides anything about their lifecycle. `subnet` becomes the
+Compose network's `ipam.config[].subnet`; the gateway is the runtime's to
+choose.
+
+There is no `labels` prop. A Compose network can declare labels, but nerdctl
+does not pass them on — checked against nerdctl 2.1.2 in both the map and the
+list syntax, and the created network carries only Compose's own two labels
+either way. A prop that provably does nothing is worse than no prop.
 
 ### `<Container>`
 
@@ -52,7 +59,7 @@ The unit of everything: one process, one image, one Compose service.
 | `labels`    | `Record<string,string>?` | What a `<Service>` selector matches.                                                      |
 | `publish`   | `PortMapping[]?`         | Host ports. Do not set these on a replicated container — replicas would collide.          |
 | `resources` | `ResourceLimits?`        | `{ cpu?: number; memory?: string }`.                                                      |
-| `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number }`. Exit 0 means ready.                            |
+| `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number; timeoutMs?: number }`. Exit 0 means ready.        |
 
 **Every field is immutable, `resources` included.** Changing any of them
 replaces the container. There is no in-place update: Compose has no
@@ -200,6 +207,7 @@ interface Plan {
   changed: readonly string[]; // exist with a different spec digest; will be replaced
   restarting: readonly string[]; // same digest, but exited; will be restarted
   orphaned: readonly string[]; // managed, but no longer declared; will be removed
+  networks: { added; removed; changed }; // against the last applied model, not observed state
 }
 ```
 
