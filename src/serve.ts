@@ -1,3 +1,10 @@
+MethodException: 
+Line |
+   2 |  … 'src/serve.ts')); $s=$s.Replace(([char]13+[char]10),[char]10); [Conso …
+     |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | Cannot convert argument "oldChar", with value: "
+", for "Replace" to type "System.Char": "Cannot convert value "
+" to type "System.Char". Error: "String must be exactly one character long.""
 /**
  * The control loop: where the two reconciliations meet, and the only file that
  * needs to understand both.
@@ -564,4 +571,3 @@ function stripUndefined<T extends object>(obj: T): Partial<T> {
   for (const [k, v] of Object.entries(obj)) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
   return out;
 }
-

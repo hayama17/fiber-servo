@@ -1,3 +1,10 @@
+MethodException: 
+Line |
+   2 |  … th 'README.md')); $s=$s.Replace(([char]13+[char]10),[char]10); [Conso …
+     |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | Cannot convert argument "oldChar", with value: "
+", for "Replace" to type "System.Char": "Cannot convert value "
+" to type "System.Char". Error: "String must be exactly one character long.""
 # fiber-servo
 
 English | [日本語](README.ja.md)
@@ -116,4 +123,3 @@ other resources and join it with `network="backend"` on Container.
 ## License
 
 MIT
-

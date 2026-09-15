@@ -1,3 +1,10 @@
+MethodException: 
+Line |
+   2 |  … chitecture.md')); $s=$s.Replace(([char]13+[char]10),[char]10); [Conso …
+     |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | Cannot convert argument "oldChar", with value: "
+", for "Replace" to type "System.Char": "Cannot convert value "
+" to type "System.Char". Error: "String must be exactly one character long.""
 # Architecture
 
 React commits desired resources. Controller components subscribe to observed
@@ -119,4 +126,3 @@ Paths below are relative to `src/`.
 
 For rationale see [Design decisions](decisions.md); for scope and open
 questions see [Project scope](../PLAN.md).
-
