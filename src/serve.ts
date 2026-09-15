@@ -353,6 +353,20 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     }
     const target = runControllers(desired, snapshot, generations.all());
 
+    // Forget generations nothing refers to any more: every one currently
+    // declared, plus every one a container is still running under. Done here
+    // rather than after applying, because the pass that finally sees the last
+    // old-generation container gone is a pass with nothing left to apply —
+    // pruning below the early return would leave one stale entry behind for
+    // ever, which is a small leak but a leak with no bound on how long it
+    // lasts.
+    generations.prune([
+      ...resourcesOfKind(desired, 'deployment').map((d) => digest(d.spec.template)),
+      ...[...snapshot.containers.values()]
+        .map((c) => c.labels[GENERATION_LABEL])
+        .filter((g): g is string => g !== undefined),
+    ]);
+
     // 2. The restart gate: which of those containers are actually admitted
     //    into this pass's model. This is the one thing `runControllers`
     //    cannot decide on its own — it has no memory of past failures.
@@ -416,16 +430,6 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
     lastApplied = plan.model;
-
-    // Forget generations nothing refers to any more: every one currently
-    // declared, plus every one a container is still running under. Without
-    // this the store grows by one entry per template edit, for ever.
-    generations.prune([
-      ...resourcesOfKind(desired, 'deployment').map((d) => digest(d.spec.template)),
-      ...[...snapshot.containers.values()]
-        .map((c) => c.labels[GENERATION_LABEL])
-        .filter((g): g is string => g !== undefined),
-    ]);
   }
 
   /**
