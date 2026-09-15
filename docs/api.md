@@ -122,7 +122,7 @@ const served = serve(<App />, {
 | `project`               | `string?`                   | The Compose project this tree applies as, passed down to the adapter. Default `fiber-servo`.                |
 | `restart`               | `RestartPolicy?`            | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
 | `onDesired`             | `(d: DesiredState) => void` | Every snapshot React commits.                                                                               |
-| `onApply`               | `(p: Plan) => void`         | What each pass is about to apply, after the restart gate has filtered it.                                   |
+| `onApply`               | `(p: Plan) => void`         | What each pass is about to apply after React controller admission.                                          |
 | `generations`           | `GenerationHistory?`        | In-flight rollout history. Process-local and volatile; supply one only to inspect it.                       |
 | `log`, `onError`, `now` |                             |                                                                                                             |
 
@@ -182,10 +182,10 @@ as `ObservedContainer.networks`.
 
 ## Controllers, the Compose model, and the planner
 
-`ReplicaSet` is a React controller component: it subscribes to `ObservedStore`
-and renders the resulting `Container` resources. Deployment and Service follow
-the same shape as they move into the React tree. The pure expansion functions
-remain exported for direct use and testing.
+`ReplicaSet`, `Deployment`, `Service`, and restart admission are React
+controller behavior: they subscribe to `ObservedStore` and render the runtime
+resources that should exist. The pure expansion functions remain exported for
+direct use and testing.
 
 All pure functions, callable directly:
 

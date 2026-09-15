@@ -47,7 +47,7 @@ import type {
   ServiceSpec,
 } from './resources.js';
 import { digest } from './resources.js';
-import { useObserved, useReady, type ReadyCondition } from './hooks.js';
+import { useObserved, useReady, useRestartAdmission, type ReadyCondition } from './hooks.js';
 import {
   expandDeployment,
   expandReplicaSet,
@@ -109,6 +109,8 @@ export interface ContainerProps extends Omit<ContainerSpec, 'name'> {
  */
 export function Container(props: ContainerProps): ReactElement {
   const { children: _children, ...spec } = props;
+  const admitted = useRestartAdmission({ ...spec, name: spec.name ?? '' } as ContainerSpec);
+  if (!admitted) return createElement(Fragment, null);
   return host('container', spec);
 }
 

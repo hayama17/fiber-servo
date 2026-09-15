@@ -9,24 +9,67 @@
  * Runtime events are inputs to React; they are never rewritten as fake props
  * or restart generations.
  *
- * What used to live here and deliberately does not any more: `useSelfHeal`.
- * It watched for a container dying and answered by incrementing a restart
- * generation, which travelled down as a prop purely so that React would see a
- * changed value and emit a commit. That made a runtime failure look like a
- * change of intent. Replacing a dead container is now what the ReplicaSet
- * controller and the control loop do, from observed state, without troubling
- * React at all — which is why a container dying no longer produces a single
- * React render.
+ * Restart admission follows the same read path. `useRestartAdmission` keeps a
+ * per-Container failure record and renders the resource only when its backoff
+ * window admits it. The timer that wakes the hook is a plain effect; it does
+ * not perform runtime I/O.
  */
-import { createContext, use, useContext, useSyncExternalStore } from 'react';
+import { createContext, use, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createObservedStore, isReady } from './observed.js';
+import {
+  admitRestart,
+  DEFAULT_RESTART_POLICY,
+  type RestartContextValue,
+  type RestartRecord,
+} from './restart.js';
+import type { ContainerSpec } from './resources.js';
 import type { ObservedContainer, ObservedStore } from './runtime/types.js';
 
 /** The observed state the enclosing root reads from. */
 export const ObservedContext = createContext<ObservedStore>(createObservedStore());
 
+/** Restart settings for the root. Timers and logging stay outside render. */
+export const RestartContext = createContext<RestartContextValue>({
+  policy: DEFAULT_RESTART_POLICY,
+  now: Date.now,
+});
+
 export function useObserved(): ObservedStore {
   return useContext(ObservedContext);
+}
+
+/**
+ * Decide whether a runtime Container is admitted in this render.
+ *
+ * A crashed container is rendered once to request its first replacement. If
+ * it crashes again before the backoff expires, the component renders null and
+ * a timer schedules the next React update. The runtime never appears in this
+ * hook; it only reads the observed store.
+ */
+export function useRestartAdmission(spec: ContainerSpec): boolean {
+  const store = useObserved();
+  const snapshot = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
+  const context = useContext(RestartContext);
+  const [, rerender] = useState(0);
+  const recordRef = useRef<RestartRecord | undefined>(undefined);
+  const result = admitRestart(
+    recordRef.current,
+    spec,
+    snapshot.containers.get(spec.name)?.phase ?? 'absent',
+    context,
+  );
+  recordRef.current = result.record;
+
+  useEffect(() => {
+    if (result.gaveUp) context.onGiveUp?.(spec.name, context.policy.maxRestarts);
+    if (result.retryAt === undefined) return;
+    const delay = Math.max(0, result.retryAt - context.now());
+    const timer = setTimeout(() => rerender((value) => value + 1), delay);
+    timer.unref?.();
+    return () => clearTimeout(timer);
+  }, [context, result.gaveUp, result.retryAt, spec.name]);
+
+  return result.admitted;
 }
 
 /** The current observation of one container, or undefined when the runtime has never reported it. */

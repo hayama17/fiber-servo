@@ -144,12 +144,12 @@ The control loop compares that snapshot with runtime observations, without
 repairing React's assumptions about the host. Serialization is O(tree),
 accepted for a single-node application; `collectSnapshots()` is the test surface.
 
-## 22. Runtime failures never re-enter the tree
+## 22. Runtime failures re-enter the tree through controller reads
 
-Controllers handle container failures from observed state; `useSelfHeal` and
-the `restarts` prop were removed. An unchanged replica count needs no React
-render to recover. Hooks may still read observations for explicit policies
-such as Ready. Restart policy is per control loop, not per container.
+`useSelfHeal` and the synthetic `restarts` prop were removed. Controllers read
+the external observed store with `useSyncExternalStore`; a failure therefore
+causes a normal React controller re-render. Restart admission is rendered by
+the Container controller, while runtime I/O remains outside React.
 
 ## 23. A Pod is an infra container plus its members
 
@@ -179,10 +179,11 @@ digest on the container. A full recorded spec was needed for field-specific
 updates; uniform replacement only needs equality. Rollout templates are not
 stored in labels (decisions 37 and 40).
 
-## 27. Backoff lives in the control loop
+## 27. Backoff is component state
 
-Restart backoff belongs to the control loop: failure counts are neither
-desired configuration nor runtime observations. Controllers remain pure.
+Restart backoff belongs to the Container controller. Its failure record is
+process-local component state, keyed by the full spec digest. The control loop
+only supplies policy and a clock; timers wake React and never perform I/O.
 Counters reset after a sufficiently long run, a spec change, or a
 control-plane restart.
 

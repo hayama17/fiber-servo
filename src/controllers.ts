@@ -30,10 +30,9 @@
  * *should* exist.
  *
  * What is deliberately NOT here: crash-loop backoff. Recognising "this
- * container keeps dying, slow down" needs memory from one tick to the next
- * (a counter, a timer), and this module keeps none. That bookkeeping belongs
- * to the control loop that calls `runControllers` on a schedule — it is not
- * missing here, it is just not this layer's job.
+ * container keeps dying, slow down" needs component state and a timer, so it
+ * lives in the React Container hook. These pure expansion helpers only decide
+ * which runtime resources a controller would render.
  */
 import {
   digest,

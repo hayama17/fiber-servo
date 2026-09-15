@@ -23,57 +23,19 @@
  * What changed with the move to Compose: there is no more action list to
  * execute one at a time. `pass()` builds the whole desired Compose
  * Application Model and hands it to `runtime.apply()` in a single call — the
- * runtime decides create vs. replace vs. leave-alone, not this file. What
- * this file still owns, because it needs memory across ticks that a pure
- * `(desired, observed) => x` function cannot have, is the restart backoff
- * gate: *whether* a container that is currently `exited` gets included in
- * this pass's model at all.
+ * runtime decides create vs. replace vs. leave-alone, not this file. Restart
+ * admission is decided by each React Container controller; this loop only
+ * schedules the I/O that applies the committed model.
  */
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
-import { createGenerationHistory, type GenerationHistory } from './generations.js';
+import type { GenerationHistory } from './generations.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
-import { digest, resourcesOfKind, type ContainerSpec, type DesiredState } from './resources.js';
-import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
-
-// ---- restart backoff --------------------------------------------------------
-
-/**
- * How eagerly a crash-looping container is replaced.
- *
- * This is the one piece of state the control loop keeps between ticks, and it
- * is why crash backoff lives here rather than in the controllers: those are
- * pure functions of (desired, observed), and "how many times has this
- * already failed" is neither.
- */
-export interface RestartPolicy {
-  /** Delay before the first replacement. Default 1000. */
-  baseDelayMs?: number;
-  /** Multiplier applied per consecutive replacement. Default 2. */
-  factor?: number;
-  /** Upper bound for the delay. Default 300000 (5 min). */
-  maxDelayMs?: number;
-  /** Give up after this many consecutive replacements. Default: unlimited. */
-  maxRestarts?: number;
-  /** Being let through and staying up this long resets the consecutive counter. Default 600000 (10 min). */
-  resetAfterMs?: number;
-}
-
-type ResolvedPolicy = Required<RestartPolicy>;
-
-export const DEFAULT_RESTART_POLICY: Readonly<ResolvedPolicy> = Object.freeze({
-  baseDelayMs: 1_000,
-  factor: 2,
-  maxDelayMs: 300_000,
-  maxRestarts: Number.POSITIVE_INFINITY,
-  resetAfterMs: 600_000,
-});
-
-export function backoffDelay(consecutive: number, policy: ResolvedPolicy): number {
-  return Math.min(policy.baseDelayMs * policy.factor ** consecutive, policy.maxDelayMs);
-}
+import { resourcesOfKind, type DesiredState } from './resources.js';
+import { resolveRestartPolicy, type RestartPolicy } from './restart.js';
+import type { ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
 /**
  * How many times the control loop will reconcile an identical Compose model
@@ -82,138 +44,6 @@ export function backoffDelay(consecutive: number, policy: ResolvedPolicy): numbe
  * than a pegged CPU.
  */
 const MAX_IDENTICAL_PASSES = 20;
-
-interface RestartRecord {
-  /**
-   * `digest()` of the `ContainerSpec` these failures belong to.
-   *
-   * A restart history is a statement about *a thing that was run*, not about
-   * a name. Keyed on the name alone, a container that crash-looped to
-   * `maxRestarts` under a broken image stayed given up on after the image
-   * was fixed: the fix is a different spec, it has never failed once, and
-   * nothing would ever try it. Worse, it is silent — the give-up warning was
-   * already logged, so the corrected version simply never starts.
-   */
-  specDigest: string;
-  consecutive: number;
-  /** Earliest time this container may be admitted again after an exit. */
-  nextAt: number;
-  /**
-   * When the gate last admitted this container. This — not any timestamp
-   * `ObservedContainer` carries — is what `resetAfterMs` measures against.
-   * `ObservedContainer.at` is an *observation* timestamp: it advances on
-   * every heartbeat a container is still merely sitting there running, so
-   * "now - lastObservedAt" almost never grows past a few milliseconds and a
-   * reset condition built on it effectively never fires. The gate's own
-   * `lastAt` only moves when *this gate* let a restart through, so
-   * `now - lastAt` genuinely measures "how long has it been since we last
-   * had to do anything about this container".
-   */
-  lastAt: number;
-}
-
-/**
- * Decides whether a container that is currently `exited` may be included in
- * *this* pass's Compose model — which is the only lever this control loop
- * has left to say "not yet". Under the old op-based write path a backed-off
- * container simply sat there, still reported `exited`, while nothing acted
- * on it. Compose does not offer that: `Runtime.apply` treats "declared but
- * absent from the model" as "remove it", so the moment this gate holds a
- * container back, the next observation reports it *absent*, not `exited` —
- * the very phase that justified the hold is now gone from view.
- *
- * That is why `admit` treats `absent` exactly like `exited` whenever it
- * already has a record for the name: the gate's own bookkeeping is the only
- * thing that remembers a hold is in progress once the runtime has honoured
- * it by removing the container. A brand-new `absent` name with no record at
- * all — a container that has simply never been created yet — passes
- * straight through; nothing here ever gates a container's *first* creation.
- *
- * `resetAfterMs` is resolved the same way, and deliberately *not* via a
- * separate "is it healthy" check run on every pass: a container that stays
- * up quietly triggers no further passes at all (nothing about it is
- * changing), so there would be no reliable moment to run such a check. The
- * gate instead resolves it lazily, the next time it actually matters: at the
- * start of handling a *new* crash, `now - record.lastAt >= resetAfterMs`
- * means the previous trouble is old news, and this crash is treated exactly
- * like a first-ever failure — immediate, uncounted against the old streak —
- * rather than an escalation of it.
- */
-class RestartGate {
-  private readonly records = new Map<string, RestartRecord>();
-
-  constructor(
-    private readonly policy: ResolvedPolicy,
-    private readonly now: () => number,
-  ) {}
-
-  /**
-   * `true` to include `name` this pass; a retry time; or `null` to give up
-   * permanently.
-   *
-   * `specDigest` identifies *what* is being asked for, and a record only
-   * applies while it still matches: edit the image, the command, the env —
-   * anything — and the history of the previous spec is dropped rather than
-   * held against its replacement. That is the difference between "this
-   * container keeps dying" and "this name keeps dying", and only the first
-   * is a reason to hold anything back.
-   */
-  admit(
-    name: string,
-    specDigest: string,
-    phase: ContainerPhase | 'absent',
-  ): true | { retryAt: number } | null {
-    if (phase !== 'exited' && phase !== 'absent') return true; // running/waiting/unknown: never gated
-    const record = this.forSpec(name, specDigest);
-    if (phase === 'absent' && record === undefined) return true; // never created yet: nothing to gate
-
-    const now = this.now();
-
-    if (record === undefined || now - record.lastAt >= this.policy.resetAfterMs) {
-      // A first-ever crash, a crash of a spec this gate has not seen fail
-      // before, or one far enough past the last restart to count as a fresh
-      // problem rather than a continuation: let the first restart through
-      // immediately.
-      this.records.set(name, {
-        specDigest,
-        consecutive: 1,
-        nextAt: now + backoffDelay(1, this.policy),
-        lastAt: now,
-      });
-      return true;
-    }
-    if (record.consecutive >= this.policy.maxRestarts) return null;
-    if (now < record.nextAt) return { retryAt: record.nextAt };
-    record.consecutive += 1;
-    record.lastAt = now;
-    record.nextAt = now + backoffDelay(record.consecutive, this.policy);
-    return true;
-  }
-
-  /**
-   * The record for this name *if it is still about this spec*. A record for
-   * a spec that is no longer wanted is deleted here rather than left to be
-   * skipped over, so nothing downstream can read it by accident and so a
-   * later crash of the new spec starts a genuinely fresh streak.
-   */
-  private forSpec(name: string, specDigest: string): RestartRecord | undefined {
-    const record = this.records.get(name);
-    if (record === undefined) return undefined;
-    if (record.specDigest === specDigest) return record;
-    this.records.delete(name);
-    return undefined;
-  }
-
-  /** Drop bookkeeping for a container the tree no longer wants at all. */
-  forget(name: string): void {
-    this.records.delete(name);
-  }
-
-  /** Names this gate currently holds a record for, so a caller can prune ones no longer desired. */
-  names(): IterableIterator<string> {
-    return this.records.keys();
-  }
-}
 
 // ---- serve ------------------------------------------------------------------
 
@@ -224,17 +54,14 @@ export interface ServeOptions {
   onError?: (error: Error) => void;
   /** Observe each desired-state snapshot React commits. */
   onDesired?: (desired: DesiredState) => void;
-  /** Observe the plan each pass is about to apply (after the restart gate has filtered it). */
+  /** Observe the plan each pass is about to apply. */
   onApply?: (plan: Plan) => void;
   restart?: RestartPolicy;
   /** The Compose project this tree applies as. Default: `compose.ts`'s `DEFAULT_PROJECT`. */
   project?: string;
   /**
-   * Where the templates of past generations are remembered while a rollout is
-   * in progress. Process-local and volatile, like every other piece of
-   * controller state; see `generations.ts` for why it is not persisted and
-   * what a restart therefore means. Supplying one is only useful for
-   * inspecting it in a test.
+   * @deprecated Deployment components own their history. This option remains
+   * accepted for source compatibility and is no longer read by `serve`.
    */
   generations?: GenerationHistory;
   now?: () => number;
@@ -265,9 +92,9 @@ export interface Served {
    * ```
    *
    * This is what "the fiber-servo process died" looks like from inside one
-   * process: reconcile requests stop being accepted, the retry timer is
-   * cleared, both subscriptions are dropped, the tree is unmounted, and every
-   * piece of controller state — the restart gate, the rollout history, the
+   * process: reconcile requests stop being accepted, controller subscriptions
+   * are dropped, the tree is unmounted, and every piece of controller state —
+   * the restart records, the rollout history, the
    * last applied model — goes with it. Nothing is asked of the runtime, and
    * the adapter is left open, because a process that has crashed does not
    * politely close its socket either.
@@ -287,20 +114,14 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const onError = options.onError ?? ((e: Error) => console.error(e));
   const now = options.now ?? Date.now;
   const observed = options.observed ?? createObservedStore(now);
-  const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
+  const policy = resolveRestartPolicy(options.restart);
   const project = options.project ?? DEFAULT_PROJECT;
-  const gate = new RestartGate(policy, now);
-  // Kept as an injection point for callers that persist control-plane state.
-  // Deployment history itself now lives in the React controller component.
-  const generations: GenerationHistory = options.generations ?? createGenerationHistory();
   const runtime: Runtime = options.runtime({ log, onError, project });
-  const warnedGiveUp = new Set<string>();
 
   let desired: DesiredState = EMPTY_DESIRED;
   let stopped = false;
   let running: Promise<void> | null = null;
   let again = false;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   // Loop-guard state; see `wedged` below.
   let lastModel = '';
   /**
@@ -356,17 +177,6 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     return running;
   }
 
-  function scheduleRetry(at: number): void {
-    const delay = Math.max(0, at - now());
-    if (retryTimer !== null) clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => {
-      retryTimer = null;
-      void request();
-    }, delay);
-    // Never hold the process open just to retry a backoff.
-    retryTimer.unref?.();
-  }
-
   async function pass(): Promise<void> {
     const snapshot = observed.snapshot();
 
@@ -377,42 +187,10 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       containers: resourcesOfKind(desired, 'container').map((resource) => resource.spec),
     };
 
-    // 2. The restart gate: which of those containers are actually admitted
-    //    into this pass's model. This remains outside React because it is
-    //    cannot decide on its own — it has no memory of past failures.
-    const desiredNames = new Set(target.containers.map((c) => c.name));
-    for (const name of [...gate.names()]) {
-      if (!desiredNames.has(name)) gate.forget(name); // no longer wanted at all: history is moot
-    }
-
-    let soonest = Number.POSITIVE_INFINITY;
-    const included: ContainerSpec[] = [];
-    for (const spec of target.containers) {
-      const phase = snapshot.containers.get(spec.name)?.phase ?? 'absent';
-      // The same digest the runtime records in `SPEC_LABEL`, so "has this
-      // changed" means one thing across the whole write path.
-      const specDigest = digest(spec);
-      const verdict = gate.admit(spec.name, specDigest, phase);
-      if (verdict === null) {
-        if (!warnedGiveUp.has(spec.name)) {
-          warnedGiveUp.add(spec.name);
-          log(`giving up on ${spec.name} after ${policy.maxRestarts} restarts; edit its spec to try again`);
-        }
-        continue;
-      }
-      if (verdict !== true) {
-        soonest = Math.min(soonest, verdict.retryAt);
-        continue;
-      }
-      warnedGiveUp.delete(spec.name);
-      included.push(spec);
-    }
-    if (soonest !== Number.POSITIVE_INFINITY) scheduleRetry(soonest);
-
-    // 3. Build the Compose Application Model this pass would apply, and stop
+    // 2. Build the Compose Application Model this pass would apply, and stop
     //    if reconciling it is not converging (see `wedged` below).
     const plan = planApply(
-      { networks: target.networks, containers: included },
+      { networks: target.networks, containers: target.containers },
       snapshot,
       project,
       lastApplied,
@@ -436,7 +214,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     // write path logged one line per action.
     for (const line of formatPlan(plan).split('\n')) log(line);
 
-    // 4. Hand the whole model to the runtime. It decides create vs. replace
+    // 3. Hand the whole model to the runtime. It decides create vs. replace
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
     lastApplied = plan.model;
@@ -479,15 +257,30 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     return true;
   }
 
+  let reactRoot: Root | undefined;
   const unsubscribeRuntime = runtime.subscribe((event) => {
     applyRuntimeEvent(observed, event);
+    // Runtime events update useSyncExternalStore subscribers synchronously
+    // before the control loop computes its next model. This keeps the model
+    // that `pass()` reads aligned with the React commit caused by the event.
+    try {
+      reactRoot?.flush();
+    } catch (error: unknown) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
   });
-  // Observed state changing is a reason to reconcile — and the only way a
-  // dead container ever gets replaced. Note that nothing here re-renders React.
+  // Observed state changing is a reason to reconcile — and also wakes the
+  // React controllers through their external-store subscriptions.
   const unsubscribeObserved = observed.subscribe(() => void request());
 
   const root = createRoot({
     observed,
+    restart: {
+      policy,
+      now,
+      onGiveUp: (name, maxRestarts) =>
+        log(`giving up on ${name} after ${maxRestarts} restarts; edit its spec to try again`),
+    },
     onCommit: (next) => {
       desired = next;
       // A new desired state is new information, so a stalled loop gets another
@@ -499,6 +292,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       void request();
     },
   });
+  reactRoot = root;
 
   // Adopt whatever is already running before the first commit, so a restarted
   // process reconciles against reality instead of assuming an empty machine.
@@ -528,7 +322,6 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       // that. `stopped` makes `request()` a no-op, so the commit updates
       // this process's own `desired` and reaches no runtime.
       stopped = true;
-      if (retryTimer !== null) clearTimeout(retryTimer);
       unsubscribeObserved();
       unsubscribeRuntime();
       // Drain anything already in flight, so nothing lands after the caller
@@ -546,7 +339,6 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
       // calling into a runtime that `close()` has already released.
       await request();
       stopped = true;
-      if (retryTimer !== null) clearTimeout(retryTimer);
       unsubscribeObserved();
       // Stay subscribed through `down()` itself: it notifies removals just
       // like any other runtime call, and `observed` should end up accurate
@@ -559,8 +351,5 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   };
 }
 
-function stripUndefined<T extends object>(obj: T): Partial<T> {
-  const out: Partial<T> = {};
-  for (const [k, v] of Object.entries(obj)) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
-  return out;
-}
+export { DEFAULT_RESTART_POLICY, backoffDelay } from './restart.js';
+export type { RestartPolicy } from './restart.js';

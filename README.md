@@ -59,8 +59,9 @@ Use `npm run example:replicaset -- --watch` to re-evaluate on save.
 
 For containerd, run `npm run example:containerd -- --namespace default` with
 socket access. This replaces the former `FIBER_SERVO_NAMESPACE` environment
-variable with the CLI's namespace option. Recovery without a React render is
-covered in [control-loop tests](test/control-loop.test.tsx).
+variable with the CLI's namespace option. Runtime failures flow through the
+React controller tree; the recovery behavior is covered in [control-loop
+tests](test/control-loop.test.tsx).
 
 ## CLI
 

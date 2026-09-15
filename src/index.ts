@@ -52,7 +52,14 @@ export type {
 // ---- React ------------------------------------------------------------------
 export { EMPTY_DESIRED, collectSnapshots, createRoot } from './reconciler.js';
 export type { CreateRootOptions, Root } from './reconciler.js';
-export { containerSatisfies, readyThenable, useContainer, useObserved, useReady } from './hooks.js';
+export {
+  containerSatisfies,
+  readyThenable,
+  useContainer,
+  useObserved,
+  useReady,
+  useRestartAdmission,
+} from './hooks.js';
 export type { ReadyCondition } from './hooks.js';
 
 // ---- generation history -----------------------------------------------------

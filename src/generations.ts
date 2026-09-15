@@ -1,5 +1,5 @@
 /**
- * A Deployment's rollout history, for as long as this process is alive.
+ * A Deployment's rollout history, for as long as its React component is mounted.
  *
  * ## What this is
  *
@@ -25,7 +25,7 @@
  * Then in a JSON file beside the application, which fixed the symptom and
  * kept the mistake: fiber-servo's control plane is in-memory and volatile by
  * design, and writing controller bookkeeping to disk quietly gave one piece
- * of it a different lifetime from the rest. The restart gate's failure
+ * of it a different lifetime from the rest. Restart admission's failure
  * counts, a `<Ready>` latch, how far a rollout has got — none of those
  * survive a restart, and none of them should. A rollout history is the same
  * kind of thing.
@@ -64,9 +64,8 @@ import { digest, type ContainerTemplate } from './resources.js';
  * that appears in container names: that is a rendering, and filing a history
  * under a rendering is how two unrelated templates come to share one.
  *
- * The read side is a plain map, which is what the controllers take: they stay
- * pure functions of (desired, observed, generations), and nothing about them
- * has to know where the map came from.
+ * The read side is a plain map, which is what the pure expansion helpers take;
+ * the Deployment component owns this map and passes it into those helpers.
  */
 export type Generations = ReadonlyMap<string, ContainerTemplate>;
 
