@@ -5,8 +5,8 @@ Read [Architecture](docs/architecture.md) before changing the control plane.
 ## Design rules
 
 - React commits desired-state snapshots; hostConfig performs no runtime I/O.
-- Observed container state lives outside the tree. Controllers compute
-  desired runtime resources; the control loop owns backoff and rollout history.
+- Observed container state lives in an external store. React controllers compute
+  runtime resources and restart admission; `serve.ts` owns runtime I/O.
 - The runtime accepts a complete Compose model. containerd-specific code
   belongs in `src/runtime/containerd/`.
 

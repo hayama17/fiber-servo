@@ -1,39 +1,4 @@
-/**
- * Controllers: the part of "React reconciles management resources, controllers
- * reconcile runtime resources" (PLAN.md, "Core principle") that turns policy
- * into Containers.
- *
- * A Deployment or ReplicaSet says "I want N of this template." It does not
- * say which N: the identities of the Containers that satisfy it are a naming
- * scheme, not a decision anyone makes at apply time. Every function here is a
- * pure, synchronous `(desired, observed) => containers` — no I/O, no timers,
- * no runtime calls, nothing remembered between calls. That purity is not a
- * style preference: it is what lets "desired 3 vs actual 2" (PLAN.md,
- * "Observed state") be asserted in a test without a container runtime
- * anywhere in sight, and it is why every function below takes its inputs as
- * plain values and returns plain values instead of reaching into a store.
- *
- * Two management resources, three functions:
- *
- *   Deployment   -> expandDeployment  -> ReplicaSets (one per template
- *                                        generation, during a rollout: two)
- *   ReplicaSet   -> expandReplicaSet  -> Containers (exactly `replicas` of
- *                                        them)
- *   Service      -> serviceEndpoints, serviceProxyContainer -> a data-plane
- *                                        Container
- *
- * `runControllers` is the one entry point the control loop calls: it walks a
- * `DesiredState` snapshot once and returns the flat Network/Container set
- * that should exist right now. Everything downstream of that — building the
- * Compose Application Model from it and handing it to an actuator — belongs
- * to `serve.ts` and the `Runtime` adapter; this module only ever says what
- * *should* exist.
- *
- * What is deliberately NOT here: crash-loop backoff. Recognising "this
- * container keeps dying, slow down" needs component state and a timer, so it
- * lives in the React Container hook. These pure expansion helpers only decide
- * which runtime resources a controller would render.
- */
+/** Pure management-resource expansion helpers used by the React controllers. */
 import {
   digest,
   selectorMatches,
