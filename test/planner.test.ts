@@ -167,6 +167,26 @@ describe('planApply: networks', () => {
     expect(formatPlan(plan)).toContain('replace network backend');
   });
 
+  // The boundary of the guarantee, pinned so the docs and the code cannot
+  // drift apart: this compares declarations, not reality. A network someone
+  // removes by hand while fiber-servo is running changes no declaration, so
+  // nothing here notices and nothing brings it back. Containers are
+  // level-triggered against a real observation; networks are not.
+  it('does not notice a network that disappeared outside fiber-servo', () => {
+    const previous = app([{ name: 'backend' }]);
+    // Observed state says nothing about networks at all -- there is no field
+    // for it -- so there is no way to express "the network is gone", which is
+    // precisely the gap.
+    const plan = planApply(
+      { networks: [{ name: 'backend' }], containers: [] },
+      EMPTY,
+      'fiber-servo',
+      previous,
+    );
+    expect(plan.networks).toEqual({ added: [], changed: [], removed: [] });
+    expect(planIsEmpty(plan)).toBe(true);
+  });
+
   // A fresh process has no previous model. Treating everything as new is the
   // safe direction: it costs one idempotent `compose up`, where the opposite
   // would leave a declared network uncreated until something else changed.

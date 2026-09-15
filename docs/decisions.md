@@ -830,3 +830,35 @@ anything — passes a file-backed one. And every failure in that file is
 survivable: unreadable, corrupt, or filed under the wrong id all mean "start
 empty and say so", because losing a rollout's gradualness must never cost the
 application its availability.
+
+## 38. "Level-triggered" is a claim about containers
+
+**Decision.** The self-healing guarantee — every pass recomputes from
+observed state, so a missed event costs a late reconcile and never a wrong
+one — is scoped in the documentation to **containers**. Network drift caused
+outside fiber-servo is explicitly not detected, and not self-healed.
+
+**Why.** The guarantee rests on there being an observation to recompute
+against, and for networks there is not. Decision 30 gives their lifecycle to
+Compose, so `ObservedState` carries none — there is no field in which "the
+network is gone" could even be expressed. `Plan.networks` is therefore
+computed against the last model _this process applied_, which detects changes
+to what was asked for and nothing else.
+
+So the honest statement is narrower than the one the README made:
+
+- a network added, removed or edited in the tree — detected
+- a network missing when fiber-servo starts — applied, because a fresh
+  process has no previous model and treats everything as new
+- a network someone removes with `nerdctl network rm` while fiber-servo runs
+  — **not** detected, until something else causes an apply or the process
+  restarts
+
+**Why say it rather than fix it.** Observing networks means deciding what
+fiber-servo is entitled to know about a resource Compose owns, and the last
+time this project inferred a runtime's private state it read nerdctl's CNI
+files and got decision 29 wrong for it. That is a design question, not an
+oversight to patch, and it is left open deliberately. What is not acceptable
+is a documented guarantee the implementation does not make, so the
+documentation moved to meet the code, and one test pins the current behaviour
+so the two cannot drift apart again.

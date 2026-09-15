@@ -115,6 +115,33 @@ missed event costs a late reconcile, never a wrong one.
 `serve.ts` is the loop, and it is the only file that needs to understand both
 halves.
 
+### What "level-triggered" covers, and what it does not
+
+That guarantee is about **containers**, and it is worth being precise about
+why: it rests on there being an observation to recompute against.
+`ObservedState` holds containers, refreshed by the containerd event stream and
+a periodic full resync, so a container that is killed, removed or changed
+behind fiber-servo's back is noticed on the next pass however it happened.
+
+**Networks have no observation behind them.** Compose creates and removes them
+as part of applying the model, so `ObservedState` deliberately carries none
+(decision 30) — which means there is nothing for a pass to compare a
+declaration against. `Plan.networks` is computed against the _last model this
+process applied_, not against the machine. So:
+
+|                                                                            | detected                                                             |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| a network you add, remove or edit in the tree                              | yes                                                                  |
+| a network missing on a fresh start                                         | yes — with no previous model, everything reads as new and is applied |
+| a network someone deletes with `nerdctl network rm` while fiber-servo runs | **no**                                                               |
+| a network someone edits underneath it                                      | **no**                                                               |
+
+A container removed behind fiber-servo's back comes back. A network removed
+behind its back does not, until something else causes an apply or the process
+restarts. That is a real gap and it is stated rather than papered over;
+whether to observe networks — and what, given that Compose owns them — is
+left open.
+
 ## What each file is for
 
 | File                  | Job                                                                 |
