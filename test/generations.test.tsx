@@ -147,15 +147,25 @@ describe('a restart converges freshly rather than resuming', () => {
     expect(beforeRestart).toHaveLength(2);
     expect(beforeRestart.every((n) => n.startsWith(`web-${shortDigest(big)}-`))).toBe(true);
 
-    // The process goes away mid-rollout: the tree now says v2, and nothing
-    // anywhere remembers v1's template.
-    await first.root.settle();
+    // The process goes away. `detach()` is what that looks like from inside:
+    // the control plane stops, the containers do not. Anything weaker leaves
+    // the old loop subscribed to the runtime, still reconciling, still able
+    // to apply its own stale desired state over the top of its replacement —
+    // which is not a restart, it is two control planes.
+    const historyBefore = createGenerationHistory();
+    await first.detach();
+    const callsAtDetach = runtime.calls.length;
 
     const second = serve(
       <Deployment name="web" replicas={2} strategy={{ maxSurge: 2 }}>
         <Container {...v2} />
       </Deployment>,
-      { runtime: () => runtime, observed: createObservedStore(), restart: { baseDelayMs: 1, factor: 1 } },
+      {
+        runtime: () => runtime,
+        observed: createObservedStore(),
+        generations: historyBefore, // a fresh one, to show it starts empty
+        restart: { baseDelayMs: 1, factor: 1 },
+      },
     );
     await settle(second);
 
@@ -164,6 +174,54 @@ describe('a restart converges freshly rather than resuming', () => {
     expect(after.every((n) => n.startsWith(`web-${shortDigest(v2)}-`))).toBe(true);
     expect(runtime.calls.some((c) => c.startsWith(`remove web-${shortDigest(big)}-`))).toBe(true);
 
+    // The detached control plane took no further part: every call after the
+    // handover was made by the new one, and none of them recreated v1.
+    expect(
+      runtime.calls.slice(callsAtDetach).some((c) => c.includes(shortDigest(big)) && c.startsWith('create')),
+    ).toBe(false);
+
+    // And no history crossed the boundary: the new control plane knows only
+    // the generation it declared itself.
+    expect([...historyBefore.all().keys()]).toEqual([digest(v2)]);
+
     await second.stop();
+  }, 20_000);
+
+  it('detach leaves the runtime alone, where stop tears it down', async () => {
+    const runtime = createMemoryRuntime();
+    const served = serve(<Container name="solo" image="api:v1" />, {
+      runtime: () => runtime,
+      restart: { baseDelayMs: 1, factor: 1 },
+    });
+    await settle(served);
+    expect(runtime.calls.some((c) => c.startsWith('create solo'))).toBe(true);
+
+    await served.detach();
+
+    // Still there, and the adapter was never asked to remove anything.
+    expect((await runtime.inspect()).containers.has('solo')).toBe(true);
+    expect(runtime.calls.some((c) => c.startsWith('remove solo'))).toBe(false);
+    expect(runtime.calls.some((c) => c.startsWith('down'))).toBe(false);
+  }, 20_000);
+
+  it('a detached control plane does not react to the runtime any more', async () => {
+    const runtime = createMemoryRuntime();
+    const served = serve(<Container name="solo" image="api:v1" />, {
+      runtime: () => runtime,
+      restart: { baseDelayMs: 1, factor: 1 },
+    });
+    await settle(served);
+    await served.detach();
+    const callsAtDetach = runtime.calls.length;
+
+    // A container dying is exactly what a live control plane would act on.
+    runtime.kill('solo');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(runtime.calls.slice(callsAtDetach).filter((c) => !c.startsWith('kill '))).toEqual([]);
+    // Its observed state is now stale rather than empty, which is the point:
+    // it is not watching any more, so it still believes what it last saw.
+    expect(served.observed.get('solo')?.phase).toBe('running');
+    expect((await runtime.inspect()).containers.get('solo')?.phase).toBe('exited');
   }, 20_000);
 });

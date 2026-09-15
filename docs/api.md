@@ -148,9 +148,32 @@ interface Served {
   observed: ObservedStore;
   reconcile(): Promise<void>; // force one pass
   idle(): Promise<void>; // wait for queued work
-  stop(): Promise<void>; // unmount, reconcile it away, stop watching
+  stop(): Promise<void>; // end the application: runtime.down() removes it
+  detach(): Promise<void>; // end the control plane: the machine is untouched
 }
 ```
+
+`stop` and `detach` are the two ways to finish, and they differ in what they
+leave behind:
+
+```text
+detach()   the control plane stops.    containers and networks stay.
+stop()     the application stops.      runtime.down() removes them.
+```
+
+`detach` is what "the fiber-servo process died" looks like from inside one
+process: reconcile requests stop being accepted, the retry timer is cleared,
+both subscriptions are dropped, the tree is unmounted, and all controller
+state — the restart gate, the rollout history, the last applied model — goes
+with it. The runtime adapter is not even closed, because a process that
+crashed does not politely close its socket either.
+
+Use it to hand a machine over to another process, to swap a control plane
+without an outage, or to write a test about restart semantics that is
+actually about a restart. Merely dropping the reference to a `serve()` does
+not detach it: it still holds a runtime subscription, still reconciles when an
+event arrives, and can still apply its own stale desired state over the top of
+whatever replaced it.
 
 ### `createRoot(options)`
 

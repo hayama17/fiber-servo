@@ -248,8 +248,39 @@ export interface Served {
   reconcile(): Promise<void>;
   /** Wait for any reconcile already in flight or queued. */
   idle(): Promise<void>;
-  /** Unmount the tree and remove the whole application from the runtime. */
+  /**
+   * Unmount the tree and remove the whole application from the runtime.
+   *
+   * This ends the *application*: `runtime.down()` is called, so the
+   * containers and the network go too. For ending only the control plane,
+   * see `detach`.
+   */
   stop(): Promise<void>;
+
+  /**
+   * End the control plane and leave the runtime exactly as it is.
+   *
+   * ```text
+   * detach()   control plane stops.       containers and networks stay.
+   * stop()     the application stops.     runtime.down() removes them.
+   * ```
+   *
+   * This is what "the fiber-servo process died" looks like from inside one
+   * process: reconcile requests stop being accepted, the retry timer is
+   * cleared, both subscriptions are dropped, the tree is unmounted, and every
+   * piece of controller state — the restart gate, the rollout history, the
+   * last applied model — goes with it. Nothing is asked of the runtime, and
+   * the adapter is left open, because a process that has crashed does not
+   * politely close its socket either.
+   *
+   * It exists because that state is not observable from outside, and a test
+   * that merely stops calling a `serve()` has not detached it: it still holds
+   * a runtime subscription, still reconciles when an event arrives, and can
+   * still apply its own stale idea of desired state on top of whoever
+   * replaced it. Real code wants it too — anything that hands a machine over
+   * to another process, or swaps a control plane without an outage.
+   */
+  detach(): Promise<void>;
 }
 
 export function serve(element: ReactNode, options: ServeOptions): Served {
@@ -505,6 +536,23 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     async idle() {
       await started;
       while (running !== null) await running;
+    },
+    async detach() {
+      await started;
+      // Take the loop out of service *first*: unmounting commits an empty
+      // desired state, and a control plane on its way out must not apply
+      // that. `stopped` makes `request()` a no-op, so the commit updates
+      // this process's own `desired` and reaches no runtime.
+      stopped = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      unsubscribeObserved();
+      unsubscribeRuntime();
+      // Drain anything already in flight, so nothing lands after the caller
+      // believes this control plane is gone.
+      while (running !== null) await running;
+      root.unmount();
+      // Deliberately not `runtime.down()`, and deliberately not
+      // `runtime.close()`: the whole point is that the machine is untouched.
     },
     async stop() {
       await started;
