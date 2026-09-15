@@ -30,7 +30,7 @@
  * this pass's model at all.
  */
 import type { ReactNode } from 'react';
-import { DEFAULT_PROJECT, renderCompose } from './compose.js';
+import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
 import { runControllers } from './controllers.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
@@ -261,6 +261,19 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   // Loop-guard state; see `wedged` below.
   let lastModel = '';
+  /**
+   * The model most recently handed to `runtime.apply`.
+   *
+   * Only the networks in it are read back (see `Plan.networks`): they are the
+   * one part of the model with nothing observable behind it, because Compose
+   * owns their lifecycle and `ObservedState` therefore carries none. Keeping
+   * it here rather than deriving it is a deliberate, bounded exception to
+   * "every pass recomputes from observed state" — and a safe one, since a
+   * process that has just started has no previous model, treats every
+   * declared network as new, and applies once. The cost of that is a single
+   * idempotent `compose up`.
+   */
+  let lastApplied: ComposeApplication | undefined;
   let repeats = 0;
   let stalled = false;
 
@@ -352,7 +365,12 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
 
     // 3. Build the Compose Application Model this pass would apply, and stop
     //    if reconciling it is not converging (see `wedged` below).
-    const plan = planApply({ networks: target.networks, containers: included }, snapshot, project);
+    const plan = planApply(
+      { networks: target.networks, containers: included },
+      snapshot,
+      project,
+      lastApplied,
+    );
     if (wedged(plan)) return;
 
     options.onApply?.(plan);
@@ -375,6 +393,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     // 4. Hand the whole model to the runtime. It decides create vs. replace
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
+    lastApplied = plan.model;
   }
 
   /**

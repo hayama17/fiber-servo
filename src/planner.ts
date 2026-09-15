@@ -37,7 +37,7 @@ import {
   toComposeApplication,
   type ComposeApplication,
 } from './compose.js';
-import type { ContainerSpec, NetworkSpec } from './resources.js';
+import { specValueEquals, type ContainerSpec, type NetworkSpec } from './resources.js';
 import type { ObservedState } from './runtime/types.js';
 
 /**
@@ -64,6 +64,27 @@ export interface Plan {
    * can never encode.
    */
   restarting: readonly string[];
+  /**
+   * Networks the model declares that the last applied one did not, no longer
+   * declares, or declares differently.
+   *
+   * Networks are the one part of the model with no observation behind them.
+   * `ObservedState` deliberately carries none — Compose creates and removes
+   * them as part of applying, so nothing in the control plane decides
+   * anything about their lifecycle (see `runtime/types.ts`) — which leaves
+   * nothing to diff a declaration against. So this one field is computed
+   * against the *previous model* rather than against reality, and it exists
+   * because without it a network-only edit changes no service, produces an
+   * empty plan, and is therefore never applied at all: declaring a network,
+   * or changing its subnet, would silently do nothing.
+   */
+  networks: NetworkChanges;
+}
+
+export interface NetworkChanges {
+  added: readonly string[];
+  removed: readonly string[];
+  changed: readonly string[];
 }
 
 /**
@@ -94,6 +115,7 @@ export function planApply(
   desired: { networks: readonly NetworkSpec[]; containers: readonly ContainerSpec[] },
   observed: ObservedState,
   project: string = DEFAULT_PROJECT,
+  previous?: ComposeApplication,
 ): Plan {
   const model = toComposeApplication(desired.containers, desired.networks, project);
   const recorded = recordedSpecDigests(observed);
@@ -107,7 +129,28 @@ export function planApply(
     .filter((name) => !changedOrMissing.has(name) && recorded.has(name))
     .filter((name) => observed.containers.get(name)?.phase === 'exited')
     .sort();
-  return { model, changed, orphaned, missing, restarting };
+  return { model, changed, orphaned, missing, restarting, networks: networkChanges(model, previous) };
+}
+
+/**
+ * Diff the model's networks against the last applied model's.
+ *
+ * With no previous model — a fresh process — every declared network counts as
+ * added. That is deliberately the safe direction: it makes the first pass
+ * apply, and applying an application whose networks already exist is a no-op
+ * for Compose, so the cost of being wrong here is one idempotent command.
+ */
+function networkChanges(model: ComposeApplication, previous: ComposeApplication | undefined): NetworkChanges {
+  const before = previous?.networks ?? {};
+  const added: string[] = [];
+  const changed: string[] = [];
+  for (const [name, network] of Object.entries(model.networks)) {
+    const was = before[name];
+    if (was === undefined) added.push(name);
+    else if (!specValueEquals(was, network)) changed.push(name);
+  }
+  const removed = Object.keys(before).filter((name) => !(name in model.networks));
+  return { added: added.sort(), changed: changed.sort(), removed: removed.sort() };
 }
 
 /**
@@ -124,7 +167,10 @@ export function planIsEmpty(plan: Plan): boolean {
     plan.missing.length === 0 &&
     plan.changed.length === 0 &&
     plan.orphaned.length === 0 &&
-    plan.restarting.length === 0
+    plan.restarting.length === 0 &&
+    plan.networks.added.length === 0 &&
+    plan.networks.changed.length === 0 &&
+    plan.networks.removed.length === 0
   );
 }
 
@@ -139,5 +185,8 @@ export function formatPlan(plan: Plan): string {
   for (const name of plan.changed) lines.push(`replace ${name}`);
   for (const name of plan.restarting) lines.push(`restart ${name}`);
   for (const name of plan.orphaned) lines.push(`remove ${name}`);
+  for (const name of plan.networks.added) lines.push(`create network ${name}`);
+  for (const name of plan.networks.changed) lines.push(`replace network ${name}`);
+  for (const name of plan.networks.removed) lines.push(`remove network ${name}`);
   return lines.length > 0 ? lines.join('\n') : '(nothing to do)';
 }

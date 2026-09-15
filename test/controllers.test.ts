@@ -337,6 +337,81 @@ describe('expandDeployment', () => {
     });
   });
 
+  // "the process started" and "it can serve traffic" are different facts, and
+  // a rollout that conflates them defeats maxUnavailable exactly when it
+  // matters: the old generation is drained during the window in which the
+  // new one is up but cannot answer anything.
+  describe('readiness-aware progress', () => {
+    const probed: ContainerTemplate = { image: 'api:v2', readiness: { exec: ['/health'] } };
+    const probedGen = digest(probed);
+    const spec: DeploymentSpec = {
+      name: 'web',
+      replicas: 3,
+      template: probed,
+      strategy: { maxUnavailable: 0 },
+    };
+
+    function newContainers(ready: boolean | undefined, count: number): ObservedContainer[] {
+      return Array.from({ length: count }, (_, i) =>
+        ownedContainer(`web-${probedGen}-${i}`, 'web', probed, { phase: 'running', ready }),
+      );
+    }
+
+    it('does not shrink the old generation for a container that is running but not ready', () => {
+      const observed = observedOf(...newContainers(false, 2), ...threeOldContainers());
+      const result = expandDeployment(spec, observed);
+      // newReady is 0, so the old generation keeps all three: 3 - 0 - 0.
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(3);
+    });
+
+    it('resumes progress once those containers report ready', () => {
+      const observed = observedOf(...newContainers(true, 2), ...threeOldContainers());
+      const result = expandDeployment(spec, observed);
+      expect(result.find((rs) => rs.name === `web-${probedGen}`)?.replicas).toBe(3); // min(3, 2+1)
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+    });
+
+    // The guarantee stated plainly: at no point does ready-new plus kept-old
+    // fall below `replicas`.
+    it('never lets availability dip below replicas while maxUnavailable is 0', () => {
+      for (const [readyCount, unready] of [
+        [0, 3],
+        [1, 2],
+        [2, 1],
+        [3, 0],
+      ]) {
+        const observed = observedOf(
+          ...newContainers(true, readyCount!),
+          ...newContainers(false, unready!).map((c, i) => ({
+            ...c,
+            name: `web-${probedGen}-${readyCount! + i}`,
+          })),
+          ...threeOldContainers(),
+        );
+        const keptOld = expandDeployment(spec, observed).find((rs) => rs.name === `web-${oldGen}`);
+        expect(
+          readyCount! + (keptOld?.replicas ?? 0),
+          `with ${String(readyCount)} ready`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    });
+
+    it('still counts a merely running container when the template has no probe', () => {
+      const unprobed: ContainerTemplate = { image: 'api:v2' };
+      const gen = digest(unprobed);
+      const observed = observedOf(
+        ownedContainer(`web-${gen}-0`, 'web', unprobed, { phase: 'running' }), // ready is undefined
+        ownedContainer(`web-${gen}-1`, 'web', unprobed, { phase: 'running' }),
+        ...threeOldContainers(),
+      );
+      const result = expandDeployment(
+        { name: 'web', replicas: 3, template: unprobed, strategy: { maxUnavailable: 0 } },
+        observed,
+      );
+      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+    });
+  });
+
   it('feeding a generated ReplicaSet through expandReplicaSet yields deterministic container names', () => {
     const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
     const observed = observedOf(...threeOldContainers());

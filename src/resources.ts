@@ -101,13 +101,19 @@ export type ContainerTemplate = Omit<ContainerSpec, 'name'>;
 
 /**
  * A local bridge network: roughly a Docker user-defined network. Containers on
- * the same Network reach each other by name; the fields other than `name` are immutable
- * once created, so changing one replaces the Network.
+ * the same Network reach each other by name; the fields other than `name` are
+ * immutable once created, so changing one replaces the Network.
+ *
+ * There is no `labels` here, and the omission is deliberate: a Compose network
+ * can declare labels, but nerdctl does not pass them on — verified against
+ * nerdctl 2.1.2 in both the map and the list syntax, and the created network
+ * carries only Compose's own two labels either way. A field you can set that
+ * provably does nothing is worse than no field, so it is not offered.
  */
 export interface NetworkSpec {
   name: string;
+  /** CIDR for the bridge, e.g. `10.88.0.0/24`. The gateway is chosen by the runtime. */
   subnet?: string;
-  labels?: Readonly<Record<string, string>>;
 }
 
 /**

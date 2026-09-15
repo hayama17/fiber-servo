@@ -197,6 +197,27 @@ function recoverTemplate(
   return undefined;
 }
 
+/**
+ * Whether a Container counts towards a rollout's progress.
+ *
+ * `running` means a process started. When the template declares a readiness
+ * probe it does *not* mean the process can do its job yet — that is the whole
+ * reason the probe was written — so a generation with a probe counts only
+ * Containers that have actually answered it. Without the distinction,
+ * `maxUnavailable: 0` guarantees nothing: the rollout would shrink the old
+ * generation as soon as the new one's processes existed, which is precisely
+ * the window in which the new ones cannot serve anything.
+ *
+ * A template with no probe has nothing to wait for, so `running` is the whole
+ * answer — and `ready` is left `undefined` in that case anyway (see
+ * `ObservedContainer.ready`), which is why this asks the template rather than
+ * inferring the rule from the observation.
+ */
+function isReady(container: ObservedContainer, template: ContainerTemplate): boolean {
+  if (container.phase !== 'running') return false;
+  return template.readiness === undefined || container.ready === true;
+}
+
 /** The oldest of a generation's Containers, by observation time — the best proxy available, since `ObservedContainer` records when it was last seen, not when it was created. */
 function oldestObservedAt(containers: readonly ObservedContainer[]): number {
   return Math.min(...containers.map((c) => c.at));
@@ -213,7 +234,8 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  *
  * Rollout math (PLAN.md "Deployment rollout semantics", step 8): let
  * `newReady` be the observed count of the new generation's Containers that
- * are `running`, `maxSurge` (default 1) the Containers allowed above
+ * are ready — `running`, and answering their readiness probe if the template
+ * declares one (see `isReady`) — `maxSurge` (default 1) the Containers allowed above
  * `replicas`, and `maxUnavailable` (default 0) the Containers allowed
  * missing below it.
  *
@@ -256,7 +278,7 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
     else byGeneration.set(generation, [container]);
   }
 
-  const newReady = (byGeneration.get(newGeneration) ?? []).filter((c) => c.phase === 'running').length;
+  const newReady = (byGeneration.get(newGeneration) ?? []).filter((c) => isReady(c, spec.template)).length;
   const newReplicas = Math.min(spec.replicas, newReady + maxSurge);
 
   const result: ReplicaSetSpec[] = [];

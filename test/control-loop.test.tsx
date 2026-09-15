@@ -64,6 +64,44 @@ describe('a single container', () => {
     await served.stop();
   });
 
+  // A network-only tree changes no service, so before networks entered the
+  // plan it produced an empty plan and nothing reached the runtime at all:
+  // declaring a network created nothing.
+  it('applies a tree that declares only a network', async () => {
+    const { served, runtime } = start(<Network name="solo" subnet="10.77.0.0/24" />);
+    await settle(served);
+
+    const applied = runtime.calls.filter((c) => c.startsWith('apply '));
+    expect(applied.length).toBeGreaterThan(0);
+
+    await served.stop();
+  });
+
+  it('applies again when only a network changed', async () => {
+    const { served, runtime } = start(
+      <>
+        <Network name="demo" subnet="10.1.0.0/24" />
+        <Container name="web" image="nginx:alpine" network="demo" />
+      </>,
+    );
+    await settle(served);
+    const before = runtime.calls.filter((c) => c.startsWith('apply ')).length;
+
+    served.root.render(
+      <>
+        <Network name="demo" subnet="10.2.0.0/24" />
+        <Container name="web" image="nginx:alpine" network="demo" />
+      </>,
+    );
+    await settle(served);
+
+    expect(runtime.calls.filter((c) => c.startsWith('apply ')).length).toBeGreaterThan(before);
+    // And the container itself was not disturbed by it.
+    expect(served.observed.get('web')?.phase).toBe('running');
+
+    await served.stop();
+  });
+
   it('removes the container when it leaves the tree', async () => {
     const { served, runtime } = start(<Container name="web" image="nginx:alpine" />);
     await settle(served);

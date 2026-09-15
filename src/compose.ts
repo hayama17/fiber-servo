@@ -115,9 +115,13 @@ export interface ComposeService {
  * and then the name written into the model no longer equals the name observed
  * back on the container. Pinning it keeps those two the same string, which is
  * one fewer thing for the reconcile comparison to know about.
+ *
+ * `ipam` carries `NetworkSpec.subnet`. Verified against nerdctl 2.1.2: the
+ * created network really does get that CIDR, with a gateway assigned from it.
  */
 export interface ComposeNetwork {
   name: string;
+  ipam?: { config: readonly { subnet: string }[] };
 }
 
 export interface ComposeApplication {
@@ -172,6 +176,13 @@ export function toComposeService(spec: ContainerSpec): ComposeService {
   return service;
 }
 
+/** One declared network becomes one Compose network. Only the fields Compose actually acts on. */
+export function toComposeNetwork(spec: NetworkSpec): ComposeNetwork {
+  const network: ComposeNetwork = { name: spec.name };
+  if (spec.subnet) Object.assign(network, { ipam: { config: [{ subnet: spec.subnet }] } });
+  return network;
+}
+
 /**
  * The whole desired application.
  *
@@ -193,7 +204,7 @@ export function toComposeApplication(
   }
 
   const declared: Record<string, ComposeNetwork> = {};
-  for (const network of networks) declared[network.name] = { name: network.name };
+  for (const network of networks) declared[network.name] = toComposeNetwork(network);
   // A container may name a network the tree never declared. Compose refuses a
   // service referencing an undeclared network, so rather than emit a file that
   // cannot be applied, declare it: the user asked to join it, and Compose

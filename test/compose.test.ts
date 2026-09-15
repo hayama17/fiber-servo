@@ -116,8 +116,19 @@ describe('toComposeApplication', () => {
   // project (`backend` becomes `fiber-servo_backend`) and the name written
   // into the model stops equalling the name observed back on the container.
   it('pins every network name so it survives the round trip unprefixed', () => {
-    const app = toComposeApplication([], [{ name: 'backend', subnet: '10.4.0.0/24' }], 'proj');
+    const app = toComposeApplication([], [{ name: 'backend' }], 'proj');
     expect(app.networks).toEqual({ backend: { name: 'backend' } });
+  });
+
+  // Verified against nerdctl 2.1.2: the created network really does get this
+  // CIDR, with a gateway assigned from it. Before this, `subnet` was a field
+  // you could set that did nothing at all.
+  it('materialises a declared subnet into the Compose network', () => {
+    const app = toComposeApplication([], [{ name: 'backend', subnet: '10.4.0.0/24' }], 'proj');
+    expect(app.networks['backend']).toEqual({
+      name: 'backend',
+      ipam: { config: [{ subnet: '10.4.0.0/24' }] },
+    });
   });
 
   it('declares a network a container joins but the tree never declared', () => {
