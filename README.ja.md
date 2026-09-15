@@ -2,10 +2,9 @@
 
 [English](README.md) | 日本語
 
-**React Fiber を使った、単一ノード向けコンテナオーケストレータの実験。**
+**React Fiberを制御プレーンとして使う、単一ノード向けコンテナオーケストレーターの実験です。**
 
-JSX で望ましい構成を宣言します。React のコントローラコンポーネントが実行状態を購読し、
-必要なリソースを render します。適用には `nerdctl compose`、観測には containerd gRPC を使います。
+JSXでアプリケーションの構成を宣言すると、Reactのコントローラーが実行中の状態を読み取り、必要なリソースを組み立てます。Composeへの適用には`nerdctl compose`、状態の監視にはcontainerd gRPCを使います。
 
 ```tsx
 import { Container, Network, ReplicaSet, Service } from 'fiber-servo';
@@ -38,12 +37,11 @@ export default function App() {
 npm install fiber-servo react
 ```
 
-Node 20 以上。containerd ランタイムには `nerdctl` と containerd のソケットに
-アクセスできる権限が必要です。[設定と制約](docs/containerd.md)を参照してください。
+Node.js 20以上が必要です。containerdを使う場合は、`nerdctl`とcontainerdのソケットにアクセスできる環境を用意してください。詳しくは[設定と制約](docs/containerd.md)を参照してください。
 
-## containerd なしで試す
+## containerdなしで試す
 
-リポジトリを clone して `npm install` 後、メモリ上でサンプルを実行できます。
+リポジトリをcloneして`npm install`を実行すると、containerdなしでメモリ上のサンプルを試せます。
 
 ```console
 npm run example
@@ -52,18 +50,14 @@ npm run example:webapp
 npm run example:plan -- --model
 ```
 
-最初の3つは Ctrl-C まで実行し、`example:plan` はモデルを表示して終了します。
-各 example は JSX を export し、起動・ログ・終了処理は CLI が担当します。
-`npm run example:replicaset -- --watch` で保存時の再評価もできます。
+最初の3つはCtrl-Cまで動き続け、`example:plan`はモデルを表示して終了します。各サンプルはJSXをexportし、起動・ログ出力・終了処理はCLIが担当します。
+`npm run example:replicaset -- --watch`を使うと、ファイルを保存するたびに再評価できます。
 
-containerd での実行は、ソケットへのアクセス権限を持つ環境で
-`npm run example:containerd -- --namespace default` を使います。
-従来の環境変数 `FIBER_SERVO_NAMESPACE` は CLI の `--namespace` に置き換わります。
-ランタイム障害からの復旧はReactのコントローラ経由で行い、[制御ループのテスト](test/control-loop.test.tsx)で検証します。
+containerdで試す場合は、ソケットにアクセスできる環境で`npm run example:containerd -- --namespace default`を実行します。以前の環境変数`FIBER_SERVO_NAMESPACE`の代わりに、CLIの`--namespace`オプションを使います。ランタイム障害からの復旧はReactのコントローラーツリーを通じて行い、[制御ループのテスト](test/control-loop.test.tsx)で検証しています。
 
 ## CLI
 
-アプリのファイルは React 要素かコンポーネントを default export します。
+アプリのファイルは、React要素またはコンポーネントをdefault exportしてください。
 
 ```console
 npx fiber-servo plan app.tsx --model
@@ -71,46 +65,41 @@ npx fiber-servo up app.tsx
 npx fiber-servo apply app.tsx
 ```
 
-- `plan`: メモリランタイムで構成を展開します。`--model` は Compose モデルを
-  表示します。実機との差分ではなく、アプリのコード自体は実行されます。
-- `up`: Ctrl-C まで実行します。`--watch` を付けるとエントリファイルの保存時に
-  再評価します。通常終了時にはアプリのコンテナとネットワークを削除します。
-- `apply`: 実行中のセッションに再評価を依頼します。保存だけでは適用しません。
-  成功は readiness 完了を意味せず、失敗時のロールバックはありません。
+- `plan`: メモリランタイム上でアプリの構成を展開します。`--model`を付けるとComposeモデルを表示します。実機との差分を取るコマンドではなく、アプリのコードを実行してモデルを作ります。
+- `up`: Ctrl-Cまで実行し続けます。`--watch`を付けると、エントリーファイルを保存したときに再評価します。通常終了時にはアプリのコンテナとネットワークを削除します。
+- `apply`: 実行中のセッションに再評価を依頼します。ファイルを保存しただけでは適用されません。成功してもreadinessの完了は意味せず、失敗時のロールバックも行いません。
 
 ## モデル
 
-ネストは所有関係、props は参照を表します。Network は他のリソースと並べて宣言し、
-Container から `network="backend"` で参照します。
+要素のネストは所有関係を、propsはリソース間の参照を表します。`Network`は他のリソースと同じ階層に宣言し、`Container`から`network="backend"`のように指定して接続します。
 
-| コンポーネント | 役割                                       |
-| -------------- | ------------------------------------------ |
-| `<Network>`    | ローカルのブリッジネットワーク。           |
-| `<Container>`  | Compose サービスに対応する実行単位。       |
-| `<ReplicaSet>` | Container テンプレートを指定数維持。       |
-| `<Deployment>` | ReplicaSet を通じた段階的ロールアウト。    |
-| `<Service>`    | ラベルで選択したコンテナ群へのプロキシ。   |
-| `<Ready>`      | 依存先の起動・readiness を待って子を宣言。 |
+| コンポーネント | 役割                                                |
+| -------------- | --------------------------------------------------- |
+| `<Network>`    | ローカルのブリッジネットワーク                      |
+| `<Container>`  | 1つのComposeサービスに対応する実行単位              |
+| `<ReplicaSet>` | `Container`を指定した数だけ維持                     |
+| `<Deployment>` | `ReplicaSet`を使った段階的なロールアウト            |
+| `<Service>`    | ラベルで選んだコンテナへのプロキシ                  |
+| `<Ready>`      | 依存先が起動またはreadinessを満たすまで子要素を待機 |
 
 ## 制約
 
-- 単一ノード・単一ライターを想定。クラスタや永続的な API サーバはありません。
-- CPU・メモリを含め、Container の spec 変更は再作成になります。
-- Service は接続先の変更時にプロキシを再作成し、通信が途切れる場合があります。
-  実験の小ささを優先し、この挙動を許容します。
-- 外部からのネットワーク変更は検出・自動復旧しません。
-- 制御プロセスを再起動するとロールアウト履歴は失われ、旧世代を段階的に
-  縮小することなく現在の構成へ収束します。
+- 単一ノード・単一ライター向けです。クラスタや永続APIサーバーは扱いません。
+- `Container`のspecを変更すると、CPUやメモリの設定を含めてコンテナを作り直します。
+- `Service`の接続先を変えるとプロキシを作り直すため、通信が一時的に途切れることがあります。実験を小さく保つため、この制約を受け入れています。
+- 外部から変更されたネットワークは検知も自動復旧もしません。
+- 制御プロセスを再起動するとロールアウト履歴は失われます。中断したロールアウトを再開せず、現在の構成へ収束します。
 
 ## ドキュメント
 
-- [API](docs/api.md) — props、フック、ライフサイクル。
-- [Architecture](docs/architecture.md) — 責務、状態、復旧の範囲。
-- [containerd](docs/containerd.md) — 設定と実行時の挙動。
-- [Design decisions](docs/decisions.md) — 判断理由と変更履歴。
-- [Project scope](PLAN.md) — 対象外と未決事項。
-- [Contributing](CONTRIBUTING.md) — 開発と検証。
+- [API](docs/api.md) — props、フック、ライフサイクル
+- [Architecture](docs/architecture.md) — 責務、状態、復旧の範囲
+- [containerd](docs/containerd.md) — 設定と実行時の挙動
+- [Design decisions](docs/decisions.md) — 判断理由と変更履歴
+- [Project scope](PLAN.md) — 対象外と未決事項
+- [Contributing](CONTRIBUTING.md) — 開発と検証
 
 ## ライセンス
 
 MIT
+
