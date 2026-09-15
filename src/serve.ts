@@ -4,7 +4,7 @@
  *
  * ```text
  *   React commit ─────┐
- *                     ├──> reconcile() ──> controllers ──> Compose model ──> Runtime.apply
+ *                     ├──> reconcile() ──> Compose model ──> Runtime.apply
  *   runtime event ────┘         ▲                                              │
  *                               └──────────────── observed state ◄─────────────┘
  * ```
@@ -12,9 +12,9 @@
  * Both arrows into `reconcile()` mean the same thing — "something might now be
  * out of date" — and neither says what to do about it. That is the whole point
  * of the split: a React commit changes what we want, a runtime event changes
- * what is, and in both cases the answer is to recompute the difference from
- * scratch. There is no incremental diff to keep in sync, and therefore nothing
- * to get out of sync.
+ * what is, and in both cases the answer is to let React recompute the runtime
+ * resource tree from scratch. There is no incremental diff to keep in sync,
+ * and therefore nothing to get out of sync.
  *
  * The loop is level-triggered, not edge-triggered: it reads the current
  * desired state and the current observed state every tick and acts on the
@@ -31,9 +31,8 @@
  */
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
-import { GENERATION_LABEL, runControllers } from './controllers.js';
-import { createGenerationHistory, type GenerationHistory } from './generations.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
+import { createGenerationHistory, type GenerationHistory } from './generations.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
 import { digest, resourcesOfKind, type ContainerSpec, type DesiredState } from './resources.js';
@@ -291,7 +290,9 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
   const project = options.project ?? DEFAULT_PROJECT;
   const gate = new RestartGate(policy, now);
-  const generations = options.generations ?? createGenerationHistory();
+  // Kept as an injection point for callers that persist control-plane state.
+  // Deployment history itself now lives in the React controller component.
+  const generations: GenerationHistory = options.generations ?? createGenerationHistory();
   const runtime: Runtime = options.runtime({ log, onError, project });
   const warnedGiveUp = new Set<string>();
 
@@ -369,32 +370,15 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   async function pass(): Promise<void> {
     const snapshot = observed.snapshot();
 
-    // 1. Controllers: management resources become the containers that should
-    //    exist. Every Deployment's current template is recorded first, so
-    //    that when it stops being the current one there is still somewhere
-    //    to read it from — the controllers themselves stay pure, taking the
-    //    accumulated map as an ordinary argument.
-    for (const deployment of resourcesOfKind(desired, 'deployment')) {
-      generations.remember(deployment.spec.template);
-    }
-    const target = runControllers(desired, snapshot, generations.all());
-
-    // Forget generations nothing refers to any more: every one currently
-    // declared, plus every one a container is still running under. Done here
-    // rather than after applying, because the pass that finally sees the last
-    // old-generation container gone is a pass with nothing left to apply —
-    // pruning below the early return would leave one stale entry behind for
-    // ever, which is a small leak but a leak with no bound on how long it
-    // lasts.
-    generations.prune([
-      ...resourcesOfKind(desired, 'deployment').map((d) => digest(d.spec.template)),
-      ...[...snapshot.containers.values()]
-        .map((c) => c.labels[GENERATION_LABEL])
-        .filter((g): g is string => g !== undefined),
-    ]);
+    // React controller components have already expanded management resources
+    // into runtime Containers. The root only collects their committed output.
+    const target = {
+      networks: resourcesOfKind(desired, 'network').map((resource) => resource.spec),
+      containers: resourcesOfKind(desired, 'container').map((resource) => resource.spec),
+    };
 
     // 2. The restart gate: which of those containers are actually admitted
-    //    into this pass's model. This is the one thing `runControllers`
+    //    into this pass's model. This remains outside React because it is
     //    cannot decide on its own — it has no memory of past failures.
     const desiredNames = new Set(target.containers.map((c) => c.name));
     for (const name of [...gate.names()]) {
