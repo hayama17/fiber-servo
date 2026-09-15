@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -16,11 +16,13 @@ import {
 } from '../src/compose.js';
 import {
   createContainerdRuntime,
+  createNerdctl,
   type ApiContainer,
   type ApiEvent,
   type ApiTask,
   type ContainerdApi,
   type ContainerdRuntimeOptions,
+  type ExecOptions,
   type ExecResult,
   type Nerdctl,
 } from '../src/runtime/containerd/index.js';
@@ -87,6 +89,10 @@ function createFakeContainerd(project = PROJECT) {
   const containers = new Map<string, FakeContainer>(); // keyed by service name -- one instance per service, index 1
   const probeResults = new Map<string, ExecResult>();
   const calls: string[] = [];
+  /** The model the file said at the moment `compose down` read it. */
+  let downModel: ComposeApplication | undefined;
+  /** Options the last `exec` was called with -- the readiness probe's timeout rides here. */
+  let lastExecOptions: ExecOptions | undefined;
   let counter = 0;
   let subscriber: { onEvent: (e: ApiEvent) => void; onError?: (e: Error) => void } | undefined;
 
@@ -170,6 +176,7 @@ function createFakeContainerd(project = PROJECT) {
     } catch {
       return fail(`open ${file}: no such file or directory`);
     }
+    downModel = app;
     if (app.name !== project) return ok();
     for (const c of [...containers.values()]) removeAndEmit(c);
     return ok();
@@ -181,8 +188,9 @@ function createFakeContainerd(project = PROJECT) {
   }
 
   const nerdctl: Nerdctl = {
-    async exec(args) {
+    async exec(args, opts) {
       calls.push(args.join(' '));
+      lastExecOptions = opts;
       if (args[0] !== 'compose') return ok();
       const [, , file, verb, ...rest] = args;
       switch (verb) {
@@ -241,6 +249,8 @@ function createFakeContainerd(project = PROJECT) {
     calls,
     containers,
     probeResults,
+    downOf: (): ComposeApplication | undefined => downModel,
+    execOptions: (): ExecOptions | undefined => lastExecOptions,
     /** A process inside the container exiting on its own -- fires `/tasks/exit`. */
     setExited: (service: string, exitCode: number): void => {
       const c = containers.get(service);
@@ -528,6 +538,20 @@ describe('containerd runtime: inspect()', () => {
     expect(state.containers.get('app')?.specDigest).toBe(spec.services['app']!.labels![SPEC_LABEL]);
   });
 
+  // `compose down` removes the project's networks, but only the ones the file
+  // it is handed declares -- and by then the last apply has usually reduced
+  // that file to the empty model, which is exactly what `serve().stop()`
+  // does. Found live: the network was still on the machine afterwards.
+  it('hands `down` the networks the application declared, not the empty model applied last', async () => {
+    const fc = createFakeContainerd();
+    const runtime = runtimeFor(fc);
+    await runtime.apply(model([{ name: 'app', image: 'app:1', network: 'backend' }], [{ name: 'backend' }]));
+    await runtime.apply(model([])); // what stop() applies after unmounting
+    await runtime.down();
+
+    expect(Object.keys(fc.downOf()?.networks ?? {})).toEqual(['backend']);
+  });
+
   // `compose up` on a file with no services is a hard error, not a no-op --
   // and an empty application is exactly what the last pass of `stop()` asks
   // for. Removing everything must not then fail on the way out.
@@ -711,5 +735,44 @@ describe('containerd runtime: readiness prober', () => {
     const state = await runtime.inspect();
     expect(state.containers.get('app')?.ready).toBe(false); // recreated: unready until probed again
     expect(state.containers.get('sidecar')?.ready).toBe(true); // never touched: still ready
+  });
+});
+
+// ---- the exec seam's timeout -------------------------------------------------
+//
+// A readiness probe runs against a container that may be unwell, so a probe
+// that never returns is a case to design for. Before this bound existed, one
+// stuck `nerdctl exec` left the container permanently un-ready AND held the
+// lock that teardown's `compose rm` needs, so Ctrl-C never completed. These
+// spawn a real process, because the bug was in the spawning.
+
+describe('createNerdctl: the exec timeout', () => {
+  /** A stand-in for the nerdctl binary: ignores its arguments and does what it is told. */
+  function fakeBin(body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'fiber-servo-bin-'));
+    composeDirs.push(dir);
+    const path = join(dir, 'fake-nerdctl');
+    writeFileSync(path, `#!/bin/sh\n${body}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  it('kills a process that will not finish, and reports it as a failure', async () => {
+    const nerdctl = createNerdctl({ bin: fakeBin('sleep 30') });
+    const started = Date.now();
+    const res = await nerdctl.exec(['compose', 'exec', 'app', 'probe'], { timeoutMs: 150 });
+
+    expect(res.code).not.toBe(0); // a probe that timed out has not passed
+    expect(res.stderr).toMatch(/killed after 150ms/);
+    expect(Date.now() - started).toBeLessThan(5000); // it did not wait for the 30s sleep
+  });
+
+  it('leaves a process that finishes in time completely alone', async () => {
+    const nerdctl = createNerdctl({ bin: fakeBin('echo ready') });
+    const res = await nerdctl.exec(['compose', 'exec', 'app', 'probe'], { timeoutMs: 5000 });
+
+    expect(res.code).toBe(0);
+    expect(res.stdout.trim()).toBe('ready');
+    expect(res.stderr).not.toMatch(/killed/);
   });
 });

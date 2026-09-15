@@ -52,7 +52,7 @@ The unit of everything: one process, one image, one Compose service.
 | `labels`    | `Record<string,string>?` | What a `<Service>` selector matches.                                                      |
 | `publish`   | `PortMapping[]?`         | Host ports. Do not set these on a replicated container — replicas would collide.          |
 | `resources` | `ResourceLimits?`        | `{ cpu?: number; memory?: string }`.                                                      |
-| `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number }`. Exit 0 means ready.                            |
+| `readiness` | `ReadinessProbe?`        | `{ exec: string[]; intervalMs?: number; timeoutMs?: number }`. Exit 0 means ready.        |
 
 **Every field is immutable, `resources` included.** Changing any of them
 replaces the container. There is no in-place update: Compose has no

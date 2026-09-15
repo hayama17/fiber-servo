@@ -104,7 +104,12 @@ services fails outright (`no service was provided`). Step 2 has already
 removed everything by then, so step 3 is skipped.
 
 `down()` is `compose -f <file> down`, guarded by the file existing — `down`
-against a missing file is an error, not a no-op.
+against a missing file is an error, not a no-op. Before running it, the
+adapter rewrites the file with the last model that **declared** anything:
+`compose down` removes only the networks the file it is given declares, and by
+then the file has usually been reduced to the empty model by that final
+`apply()`. Without this the application's network outlives it, which is what a
+live run showed.
 
 ## Labels, and how a restart recovers
 
@@ -142,6 +147,21 @@ under `fiber-servo.readiness`, written by `toComposeService` in
 `src/compose.ts` and read back by the adapter — off the model for a service
 about to be applied, and off a running container when rebuilding the schedule
 after a restart.
+
+**Every probe is bounded** (`timeoutMs`, default 2000), and the timeout kills
+the process _group_, not the child. Both halves of that were found by running
+it rather than reading it:
+
+- An unbounded probe is not merely slow. `nerdctl exec` into a wedged
+  container never returns, and it holds the container's exec lock — so the
+  `compose rm` that teardown issues blocks behind it and **Ctrl-C never
+  completes**. Measured before the fix: still running after 31 seconds; after
+  it: 3 seconds, container removed.
+- Signalling only the direct child does nothing, because `nerdctl compose
+exec` is itself a parent of `nerdctl exec`: the grandchild survives holding
+  the stdout pipe, so Node's `close` event never fires and the timeout has no
+  effect at all. The child is spawned `detached` and the timeout signals
+  `-pid`.
 
 ## Files
 

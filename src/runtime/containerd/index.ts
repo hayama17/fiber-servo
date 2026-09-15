@@ -57,7 +57,7 @@ export { createContainerdRuntime } from './runtime.js';
 export type { ContainerdRuntimeOptions } from './runtime.js';
 
 export { createNerdctl } from './nerdctl.js';
-export type { ExecResult, Nerdctl, NerdctlOptions } from './nerdctl.js';
+export type { ExecOptions, ExecResult, Nerdctl, NerdctlOptions } from './nerdctl.js';
 
 export { phaseFromTask, READINESS_LABEL, toObservedContainer } from './parse.js';
 

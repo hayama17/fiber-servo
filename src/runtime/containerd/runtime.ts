@@ -177,6 +177,18 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   /**
+   * The last model that declared anything, kept for `down()`.
+   *
+   * `compose down` removes the project's networks, but only the ones the file
+   * it is given declares -- and by the time `down()` runs, the file on disk
+   * has usually been reduced to the empty model by a final `apply()` (that is
+   * exactly what `serve().stop()` does: unmount, apply nothing, then tear
+   * down). Handing `down` that file removes nothing, and the network outlives
+   * the application. Verified live: the network was still there afterwards.
+   */
+  let lastDeclared: ComposeApplication | undefined;
+
+  /**
    * `model` plus a minimal stub entry for each service in `orphaned` -- just
    * enough for `compose rm -f -s` to accept the name; see the file doc for
    * why this exists at all. The stub's image is whatever this service was
@@ -285,6 +297,9 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
           `Set the project in one place — serve({ project }) passes it to the adapter for you.`,
       );
     }
+    if (Object.keys(model.services).length > 0 || Object.keys(model.networks).length > 0) {
+      lastDeclared = model;
+    }
     const { digests, images } = await recordedState();
     const changed = changedServices(model, digests);
     const orphaned = orphanedServices(model, digests);
@@ -321,12 +336,18 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
   }
 
   async function down(): Promise<void> {
+    // Restore what the application last declared, so `down` has the networks
+    // to remove; see `lastDeclared`. A process that never applied anything in
+    // this run has nothing to restore and falls back to the file on disk,
+    // which is the point of that file being at a stable path.
+    if (lastDeclared) writeModel(lastDeclared);
     if (!existsSync(composeFile)) return; // nothing was ever applied: down is idempotent
     const res = await call(['compose', '-f', composeFile, 'down']);
     if (res.code !== 0) throw fail(res, 'compose down');
     idIndex.clear();
     notOurs.clear();
     readinessTargets.clear();
+    lastDeclared = undefined;
   }
 
   // ---- events -----------------------------------------------------------------
@@ -477,7 +498,10 @@ export function createContainerdRuntime(options: ContainerdRuntimeOptions): Runt
         const interval = target.probe.intervalMs ?? 2000;
         if (t - (lastAttempt.get(service) ?? 0) < interval) continue;
         lastAttempt.set(service, t);
-        const res = await nerdctl.exec(['compose', '-f', composeFile, 'exec', service, ...target.probe.exec]);
+        const res = await nerdctl.exec(
+          ['compose', '-f', composeFile, 'exec', service, ...target.probe.exec],
+          { timeoutMs: target.probe.timeoutMs ?? 2000 },
+        );
         // Only mark it once: a concurrent removal clears the target from the
         // map entirely, so a stale success cannot resurrect it.
         if (res.code === 0 && readinessTargets.get(service) === target && !target.ready) {

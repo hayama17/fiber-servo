@@ -37,6 +37,17 @@ export interface ReadinessProbe {
   exec: readonly string[];
   /** Time between attempts. Default 2000. */
   intervalMs?: number;
+  /**
+   * Give up on one attempt after this long and count it as a failure.
+   * Default 2000.
+   *
+   * A probe runs against a container that may be unwell, so "the probe never
+   * returns" is a case to design for rather than an exotic one. Without a
+   * bound, one stuck probe leaves the container permanently un-ready (so
+   * anything waiting on it waits for ever) and holds a runtime lock that
+   * teardown then blocks behind.
+   */
+  timeoutMs?: number;
 }
 
 /**

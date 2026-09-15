@@ -716,3 +716,42 @@ having one write path instead of two, and of the planner no longer needing to
 know _which_ field changed — a digest comparison answers "same or different",
 and nothing above the adapter asks anything finer. Decision 26's recorded spec
 shrinks to that digest for the same reason.
+
+## 35. A probe is bounded, and teardown does not depend on it
+
+**Decision.** `ReadinessProbe.timeoutMs` (default 2000) bounds every attempt,
+and the timeout kills the probe's process _group_. `Runtime.down()` restores
+the last model that declared anything before asking Compose to remove it.
+
+**Why.** Both came out of running the thing on a live daemon, and neither was
+visible from reading it.
+
+A readiness probe is, by construction, run against a container that might be
+unwell — so "the probe does not return" is the ordinary case, not an exotic
+one. Unbounded, it costs more than a late answer: `nerdctl exec` holds the
+container's exec lock, so the `compose rm` that teardown issues blocks behind
+it and **Ctrl-C never completes**. Measured: still running after 31 seconds
+before, 3 seconds after.
+
+The first attempt at the fix did not work, for a reason worth keeping: killing
+the direct child is useless when that child is itself a parent. `nerdctl
+compose exec` runs `nerdctl exec`, the grandchild inherits the stdout pipe,
+and Node's `close` event waits for the pipe — so the process was signalled and
+the call still waited out the full sleep. The probe child is spawned
+`detached` and the timeout signals the group.
+
+The second is smaller and the same shape. `compose down` removes the networks
+declared by the file it is handed, and `serve().stop()` unmounts first, so by
+the time `down()` runs that file has been reduced to the empty model. The
+application came down; its network stayed on the machine.
+
+**Consequences.** A probe that legitimately takes longer than two seconds must
+say so. That is the right default to get wrong in this direction: a probe
+answering late is reported as not-ready and retried, while a probe answering
+never used to take the whole control plane with it.
+
+**The general lesson**, which is why this is a decision and not a bug fix:
+every one of these is a case where fiber-servo trusted a subprocess to finish.
+The two reconcilers are level-triggered precisely so that a _missed_ answer
+costs a late reconcile — but a _blocked_ one costs everything, because no
+later pass ever runs. Anything this project waits on needs a bound.
