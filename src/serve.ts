@@ -31,11 +31,12 @@
  */
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
-import { runControllers } from './controllers.js';
+import { GENERATION_LABEL, runControllers } from './controllers.js';
+import { createGenerationHistory, type GenerationHistory } from './generations.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
-import { digest, type ContainerSpec, type DesiredState } from './resources.js';
+import { digest, resourcesOfKind, type ContainerSpec, type DesiredState } from './resources.js';
 import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
 // ---- restart backoff --------------------------------------------------------
@@ -229,6 +230,14 @@ export interface ServeOptions {
   restart?: RestartPolicy;
   /** The Compose project this tree applies as. Default: `compose.ts`'s `DEFAULT_PROJECT`. */
   project?: string;
+  /**
+   * Where the templates of past generations are remembered while a rollout is
+   * in progress. Process-local and volatile, like every other piece of
+   * controller state; see `generations.ts` for why it is not persisted and
+   * what a restart therefore means. Supplying one is only useful for
+   * inspecting it in a test.
+   */
+  generations?: GenerationHistory;
   now?: () => number;
 }
 
@@ -239,8 +248,39 @@ export interface Served {
   reconcile(): Promise<void>;
   /** Wait for any reconcile already in flight or queued. */
   idle(): Promise<void>;
-  /** Unmount the tree and remove the whole application from the runtime. */
+  /**
+   * Unmount the tree and remove the whole application from the runtime.
+   *
+   * This ends the *application*: `runtime.down()` is called, so the
+   * containers and the network go too. For ending only the control plane,
+   * see `detach`.
+   */
   stop(): Promise<void>;
+
+  /**
+   * End the control plane and leave the runtime exactly as it is.
+   *
+   * ```text
+   * detach()   control plane stops.       containers and networks stay.
+   * stop()     the application stops.     runtime.down() removes them.
+   * ```
+   *
+   * This is what "the fiber-servo process died" looks like from inside one
+   * process: reconcile requests stop being accepted, the retry timer is
+   * cleared, both subscriptions are dropped, the tree is unmounted, and every
+   * piece of controller state — the restart gate, the rollout history, the
+   * last applied model — goes with it. Nothing is asked of the runtime, and
+   * the adapter is left open, because a process that has crashed does not
+   * politely close its socket either.
+   *
+   * It exists because that state is not observable from outside, and a test
+   * that merely stops calling a `serve()` has not detached it: it still holds
+   * a runtime subscription, still reconciles when an event arrives, and can
+   * still apply its own stale idea of desired state on top of whoever
+   * replaced it. Real code wants it too — anything that hands a machine over
+   * to another process, or swaps a control plane without an outage.
+   */
+  detach(): Promise<void>;
 }
 
 export function serve(element: ReactNode, options: ServeOptions): Served {
@@ -251,6 +291,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
   const project = options.project ?? DEFAULT_PROJECT;
   const gate = new RestartGate(policy, now);
+  const generations = options.generations ?? createGenerationHistory();
   const runtime: Runtime = options.runtime({ log, onError, project });
   const warnedGiveUp = new Set<string>();
 
@@ -328,8 +369,29 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   async function pass(): Promise<void> {
     const snapshot = observed.snapshot();
 
-    // 1. Controllers: management resources become the containers that should exist.
-    const target = runControllers(desired, snapshot);
+    // 1. Controllers: management resources become the containers that should
+    //    exist. Every Deployment's current template is recorded first, so
+    //    that when it stops being the current one there is still somewhere
+    //    to read it from — the controllers themselves stay pure, taking the
+    //    accumulated map as an ordinary argument.
+    for (const deployment of resourcesOfKind(desired, 'deployment')) {
+      generations.remember(deployment.spec.template);
+    }
+    const target = runControllers(desired, snapshot, generations.all());
+
+    // Forget generations nothing refers to any more: every one currently
+    // declared, plus every one a container is still running under. Done here
+    // rather than after applying, because the pass that finally sees the last
+    // old-generation container gone is a pass with nothing left to apply —
+    // pruning below the early return would leave one stale entry behind for
+    // ever, which is a small leak but a leak with no bound on how long it
+    // lasts.
+    generations.prune([
+      ...resourcesOfKind(desired, 'deployment').map((d) => digest(d.spec.template)),
+      ...[...snapshot.containers.values()]
+        .map((c) => c.labels[GENERATION_LABEL])
+        .filter((g): g is string => g !== undefined),
+    ]);
 
     // 2. The restart gate: which of those containers are actually admitted
     //    into this pass's model. This is the one thing `runControllers`
@@ -474,6 +536,23 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     async idle() {
       await started;
       while (running !== null) await running;
+    },
+    async detach() {
+      await started;
+      // Take the loop out of service *first*: unmounting commits an empty
+      // desired state, and a control plane on its way out must not apply
+      // that. `stopped` makes `request()` a no-op, so the commit updates
+      // this process's own `desired` and reaches no runtime.
+      stopped = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      unsubscribeObserved();
+      unsubscribeRuntime();
+      // Drain anything already in flight, so nothing lands after the caller
+      // believes this control plane is gone.
+      while (running !== null) await running;
+      root.unmount();
+      // Deliberately not `runtime.down()`, and deliberately not
+      // `runtime.close()`: the whole point is that the machine is untouched.
     },
     async stop() {
       await started;

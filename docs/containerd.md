@@ -120,6 +120,8 @@ Every container carries:
 | `fiber-servo.managed`        | Ours. Anything without it is left strictly alone.                  |
 | `fiber-servo.spec`           | `digest()` of the `ContainerSpec` it was created from.             |
 | `fiber-servo.readiness`      | The readiness probe, percent-encoded JSON. Only when there is one. |
+| `fiber-servo.owner`          | The Deployment or ReplicaSet that produced it.                     |
+| `fiber-servo.generation`     | Which template generation it belongs to.                           |
 | `com.docker.compose.service` | Compose's own — and it is the name our controllers chose.          |
 | `com.docker.compose.project` | Compose's own.                                                     |
 | `nerdctl/networks`           | nerdctl's own. Network membership, without reading a CNI file.     |
@@ -128,6 +130,16 @@ Identity needs no label of fiber-servo's invention: Compose mangles the
 container name to `<project>-<service>-<index>` but records the service name,
 which is the name the controllers chose (`api-0`, `web-43bfee23d1cb5f62-1`). Two of
 the six labels above are ours; the rest were already there.
+
+**Every label here is small and fixed-width, deliberately.** containerd
+refuses any label whose key and value together exceed 4096 bytes — measured:
+6015 bytes rejected, two labels of 3000 bytes each accepted, so the cap is per
+pair rather than across the set. A Deployment's whole `ContainerTemplate` was
+briefly carried in a label, which made a perfectly legal spec with a few
+kilobytes of environment impossible to create at all. Labels answer "what is
+this", never "how did we get here": the templates of past generations are
+controller state, held in memory for the life of the process and written
+nowhere. See decision 40.
 
 A container with no `fiber-servo.managed` label is adopted, never removed —
 fiber-servo shares a machine, it does not own one. And because the digest and

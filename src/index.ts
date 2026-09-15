@@ -55,6 +55,10 @@ export type { CreateRootOptions, Root } from './reconciler.js';
 export { containerSatisfies, readyThenable, useContainer, useObserved, useReady } from './hooks.js';
 export type { ReadyCondition } from './hooks.js';
 
+// ---- generation history -----------------------------------------------------
+export { createGenerationHistory } from './generations.js';
+export type { GenerationHistory, Generations } from './generations.js';
+
 // ---- observed state ---------------------------------------------------------
 export { applyRuntimeEvent, createObservedStore, isReady } from './observed.js';
 

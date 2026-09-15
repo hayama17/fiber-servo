@@ -77,6 +77,13 @@ export interface Plan {
    * because without it a network-only edit changes no service, produces an
    * empty plan, and is therefore never applied at all: declaring a network,
    * or changing its subnet, would silently do nothing.
+   *
+   * Being computed against the previous *model* rather than the machine has
+   * a consequence worth naming: this detects changes to what was **asked
+   * for**, not drift in what exists. A network removed with `nerdctl network
+   * rm` while fiber-servo is running is not noticed, because no declaration
+   * changed. Containers are level-triggered against a real observation;
+   * networks are not, and `docs/architecture.md` says so in as many words.
    */
   networks: NetworkChanges;
 }

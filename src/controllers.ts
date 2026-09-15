@@ -39,7 +39,6 @@ import {
   digest,
   selectorMatches,
   shortDigest,
-  SHORT_DIGEST_LENGTH,
   type ContainerSpec,
   type ContainerTemplate,
   type DeploymentSpec,
@@ -48,47 +47,24 @@ import {
   type ReplicaSetSpec,
   type ServiceSpec,
 } from './resources.js';
+import type { Generations } from './generations.js';
 import type { ObservedContainer, ObservedState } from './runtime/types.js';
 
 /** Label keys the controllers stamp on the Containers they own, so ownership is visible at runtime. */
 export const OWNER_LABEL = 'fiber-servo.owner';
-export const GENERATION_LABEL = 'fiber-servo.generation';
-
 /**
- * The `ContainerTemplate` a replica was stamped from, as percent-encoded JSON.
+ * Which template generation a replica belongs to, as the **full** digest of
+ * that template.
  *
- * This exists for exactly one reader: `expandDeployment`, draining an old
- * generation. A Deployment carries one template — the current one — and these
- * controllers keep nothing between calls, so when a rollout starts there is
- * no longer anywhere in the process that remembers what the *previous*
- * generation's template said. Without this label the only recoverable fields
- * were `image` and `labels`, which is not a partial answer but a wrong one:
- * the reconstructed template digests differently from the real one, so every
- * surviving old-generation container is seen as out of date and replaced —
- * with a spec missing its command, env, network, resources and readiness
- * probe. Starting a rollout was enough to trigger it.
- *
- * Putting it on the resource rather than in a cache is the same choice
- * decision 26 makes for `fiber-servo.spec`, and for the same reason: a
- * fiber-servo restart mid-rollout must not lose it. Percent-encoded because
- * the value is JSON and a label is a flat string.
+ * A generation's identity and a generation's name are two different things,
+ * and this is the identity. It is what `expandDeployment` buckets observed
+ * containers by, and what the generation store (`generations.ts`) files a
+ * template under — questions of the form "is this the same generation", where
+ * a collision would mean two unrelated templates silently sharing a history.
+ * The *name* derived from it is truncated for readability (see
+ * `generationName`); nothing that decides anything reads the truncation.
  */
-export const TEMPLATE_LABEL = 'fiber-servo.template';
-
-export function encodeTemplate(template: ContainerTemplate): string {
-  return encodeURIComponent(JSON.stringify(template));
-}
-
-/** Inverse of `encodeTemplate`. A foreign or corrupt value reads as "not recoverable", never as a throw. */
-export function decodeTemplate(value: string | undefined): ContainerTemplate | undefined {
-  if (!value) return undefined;
-  try {
-    const template = JSON.parse(decodeURIComponent(value)) as ContainerTemplate;
-    return typeof template?.image === 'string' ? template : undefined;
-  } catch {
-    return undefined;
-  }
-}
+export const GENERATION_LABEL = 'fiber-servo.generation';
 
 // ---- ReplicaSet -------------------------------------------------------------
 
@@ -140,15 +116,7 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: ReplicaSet "${spec.name}" replicas must be a non-negative integer`);
   }
-  const labels = {
-    ...ownedLabels(spec.template.labels, spec.name, shortDigest(spec.template)),
-    // The template travels with the replica, so a later pass — or a later
-    // process — can reproduce it exactly; see `TEMPLATE_LABEL`. Encoded from
-    // `spec.template`, never from the labels being built here, so there is
-    // no recursion: a template's own labels are the user's, and the three
-    // controller labels are added on top.
-    [TEMPLATE_LABEL]: encodeTemplate(spec.template),
-  };
+  const labels = ownedLabels(spec.template.labels, spec.name, digest(spec.template));
   const containers: ContainerSpec[] = [];
   for (let i = 0; i < spec.replicas; i++) {
     containers.push({ ...spec.template, name: `${spec.name}-${i}`, labels });
@@ -159,43 +127,60 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
 // ---- Deployment ---------------------------------------------------------
 
 /**
- * A generation id is `shortDigest()`, which is always exactly
- * `SHORT_DIGEST_LENGTH` lowercase hex characters (see resources.ts), so it
- * can be recovered from the end of `${deployment.name}-${generation}`
- * without re-parsing the deployment name, which may itself contain hyphens.
+ * What a generation is *called*: the Deployment's name and a short prefix of
+ * the generation's digest.
+ *
+ * This is a rendering, not an identity — it becomes a ReplicaSet name and
+ * therefore a container name, so it is truncated to stay readable in
+ * `nerdctl ps`, and nothing compares generations by it. But "rendering" does
+ * not mean "harmless if it collides", and an earlier version of this comment
+ * claimed it did. Two generations that agreed on the short form would produce
+ * the same container names, and `runControllers` refuses that outright:
+ *
+ *   fiber-servo: two resources both produce a container named "web-aaaa-0"
+ *
+ * which fails the pass through `onError` and leaves the tree unconverged
+ * until something changes. So the honest statement is: a full-digest
+ * collision is a *correctness* failure (a changed spec that reconciles as
+ * unchanged, with nothing able to notice), a short-digest collision is a
+ * *name* collision and a loud, non-converging one — and neither is silent
+ * corruption of the other's kind.
+ *
+ * The short form is 16 hex characters, 64 bits, over the handful of template
+ * generations one Deployment has in its life. That probability is being
+ * ignored deliberately, which is a different thing from it not existing.
  */
-const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
+function generationName(deployment: string, template: ContainerTemplate): string {
+  return `${deployment}-${shortDigest(template)}`;
+}
 
 /**
- * Recover an old generation's `ContainerTemplate` from the Containers it
- * produced.
+ * Recover an old generation's `ContainerTemplate`.
  *
  * `expandDeployment` is a pure function of the *current* `DeploymentSpec`,
- * and a Deployment carries one template, not a history of them — so the only
- * place an old generation's shape survives is the Containers themselves,
- * which carry it in `TEMPLATE_LABEL`.
+ * and a Deployment carries one template, not a history of them — so a
+ * generation that is no longer the current one has to be looked up. That
+ * lookup is an ordinary input to this function (`generations`), not a
+ * reach into a store, which is what keeps every controller here a pure
+ * function of its arguments. `generations.ts` explains where the map comes
+ * from and why it is not a container label.
  *
- * The recovered template is checked against the generation it claims to be:
- * `shortDigest(template)` is what named the generation in the first place, so if
- * the two agree the recovery is exact, not approximate. That check is what
- * makes it safe to hand the result back to `expandReplicaSet` as if it were
- * the original template, because it provably is one.
+ * The recovered template is checked against the generation it is filed
+ * under: `digest(template)` is the generation's identity in the first
+ * place, so if the two agree the recovery is exact, not approximate. That
+ * check is what makes it safe to hand the result back to `expandReplicaSet`
+ * as if it were the original template, because it provably is one.
  *
- * `undefined` means this generation cannot be reproduced — no label (a
- * container from before this label existed, or one relabelled by hand) or a
- * digest that does not match. Guessing at the rest of the spec is what the
- * previous version of this function did, and the guess was worse than
- * nothing: see `TEMPLATE_LABEL`.
+ * `undefined` means this generation cannot be reproduced. Guessing at the
+ * rest of the spec is what an earlier version did — reconstructing `image`
+ * and `labels` from an observed container and nothing else — and the guess
+ * was worse than nothing: it digested differently from the real template, so
+ * every surviving old container read as out of date and was replaced by a
+ * spec missing its command, env, network, resources and readiness probe.
  */
-function recoverTemplate(
-  containers: readonly ObservedContainer[],
-  generation: string,
-): ContainerTemplate | undefined {
-  const sorted = [...containers].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  for (const container of sorted) {
-    const template = decodeTemplate(container.labels[TEMPLATE_LABEL]);
-    if (template && shortDigest(template) === generation) return template;
-  }
+function recoverTemplate(generation: string, generations: Generations): ContainerTemplate | undefined {
+  const template = generations.get(generation);
+  if (template && digest(template) === generation) return template;
   return undefined;
 }
 
@@ -229,7 +214,7 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  * A Deployment becomes one ReplicaSet per template generation: `newRS` for
  * `spec.template` as it reads right now, and one `oldRS` per generation that
  * still has Containers running from an earlier apply. A generation's
- * identity is `shortDigest(template)` (decision 4's naming discipline, extended:
+ * identity is `digest(template)` (decision 4's naming discipline, extended:
  * an unchanged template keeps the same name, and therefore the same
  * ReplicaSet, for free; an edited one gets a new name and therefore a new
  * rollout instead of mutating Containers in place).
@@ -259,11 +244,15 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  * generation has no such Containers-already-exist case to signal, so it is
  * simply left out when its own share is 0.
  */
-export function expandDeployment(spec: DeploymentSpec, observed: ObservedState): ReplicaSetSpec[] {
+export function expandDeployment(
+  spec: DeploymentSpec,
+  observed: ObservedState,
+  generations: Generations = new Map(),
+): ReplicaSetSpec[] {
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: Deployment "${spec.name}" replicas must be a non-negative integer`);
   }
-  const newGeneration = shortDigest(spec.template);
+  const newGeneration = digest(spec.template);
   const maxSurge = spec.strategy?.maxSurge ?? 1;
   const maxUnavailable = spec.strategy?.maxUnavailable ?? 0;
 
@@ -285,7 +274,11 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
 
   const result: ReplicaSetSpec[] = [];
   if (newReplicas > 0) {
-    result.push({ name: `${spec.name}-${newGeneration}`, replicas: newReplicas, template: spec.template });
+    result.push({
+      name: generationName(spec.name, spec.template),
+      replicas: newReplicas,
+      template: spec.template,
+    });
   }
 
   const oldGenerations = [...byGeneration.entries()]
@@ -294,19 +287,19 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
 
   let oldBudget = Math.max(0, spec.replicas - newReady - maxUnavailable);
   for (const [generation, containers] of oldGenerations) {
-    const template = recoverTemplate(containers, generation);
+    const template = recoverTemplate(generation, generations);
     // A generation whose template cannot be reproduced is left out of the
     // desired set entirely, which removes its Containers. That is a real
     // loss and it is the lesser one: the alternative is to keep them alive
     // under a spec this function invented, and "running a container nobody
-    // asked for" is the failure this whole model exists to avoid. In
-    // practice it means Containers created before `TEMPLATE_LABEL` existed
-    // are drained by the first rollout after an upgrade rather than
-    // recreated as something else.
+    // asked for" is the failure this whole model exists to avoid. What it
+    // costs in practice is that a rollout interrupted by losing the
+    // generation store finishes abruptly instead of gradually — the new
+    // generation is already ramping. See `generations.ts`.
     if (!template) continue;
     const allocated = Math.min(containers.length, oldBudget);
     oldBudget -= allocated;
-    result.push({ name: `${spec.name}-${generation}`, replicas: allocated, template });
+    result.push({ name: generationName(spec.name, template), replicas: allocated, template });
   }
   return result;
 }
@@ -422,6 +415,7 @@ export function serviceProxyContainer(
 export function runControllers(
   desired: DesiredState,
   observed: ObservedState,
+  generations: Generations = new Map(),
 ): { networks: NetworkSpec[]; containers: ContainerSpec[] } {
   const networks: NetworkSpec[] = [];
   const containers: ContainerSpec[] = [];
@@ -458,17 +452,17 @@ export function runControllers(
         break;
 
       case 'deployment':
-        for (const replicaSet of expandDeployment(resource.spec, observed)) {
-          // See the doc comment above: `expandReplicaSet` names the owner
-          // after `replicaSet.name`, which is `${deployment}-${digest}`, so
-          // it is corrected here to the Deployment's own name. The
-          // generation label it stamped is already right — it recomputed
-          // `shortDigest(replicaSet.template)`, which for the new generation
-          // *is* `spec.template` and for an old one is what named this very
-          // ReplicaSet in the first place — but pulling it straight from
-          // the name (see `DIGEST_LENGTH`) avoids trusting a second
-          // recomputation to agree with the first.
-          const generation = replicaSet.name.slice(-DIGEST_LENGTH);
+        for (const replicaSet of expandDeployment(resource.spec, observed, generations)) {
+          // `expandReplicaSet` names the owner after `replicaSet.name`,
+          // which is the generation's *name*, so it is corrected here to the
+          // Deployment's own name. The generation itself is recomputed from
+          // the template rather than parsed back out of that name — which is
+          // exact in both cases, and provably so: the new generation's
+          // template *is* `spec.template`, and an old one's was returned by
+          // `recoverTemplate` only after its digest was checked against the
+          // generation it claimed to be. The name is a truncation and could
+          // not carry the identity back even if we wanted it to.
+          const generation = digest(replicaSet.template);
           for (const container of expandReplicaSet(replicaSet, observed)) {
             addContainer(
               {

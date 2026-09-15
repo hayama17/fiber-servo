@@ -228,7 +228,10 @@ JSX → React Fiber → DesiredState → controllers → Compose model → nerdc
 
 The loop is level-triggered: every pass reads the current desired state and the
 current observed state and recomputes the difference. A missed event costs a
-late reconcile, never a wrong one.
+late reconcile, never a wrong one — for containers, which are the things
+fiber-servo observes. Networks belong to Compose and are not observed, so
+drift in one (someone removing it by hand) is not self-healed; see
+[`docs/architecture.md`](docs/architecture.md).
 
 Writes go down through Compose; reads come back from containerd underneath it.
 That is not a layering violation — the two answer different questions. Compose

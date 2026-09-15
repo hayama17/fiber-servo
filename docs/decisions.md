@@ -780,12 +780,156 @@ exactly where a cheap hash is weakest.
 
 **Consequences.** `digest()` now needs `node:crypto`, which `resources.ts` did
 not previously import; the package was already Node-only. Container names grow
-by eight characters (`web-43bfee23-1` becomes `web-43bfee23d1cb5f62-1`) —
-still readable in `nerdctl ps`, and 64 bits is far past where an accidental
-collision between the handful of generations one Deployment ever has is worth
-thinking about.
+by eight characters (`web-43bfee23-1` becomes `web-43bfee23d1cb5f62-1`) — still
+readable in `nerdctl ps`. Sixty-four bits over the handful of generations one
+Deployment has in its life is a collision probability this project chooses to
+ignore; decision 39 is precise about what would happen if it did not.
 
 **The split is the point.** Keeping `shortDigest` a separate function is what
 stops a readability decision about names from quietly becoming a correctness
 decision about identity. The truncation happens where a human reads it, and
-nowhere else.
+nowhere else. (Decision 39 finishes that separation: at first the truncation
+_was_ the generation's identity, which is exactly the slide this paragraph
+warned about.)
+
+## 37. A template does not fit in a container label
+
+**Decision.** A container's labels carry only small, fixed-width identifiers —
+who owns it, which generation it belongs to, the digest of its spec, and its
+readiness probe. The mapping from a generation to the `ContainerTemplate` it
+was made from moves off the container.
+
+**Why.** Decision 26 says state belongs on the resource, because state on the
+resource cannot desynchronise from it. That is still the better instinct, and
+here it is simply not available: containerd rejects any label whose key and
+value together exceed 4096 bytes. Measured against containerd 2.2.2 — 6015
+bytes refused, two labels of 3000 bytes accepted, so the limit is per pair,
+not across the set.
+
+A container spec with a few kilobytes of environment is ordinary. Carrying the
+template in a label made such a spec **impossible to create**: `create
+container failed validation: label key and value length (17816 bytes) greater
+than maximum size (4096 bytes)`. A feature that turns a valid spec into an
+unlaunchable one is not a trade-off, and no amount of encoding cleverness
+fixes an unbounded value in a bounded place.
+
+**Superseded by decision 40 for where it goes instead.** This decision's
+answer was a JSON file beside the application, which fixed the symptom and
+kept the mistake — it gave one piece of controller bookkeeping a different
+lifetime from the rest. What survives is the measurement above and the rule
+it implies about labels: identity yes, history no.
+
+## 38. "Level-triggered" is a claim about containers
+
+**Decision.** The self-healing guarantee — every pass recomputes from
+observed state, so a missed event costs a late reconcile and never a wrong
+one — is scoped in the documentation to **containers**. Network drift caused
+outside fiber-servo is explicitly not detected, and not self-healed.
+
+**Why.** The guarantee rests on there being an observation to recompute
+against, and for networks there is not. Decision 30 gives their lifecycle to
+Compose, so `ObservedState` carries none — there is no field in which "the
+network is gone" could even be expressed. `Plan.networks` is therefore
+computed against the last model _this process applied_, which detects changes
+to what was asked for and nothing else.
+
+So the honest statement is narrower than the one the README made:
+
+- a network added, removed or edited in the tree — detected
+- a network missing when fiber-servo starts — applied, because a fresh
+  process has no previous model and treats everything as new
+- a network someone removes with `nerdctl network rm` while fiber-servo runs
+  — **not** detected, until something else causes an apply or the process
+  restarts
+
+**Why say it rather than fix it.** Observing networks means deciding what
+fiber-servo is entitled to know about a resource Compose owns, and the last
+time this project inferred a runtime's private state it read nerdctl's CNI
+files and got decision 29 wrong for it. That is a design question, not an
+oversight to patch, and it is left open deliberately. What is not acceptable
+is a documented guarantee the implementation does not make, so the
+documentation moved to meet the code, and one test pins the current behaviour
+so the two cannot drift apart again.
+
+## 39. A generation's identity is the full digest; its name is the short one
+
+**Decision.** `digest(template)` is a generation's identity: it is what
+`fiber-servo.generation` carries, what observed containers are bucketed by,
+and the key its template is filed under in the generation store.
+`shortDigest(template)` appears in exactly one place — the ReplicaSet and
+container name, `${deployment}-${short}`.
+
+**Why.** Decision 36 introduced `shortDigest` "for names only", and then used
+it as the generation itself: the label held the truncation, the store was
+keyed by the truncation, and `runControllers` recovered the generation by
+slicing sixteen characters off the end of a container name. So the sentence
+"truncation happens only where a human reads it" was not true of the code that
+introduced it — the short form was load-bearing for three comparisons.
+
+Nothing was broken by it in practice, which is the point: 64 bits is plenty,
+and this is not a bug report. It is that the code and its explanation
+disagreed, and when they disagree it is the explanation that gets believed and
+the code that gets extended. The next person to key something by a generation
+would have keyed it by a truncation without ever deciding to.
+
+**Consequences.** `runControllers` recomputes `digest(replicaSet.template)`
+rather than parsing an identity back out of a name — exact in both cases, and
+provably so: the new generation's template _is_ the Deployment's, and an old
+one's was returned by `recoverTemplate` only after its digest was checked
+against the generation it claimed to be. A name can no longer carry an
+identity back, which is correct — it never should have been able to. And a
+truncation collision now costs two generations a confusing pair of names,
+where before it would have merged their histories.
+
+## 40. Controller history does not go into runtime metadata
+
+**Decision.** The templates of past generations live in memory, for the life
+of the process, and are written nowhere. A container's labels carry identity
+only — managed, owner, generation, spec digest. A restart resets controller
+state; fiber-servo does not resume an interrupted rollout, it converges
+freshly on what the tree says now.
+
+**Why.** Decision 37 asked the wrong question. Faced with "a template does not
+fit in a label", it asked _where else to persist it_ and answered with a file.
+But the question worth asking was whether an old generation's template needs
+to be persisted at all — and it does not.
+
+Look at what else the control plane keeps: the restart gate's failure counts,
+a `<Ready>` latch, how far a rollout has got, the last applied model. Every
+one of them is process-local and volatile, and nobody has ever wanted them
+otherwise. A rollout history is exactly the same kind of thing. Persisting one
+of them gave it a lifetime the others do not have, which is the sort of
+asymmetry that is invisible until it is load-bearing, and it bought a new
+failure mode — a file that can disagree with the machine — in exchange for
+gradualness during an event (a restart mid-rollout) that is already
+exceptional.
+
+The rule underneath, which both earlier attempts missed: **a container's
+labels answer "what is this", never "how did we get here".** Identity is
+small, fixed-width, and belongs on the resource. History is unbounded, belongs
+to whoever is doing the reconciling, and dies with them.
+
+**What this promises, and what it does not.** After a restart:
+
+```text
+in the current desired state, missing   -> create
+not in the current desired state        -> remove
+```
+
+An interrupted rollout therefore finishes abruptly rather than gradually: the
+old generation is drained at once, because nothing claims those containers are
+wanted any more. That is the intended behaviour, not a regression. The
+guarantee is **convergence to current desired state, not continuity of a
+plan** — and a control plane that is honestly volatile is easier to reason
+about than one that is durable in one arbitrary respect.
+
+`expandDeployment` still refuses to invent a template for a generation it has
+no record of, so the failure mode remains "the rollout finishes sooner", never
+"a container comes back as something nobody asked for".
+
+**Consequences.** `src/generations.ts` has one implementation and no option to
+persist; a durable variant would have to answer what happens when it disagrees
+with the machine, and this design wants that question not to arise — the only
+durable record of what is running is the machine. `fiber-servo up` writes
+nothing outside the Compose file it must hand to the actuator. And a template
+may now be any size, because it is never encoded into anything with a limit.

@@ -87,8 +87,14 @@ container is a controller's problem and not a re-render.
 ```
 
 Rollout policy over ReplicaSets. Editing the template creates a new generation
-(keyed by a digest of it) and shifts replicas across, rather than editing
-containers in place.
+and shifts replicas across, rather than editing containers in place.
+
+A generation's **identity** is `digest(template)` — the full 64-hex value,
+carried on each replica's `fiber-servo.generation` label, and the key its
+template is filed under. A generation's **name** is the Deployment's name plus
+`shortDigest(template)`, which is what you see in `nerdctl ps`. Nothing that
+decides anything reads the short form; it exists so a container name stays
+readable.
 
 ### `<Service>`
 
@@ -131,6 +137,7 @@ const served = serve(<App />, {
 | `restart`               | `RestartPolicy?`            | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
 | `onDesired`             | `(d: DesiredState) => void` | Every snapshot React commits.                                                                               |
 | `onApply`               | `(p: Plan) => void`         | What each pass is about to apply, after the restart gate has filtered it.                                   |
+| `generations`           | `GenerationHistory?`        | In-flight rollout history. Process-local and volatile; supply one only to inspect it.                       |
 | `log`, `onError`, `now` |                             |                                                                                                             |
 
 Returns:
@@ -141,9 +148,32 @@ interface Served {
   observed: ObservedStore;
   reconcile(): Promise<void>; // force one pass
   idle(): Promise<void>; // wait for queued work
-  stop(): Promise<void>; // unmount, reconcile it away, stop watching
+  stop(): Promise<void>; // end the application: runtime.down() removes it
+  detach(): Promise<void>; // end the control plane: the machine is untouched
 }
 ```
+
+`stop` and `detach` are the two ways to finish, and they differ in what they
+leave behind:
+
+```text
+detach()   the control plane stops.    containers and networks stay.
+stop()     the application stops.      runtime.down() removes them.
+```
+
+`detach` is what "the fiber-servo process died" looks like from inside one
+process: reconcile requests stop being accepted, the retry timer is cleared,
+both subscriptions are dropped, the tree is unmounted, and all controller
+state — the restart gate, the rollout history, the last applied model — goes
+with it. The runtime adapter is not even closed, because a process that
+crashed does not politely close its socket either.
+
+Use it to hand a machine over to another process, to swap a control plane
+without an outage, or to write a test about restart semantics that is
+actually about a restart. Merely dropping the reference to a `serve()` does
+not detach it: it still holds a runtime subscription, still reconciles when an
+event arrives, and can still apply its own stale desired state over the top of
+whatever replaced it.
 
 ### `createRoot(options)`
 
