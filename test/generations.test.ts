@@ -37,7 +37,7 @@ describe('createGenerationStore', () => {
   it('remembers a template under its own generation id', () => {
     const store = createGenerationStore({ path: tempPath() });
     store.remember(huge);
-    expect(store.all().get(shortDigest(huge))).toEqual(huge);
+    expect(store.all().get(digest(huge))).toEqual(huge);
   });
 
   // The whole reason this is a file and not a label: it has to survive the
@@ -47,14 +47,14 @@ describe('createGenerationStore', () => {
     createGenerationStore({ path }).remember(huge);
 
     const reopened = createGenerationStore({ path });
-    expect(reopened.all().get(shortDigest(huge))).toEqual(huge);
+    expect(reopened.all().get(digest(huge))).toEqual(huge);
   });
 
   it('creates the directory it needs, and writes a file a human can read', () => {
     const path = tempPath();
     createGenerationStore({ path }).remember({ image: 'api:v1' });
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
-      [shortDigest({ image: 'api:v1' })]: { image: 'api:v1' },
+      [digest({ image: 'api:v1' })]: { image: 'api:v1' },
     });
   });
 
@@ -64,10 +64,10 @@ describe('createGenerationStore', () => {
     store.remember({ image: 'api:v1' });
     store.remember({ image: 'api:v2' });
 
-    store.prune([shortDigest({ image: 'api:v2' })]);
+    store.prune([digest({ image: 'api:v2' })]);
 
-    expect([...store.all().keys()]).toEqual([shortDigest({ image: 'api:v2' })]);
-    expect([...createGenerationStore({ path }).all().keys()]).toEqual([shortDigest({ image: 'api:v2' })]);
+    expect([...store.all().keys()]).toEqual([digest({ image: 'api:v2' })]);
+    expect([...createGenerationStore({ path }).all().keys()]).toEqual([digest({ image: 'api:v2' })]);
   });
 
   // Every failure here is survivable, and none of them may stop the control
@@ -109,7 +109,7 @@ describe('createMemoryGenerationStore', () => {
   it('behaves the same, minus the file', () => {
     const store = createMemoryGenerationStore();
     store.remember(huge);
-    expect(store.all().get(shortDigest(huge))).toEqual(huge);
+    expect(store.all().get(digest(huge))).toEqual(huge);
     store.prune([]);
     expect([...store.all().keys()]).toEqual([]);
   });
@@ -131,8 +131,9 @@ describe('recovering a rollout across a restart', () => {
 
   /** What a runtime would report back for the containers generation `v1` produced. */
   function running(): ObservedContainer[] {
-    const generation = shortDigest(v1);
-    return expandReplicaSet({ name: `web-${generation}`, replicas: 2, template: v1 }, EMPTY).map((c, i) => ({
+    const generation = digest(v1);
+    const name = shortDigest(v1);
+    return expandReplicaSet({ name: `web-${name}`, replicas: 2, template: v1 }, EMPTY).map((c, i) => ({
       name: c.name,
       phase: 'running' as const,
       networks: ['backend'],
@@ -185,7 +186,7 @@ describe('recovering a rollout across a restart', () => {
           labels: {
             ...c.labels,
             [OWNER_LABEL]: 'web',
-            [GENERATION_LABEL]: rs.name.slice(-shortDigest(v1).length),
+            [GENERATION_LABEL]: digest(rs.template),
           },
         })),
       )

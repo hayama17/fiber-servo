@@ -36,7 +36,7 @@ import { createMemoryGenerationStore, type GenerationStore } from './generations
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
-import { digest, resourcesOfKind, shortDigest, type ContainerSpec, type DesiredState } from './resources.js';
+import { digest, resourcesOfKind, type ContainerSpec, type DesiredState } from './resources.js';
 import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
 // ---- restart backoff --------------------------------------------------------
@@ -421,7 +421,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     // declared, plus every one a container is still running under. Without
     // this the store grows by one entry per template edit, for ever.
     generations.prune([
-      ...resourcesOfKind(desired, 'deployment').map((d) => shortDigest(d.spec.template)),
+      ...resourcesOfKind(desired, 'deployment').map((d) => digest(d.spec.template)),
       ...[...snapshot.containers.values()]
         .map((c) => c.labels[GENERATION_LABEL])
         .filter((g): g is string => g !== undefined),

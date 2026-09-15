@@ -11,7 +11,6 @@ import {
 import {
   digest,
   shortDigest,
-  SHORT_DIGEST_LENGTH,
   type ContainerTemplate,
   type DeploymentSpec,
   type DesiredState,
@@ -54,7 +53,7 @@ function ownedContainer(
     labels: {
       ...template.labels,
       [OWNER_LABEL]: owner,
-      [GENERATION_LABEL]: shortDigest(template),
+      [GENERATION_LABEL]: digest(template),
     },
     image: template.image,
     ...overrides,
@@ -114,7 +113,7 @@ describe('expandReplicaSet', () => {
     expect(c!.labels).toEqual({
       app: 'web',
       [OWNER_LABEL]: 'web',
-      [GENERATION_LABEL]: shortDigest(spec.template),
+      [GENERATION_LABEL]: digest(spec.template),
     });
   });
 
@@ -154,7 +153,10 @@ describe('expandReplicaSet', () => {
 
 describe('expandDeployment', () => {
   const deploymentTemplate = { image: 'api:v2' };
-  const newGen = shortDigest(deploymentTemplate);
+  /** The generation's identity, as `GENERATION_LABEL` carries it. */
+  const newGen = digest(deploymentTemplate);
+  /** What it is *called* — the suffix a ReplicaSet and its containers get. */
+  const newName = shortDigest(deploymentTemplate);
   // A real previous template, not a made-up digest: the generation IS
   // `digest(template)`, and an old generation is only drainable because its
   // containers still carry the template that named it.
@@ -166,7 +168,8 @@ describe('expandDeployment', () => {
     resources: { cpu: 0.5, memory: '512m' },
     readiness: { exec: ['/health'] },
   };
-  const oldGen = shortDigest(oldTemplate);
+  const oldGen = digest(oldTemplate);
+  const oldName = shortDigest(oldTemplate);
   /** What `serve()` would have accumulated by the time the template was edited. */
   const history = generationsOf(oldTemplate, deploymentTemplate);
 
@@ -177,7 +180,7 @@ describe('expandDeployment', () => {
    * spec this codebase can genuinely produce.
    */
   function threeOldContainers(readyOverrides: Partial<ObservedContainer> = {}): ObservedContainer[] {
-    const produced = expandReplicaSet({ name: `web-${oldGen}`, replicas: 3, template: oldTemplate }, EMPTY);
+    const produced = expandReplicaSet({ name: `web-${oldName}`, replicas: 3, template: oldTemplate }, EMPTY);
     return produced.map((c, i) =>
       container({
         name: c.name,
@@ -200,35 +203,35 @@ describe('expandDeployment', () => {
     const observed = observedOf(...threeOldContainers());
     const result = expandDeployment(spec, observed, history);
     // new-generation-first
-    expect(result[0]).toMatchObject({ name: `web-${newGen}`, replicas: 1 }); // min(3, 0+1)
-    expect(result[1]).toMatchObject({ name: `web-${oldGen}`, replicas: 3 }); // max(0, 3-0-0), capped at 3 existing
+    expect(result[0]).toMatchObject({ name: `web-${newName}`, replicas: 1 }); // min(3, 0+1)
+    expect(result[1]).toMatchObject({ name: `web-${oldName}`, replicas: 3 }); // max(0, 3-0-0), capped at 3 existing
   });
 
   it('some new containers ready: replicas split proportionally between generations', () => {
     const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
     const observed = observedOf(
-      ownedContainer(`web-${newGen}-0`, 'web', deploymentTemplate, { phase: 'running' }),
-      ownedContainer(`web-${newGen}-1`, 'web', deploymentTemplate, { phase: 'waiting' }), // not ready yet
+      ownedContainer(`web-${newName}-0`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newName}-1`, 'web', deploymentTemplate, { phase: 'waiting' }), // not ready yet
       ...threeOldContainers(),
     );
     const result = expandDeployment(spec, observed, history);
-    expect(result[0]).toMatchObject({ name: `web-${newGen}`, replicas: 2 }); // min(3, 1+1)
-    expect(result[1]).toMatchObject({ name: `web-${oldGen}`, replicas: 2 }); // max(0, 3-1-0)
+    expect(result[0]).toMatchObject({ name: `web-${newName}`, replicas: 2 }); // min(3, 1+1)
+    expect(result[1]).toMatchObject({ name: `web-${oldName}`, replicas: 2 }); // max(0, 3-1-0)
   });
 
   it('all new containers ready: old generation is driven to zero and therefore disappears from the running set', () => {
     const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
     const observed = observedOf(
-      ownedContainer(`web-${newGen}-0`, 'web', deploymentTemplate, { phase: 'running' }),
-      ownedContainer(`web-${newGen}-1`, 'web', deploymentTemplate, { phase: 'running' }),
-      ownedContainer(`web-${newGen}-2`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newName}-0`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newName}-1`, 'web', deploymentTemplate, { phase: 'running' }),
+      ownedContainer(`web-${newName}-2`, 'web', deploymentTemplate, { phase: 'running' }),
       ...threeOldContainers(),
     );
     const result = expandDeployment(spec, observed, history);
-    expect(result[0]).toMatchObject({ name: `web-${newGen}`, replicas: 3 }); // min(3, 3+1)
+    expect(result[0]).toMatchObject({ name: `web-${newName}`, replicas: 3 }); // min(3, 3+1)
     // The old generation is still *returned*, but at 0 — that 0 is the
     // removal instruction, not an omission.
-    expect(result[1]).toMatchObject({ name: `web-${oldGen}`, replicas: 0 });
+    expect(result[1]).toMatchObject({ name: `web-${oldName}`, replicas: 0 });
     expect(result).toHaveLength(2);
   });
 
@@ -241,7 +244,7 @@ describe('expandDeployment', () => {
     // tick until observed reality (newReady) catches up.
     const spec: DeploymentSpec = { name: 'web', replicas: 2, template: deploymentTemplate };
     const result = expandDeployment(spec, EMPTY);
-    expect(result).toEqual([{ name: `web-${newGen}`, replicas: 1, template: deploymentTemplate }]);
+    expect(result).toEqual([{ name: `web-${newName}`, replicas: 1, template: deploymentTemplate }]);
   });
 
   it('a fresh Deployment ramps to its full replica count once maxSurge allows it', () => {
@@ -252,8 +255,55 @@ describe('expandDeployment', () => {
       strategy: { maxSurge: 2 },
     };
     expect(expandDeployment(spec, EMPTY)).toEqual([
-      { name: `web-${newGen}`, replicas: 2, template: deploymentTemplate },
+      { name: `web-${newName}`, replicas: 2, template: deploymentTemplate },
     ]);
+  });
+
+  // A generation's identity and a generation's name are two different things.
+  // The label is what anything comparing generations reads; the name is a
+  // truncation for human eyes. Conflating them is how a readability decision
+  // turns into a correctness one.
+  describe('identity versus name', () => {
+    const spec: DeploymentSpec = { name: 'web', replicas: 3, template: deploymentTemplate };
+
+    it('labels a replica with the full digest and names it with the short one', () => {
+      const observed = observedOf(...threeOldContainers());
+      const [newRS] = expandDeployment(spec, observed, history);
+      const [c] = expandReplicaSet(newRS!, observed);
+
+      expect(newRS!.name).toBe(`web-${shortDigest(deploymentTemplate)}`);
+      expect(c!.labels?.[GENERATION_LABEL]).toBe(digest(deploymentTemplate));
+      expect(c!.labels?.[GENERATION_LABEL]).not.toBe(shortDigest(deploymentTemplate));
+    });
+
+    it('buckets observed containers by the full identity, not by the name', () => {
+      // Two containers that agree on the short form but not the full digest
+      // are different generations, and nothing may merge them. Constructed
+      // rather than found, because finding a real collision is the thing
+      // SHA-256 makes impossible.
+      const impostor = {
+        ...threeOldContainers()[0]!,
+        name: 'web-impostor-0',
+        labels: {
+          ...threeOldContainers()[0]!.labels,
+          [GENERATION_LABEL]: `${oldGen.slice(0, 16)}${'f'.repeat(48)}`,
+        },
+      };
+      const result = expandDeployment(spec, observedOf(...threeOldContainers(), impostor), history);
+
+      // The impostor's generation is unknown to the store, so it is dropped —
+      // and crucially it did not join the real old generation's bucket.
+      const old = result.find((rs) => rs.name === `web-${oldName}`);
+      expect(old?.replicas).toBe(3); // still three, not four
+    });
+
+    it('recovers an old generation by its full identity', () => {
+      // A store keyed by the short form would answer this lookup; keyed by
+      // the full identity it does not, because that is not what it is.
+      const shortKeyed: Generations = new Map([[oldName, oldTemplate]]);
+      const result = expandDeployment(spec, observedOf(...threeOldContainers()), shortKeyed);
+      expect(result.map((rs) => rs.name)).toEqual([`web-${shortDigest(deploymentTemplate)}`]);
+    });
   });
 
   // The whole point of TEMPLATE_LABEL. Before it, an old generation was
@@ -277,7 +327,7 @@ describe('expandDeployment', () => {
           labels: {
             ...c.labels,
             [OWNER_LABEL]: 'web',
-            [GENERATION_LABEL]: rs.name.slice(-SHORT_DIGEST_LENGTH),
+            [GENERATION_LABEL]: digest(rs.template),
           },
         })),
       );
@@ -285,7 +335,7 @@ describe('expandDeployment', () => {
 
     function oldReplicaSet(): ReplicaSetSpec {
       const observed = observedOf(...threeOldContainers());
-      const found = expandDeployment(spec, observed, history).find((rs) => rs.name === `web-${oldGen}`);
+      const found = expandDeployment(spec, observed, history).find((rs) => rs.name === `web-${oldName}`);
       if (!found) throw new Error('the old generation was not returned at all');
       return found;
     }
@@ -337,7 +387,7 @@ describe('expandDeployment', () => {
         observedOf(...threeOldContainers()),
         generationsOf(deploymentTemplate),
       );
-      expect(result.map((rs) => rs.name)).toEqual([`web-${newGen}`]);
+      expect(result.map((rs) => rs.name)).toEqual([`web-${newName}`]);
     });
 
     it('drops a generation the store has a mismatched template for', () => {
@@ -346,7 +396,7 @@ describe('expandDeployment', () => {
       // is not used.
       const wrong: Generations = new Map([[oldGen, { image: 'something-else:v9' }]]);
       const result = expandDeployment(spec, observedOf(...threeOldContainers()), wrong);
-      expect(result.map((rs) => rs.name)).toEqual([`web-${newGen}`]);
+      expect(result.map((rs) => rs.name)).toEqual([`web-${newName}`]);
     });
   });
 
@@ -374,14 +424,14 @@ describe('expandDeployment', () => {
       const observed = observedOf(...newContainers(false, 2), ...threeOldContainers());
       const result = expandDeployment(spec, observed, history);
       // newReady is 0, so the old generation keeps all three: 3 - 0 - 0.
-      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(3);
+      expect(result.find((rs) => rs.name === `web-${oldName}`)?.replicas).toBe(3);
     });
 
     it('resumes progress once those containers report ready', () => {
       const observed = observedOf(...newContainers(true, 2), ...threeOldContainers());
       const result = expandDeployment(spec, observed, history);
       expect(result.find((rs) => rs.name === `web-${probedGen}`)?.replicas).toBe(3); // min(3, 2+1)
-      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+      expect(result.find((rs) => rs.name === `web-${oldName}`)?.replicas).toBe(1); // 3 - 2 - 0
     });
 
     // The guarantee stated plainly: at no point does ready-new plus kept-old
@@ -401,7 +451,7 @@ describe('expandDeployment', () => {
           })),
           ...threeOldContainers(),
         );
-        const keptOld = expandDeployment(spec, observed, history).find((rs) => rs.name === `web-${oldGen}`);
+        const keptOld = expandDeployment(spec, observed, history).find((rs) => rs.name === `web-${oldName}`);
         expect(
           readyCount! + (keptOld?.replicas ?? 0),
           `with ${String(readyCount)} ready`,
@@ -422,7 +472,7 @@ describe('expandDeployment', () => {
         observed,
         history,
       );
-      expect(result.find((rs) => rs.name === `web-${oldGen}`)?.replicas).toBe(1); // 3 - 2 - 0
+      expect(result.find((rs) => rs.name === `web-${oldName}`)?.replicas).toBe(1); // 3 - 2 - 0
     });
   });
 
@@ -431,7 +481,7 @@ describe('expandDeployment', () => {
     const observed = observedOf(...threeOldContainers());
     const [newRS] = expandDeployment(spec, observed, history);
     const containers = expandReplicaSet(newRS!, observed);
-    expect(containers.map((c) => c.name)).toEqual([`web-${newGen}-0`]);
+    expect(containers.map((c) => c.name)).toEqual([`web-${newName}-0`]);
   });
 });
 
@@ -554,7 +604,7 @@ describe('runControllers', () => {
     expect(result.containers).toHaveLength(2);
     for (const c of result.containers) {
       expect(c.labels?.[OWNER_LABEL]).toBe('web'); // the Deployment's name, not the generated ReplicaSet's
-      expect(c.labels?.[GENERATION_LABEL]).toBe(shortDigest(template));
+      expect(c.labels?.[GENERATION_LABEL]).toBe(digest(template));
     }
   });
 

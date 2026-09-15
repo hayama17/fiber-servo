@@ -87,8 +87,14 @@ container is a controller's problem and not a re-render.
 ```
 
 Rollout policy over ReplicaSets. Editing the template creates a new generation
-(keyed by a digest of it) and shifts replicas across, rather than editing
-containers in place.
+and shifts replicas across, rather than editing containers in place.
+
+A generation's **identity** is `digest(template)` — the full 64-hex value,
+carried on each replica's `fiber-servo.generation` label, and the key its
+template is filed under. A generation's **name** is the Deployment's name plus
+`shortDigest(template)`, which is what you see in `nerdctl ps`. Nothing that
+decides anything reads the short form; it exists so a container name stays
+readable.
 
 ### `<Service>`
 

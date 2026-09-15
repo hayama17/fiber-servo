@@ -52,9 +52,14 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { shortDigest, type ContainerTemplate } from './resources.js';
+import { digest, type ContainerTemplate } from './resources.js';
 
 /**
+ * Keyed by the generation's identity — the **full** `digest()` of the
+ * template, the same value `GENERATION_LABEL` carries. Not the short form
+ * that appears in container names: that is a rendering, and filing a history
+ * under a rendering is how two unrelated templates come to share one.
+ *
  * The read side is a plain map, which is what the controllers take: they stay
  * pure functions of (desired, observed, generations), and nothing about them
  * has to know whether the map came from a file, a test, or nowhere.
@@ -81,7 +86,7 @@ export function createMemoryGenerationStore(): GenerationStore {
   const templates = new Map<string, ContainerTemplate>();
   return {
     remember(template) {
-      templates.set(shortDigest(template), template);
+      templates.set(digest(template), template);
     },
     all: () => templates,
     prune(keep) {
@@ -141,7 +146,7 @@ export function createGenerationStore(options: GenerationStoreOptions): Generati
           template !== null &&
           typeof template === 'object' &&
           typeof (template as ContainerTemplate).image === 'string' &&
-          shortDigest(template) === generation
+          digest(template) === generation
         ) {
           loaded.set(generation, template as ContainerTemplate);
         } else {
@@ -173,7 +178,7 @@ export function createGenerationStore(options: GenerationStoreOptions): Generati
 
   return {
     remember(template) {
-      const generation = shortDigest(template);
+      const generation = digest(template);
       if (templates.has(generation)) return; // already recorded: the common case, every pass
       templates.set(generation, template);
       save();

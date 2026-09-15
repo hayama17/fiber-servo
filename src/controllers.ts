@@ -39,7 +39,6 @@ import {
   digest,
   selectorMatches,
   shortDigest,
-  SHORT_DIGEST_LENGTH,
   type ContainerSpec,
   type ContainerTemplate,
   type DeploymentSpec,
@@ -53,6 +52,18 @@ import type { ObservedContainer, ObservedState } from './runtime/types.js';
 
 /** Label keys the controllers stamp on the Containers they own, so ownership is visible at runtime. */
 export const OWNER_LABEL = 'fiber-servo.owner';
+/**
+ * Which template generation a replica belongs to, as the **full** digest of
+ * that template.
+ *
+ * A generation's identity and a generation's name are two different things,
+ * and this is the identity. It is what `expandDeployment` buckets observed
+ * containers by, and what the generation store (`generations.ts`) files a
+ * template under — questions of the form "is this the same generation", where
+ * a collision would mean two unrelated templates silently sharing a history.
+ * The *name* derived from it is truncated for readability (see
+ * `generationName`); nothing that decides anything reads the truncation.
+ */
 export const GENERATION_LABEL = 'fiber-servo.generation';
 
 // ---- ReplicaSet -------------------------------------------------------------
@@ -105,7 +116,7 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: ReplicaSet "${spec.name}" replicas must be a non-negative integer`);
   }
-  const labels = ownedLabels(spec.template.labels, spec.name, shortDigest(spec.template));
+  const labels = ownedLabels(spec.template.labels, spec.name, digest(spec.template));
   const containers: ContainerSpec[] = [];
   for (let i = 0; i < spec.replicas; i++) {
     containers.push({ ...spec.template, name: `${spec.name}-${i}`, labels });
@@ -116,12 +127,18 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
 // ---- Deployment ---------------------------------------------------------
 
 /**
- * A generation id is `shortDigest()`, which is always exactly
- * `SHORT_DIGEST_LENGTH` lowercase hex characters (see resources.ts), so it
- * can be recovered from the end of `${deployment.name}-${generation}`
- * without re-parsing the deployment name, which may itself contain hyphens.
+ * What a generation is *called*: the Deployment's name and a short prefix of
+ * the generation's digest.
+ *
+ * This is a rendering, not an identity. It becomes a ReplicaSet name and
+ * therefore a container name, so it is truncated to stay readable in
+ * `nerdctl ps` — and because it is only a rendering, a truncation collision
+ * would cost two generations a confusing pair of names and nothing more. The
+ * identity they are compared by is the full digest on `GENERATION_LABEL`.
  */
-const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
+function generationName(deployment: string, template: ContainerTemplate): string {
+  return `${deployment}-${shortDigest(template)}`;
+}
 
 /**
  * Recover an old generation's `ContainerTemplate`.
@@ -135,7 +152,7 @@ const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
  * from and why it is not a container label.
  *
  * The recovered template is checked against the generation it is filed
- * under: `shortDigest(template)` is what named the generation in the first
+ * under: `digest(template)` is the generation's identity in the first
  * place, so if the two agree the recovery is exact, not approximate. That
  * check is what makes it safe to hand the result back to `expandReplicaSet`
  * as if it were the original template, because it provably is one.
@@ -149,7 +166,7 @@ const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
  */
 function recoverTemplate(generation: string, generations: Generations): ContainerTemplate | undefined {
   const template = generations.get(generation);
-  if (template && shortDigest(template) === generation) return template;
+  if (template && digest(template) === generation) return template;
   return undefined;
 }
 
@@ -183,7 +200,7 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  * A Deployment becomes one ReplicaSet per template generation: `newRS` for
  * `spec.template` as it reads right now, and one `oldRS` per generation that
  * still has Containers running from an earlier apply. A generation's
- * identity is `shortDigest(template)` (decision 4's naming discipline, extended:
+ * identity is `digest(template)` (decision 4's naming discipline, extended:
  * an unchanged template keeps the same name, and therefore the same
  * ReplicaSet, for free; an edited one gets a new name and therefore a new
  * rollout instead of mutating Containers in place).
@@ -221,7 +238,7 @@ export function expandDeployment(
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: Deployment "${spec.name}" replicas must be a non-negative integer`);
   }
-  const newGeneration = shortDigest(spec.template);
+  const newGeneration = digest(spec.template);
   const maxSurge = spec.strategy?.maxSurge ?? 1;
   const maxUnavailable = spec.strategy?.maxUnavailable ?? 0;
 
@@ -243,7 +260,11 @@ export function expandDeployment(
 
   const result: ReplicaSetSpec[] = [];
   if (newReplicas > 0) {
-    result.push({ name: `${spec.name}-${newGeneration}`, replicas: newReplicas, template: spec.template });
+    result.push({
+      name: generationName(spec.name, spec.template),
+      replicas: newReplicas,
+      template: spec.template,
+    });
   }
 
   const oldGenerations = [...byGeneration.entries()]
@@ -264,7 +285,7 @@ export function expandDeployment(
     if (!template) continue;
     const allocated = Math.min(containers.length, oldBudget);
     oldBudget -= allocated;
-    result.push({ name: `${spec.name}-${generation}`, replicas: allocated, template });
+    result.push({ name: generationName(spec.name, template), replicas: allocated, template });
   }
   return result;
 }
@@ -418,16 +439,16 @@ export function runControllers(
 
       case 'deployment':
         for (const replicaSet of expandDeployment(resource.spec, observed, generations)) {
-          // See the doc comment above: `expandReplicaSet` names the owner
-          // after `replicaSet.name`, which is `${deployment}-${digest}`, so
-          // it is corrected here to the Deployment's own name. The
-          // generation label it stamped is already right — it recomputed
-          // `shortDigest(replicaSet.template)`, which for the new generation
-          // *is* `spec.template` and for an old one is what named this very
-          // ReplicaSet in the first place — but pulling it straight from
-          // the name (see `DIGEST_LENGTH`) avoids trusting a second
-          // recomputation to agree with the first.
-          const generation = replicaSet.name.slice(-DIGEST_LENGTH);
+          // `expandReplicaSet` names the owner after `replicaSet.name`,
+          // which is the generation's *name*, so it is corrected here to the
+          // Deployment's own name. The generation itself is recomputed from
+          // the template rather than parsed back out of that name — which is
+          // exact in both cases, and provably so: the new generation's
+          // template *is* `spec.template`, and an old one's was returned by
+          // `recoverTemplate` only after its digest was checked against the
+          // generation it claimed to be. The name is a truncation and could
+          // not carry the identity back even if we wanted it to.
+          const generation = digest(replicaSet.template);
           for (const container of expandReplicaSet(replicaSet, observed)) {
             addContainer(
               {

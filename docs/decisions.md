@@ -788,7 +788,9 @@ thinking about.
 **The split is the point.** Keeping `shortDigest` a separate function is what
 stops a readability decision about names from quietly becoming a correctness
 decision about identity. The truncation happens where a human reads it, and
-nowhere else.
+nowhere else. (Decision 39 finishes that separation: at first the truncation
+_was_ the generation's identity, which is exactly the slide this paragraph
+warned about.)
 
 ## 37. Template history lives beside the application, not on the container
 
@@ -862,3 +864,33 @@ oversight to patch, and it is left open deliberately. What is not acceptable
 is a documented guarantee the implementation does not make, so the
 documentation moved to meet the code, and one test pins the current behaviour
 so the two cannot drift apart again.
+
+## 39. A generation's identity is the full digest; its name is the short one
+
+**Decision.** `digest(template)` is a generation's identity: it is what
+`fiber-servo.generation` carries, what observed containers are bucketed by,
+and the key its template is filed under in the generation store.
+`shortDigest(template)` appears in exactly one place — the ReplicaSet and
+container name, `${deployment}-${short}`.
+
+**Why.** Decision 36 introduced `shortDigest` "for names only", and then used
+it as the generation itself: the label held the truncation, the store was
+keyed by the truncation, and `runControllers` recovered the generation by
+slicing sixteen characters off the end of a container name. So the sentence
+"truncation happens only where a human reads it" was not true of the code that
+introduced it — the short form was load-bearing for three comparisons.
+
+Nothing was broken by it in practice, which is the point: 64 bits is plenty,
+and this is not a bug report. It is that the code and its explanation
+disagreed, and when they disagree it is the explanation that gets believed and
+the code that gets extended. The next person to key something by a generation
+would have keyed it by a truncation without ever deciding to.
+
+**Consequences.** `runControllers` recomputes `digest(replicaSet.template)`
+rather than parsing an identity back out of a name — exact in both cases, and
+provably so: the new generation's template _is_ the Deployment's, and an old
+one's was returned by `recoverTemplate` only after its digest was checked
+against the generation it claimed to be. A name can no longer carry an
+identity back, which is correct — it never should have been able to. And a
+truncation collision now costs two generations a confusing pair of names,
+where before it would have merged their histories.
