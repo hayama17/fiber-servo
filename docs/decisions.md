@@ -789,3 +789,44 @@ thinking about.
 stops a readability decision about names from quietly becoming a correctness
 decision about identity. The truncation happens where a human reads it, and
 nowhere else.
+
+## 37. Template history lives beside the application, not on the container
+
+**Decision.** A container's labels carry only small, fixed-width identifiers —
+who owns it, which generation it belongs to, the digest of its spec, and its
+readiness probe. The mapping from a generation to the `ContainerTemplate` it
+was made from lives in a small JSON file (`src/generations.ts`), written by
+`fiber-servo up` and read back at startup.
+
+**Why.** Decision 26 says state belongs on the resource, because state on the
+resource cannot desynchronise from it. That is still the better instinct, and
+here it is simply not available: containerd rejects any label whose key and
+value together exceed 4096 bytes. Measured against containerd 2.2.2 — 6015
+bytes refused, two labels of 3000 bytes accepted, so the limit is per pair,
+not across the set.
+
+A container spec with a few kilobytes of environment is ordinary. Carrying the
+template in a label made such a spec **impossible to create**: `create
+container failed validation: label key and value length (17816 bytes) greater
+than maximum size (4096 bytes)`. A feature that turns a valid spec into an
+unlaunchable one is not a trade-off, and no amount of encoding cleverness
+fixes an unbounded value in a bounded place.
+
+**Consequences, including the one that is a real loss.** The file can go
+missing while the containers it describes are still running — a fresh machine,
+a cleared state directory — which a label could never do. The window is
+narrower than it looks: the store is consulted only for generations _other
+than the one currently declared_, so an application that is not mid-rollout
+never reads it. What it costs is that a rollout interrupted by losing the
+store finishes abruptly rather than gradually, because `expandDeployment`
+refuses to invent a template it cannot verify (`shortDigest(template)` must
+equal the id it is filed under). The failure mode is "the rollout finishes
+sooner", never "a container comes back as something nobody asked for".
+
+Two smaller consequences worth stating. The library does not write to disk by
+default: `serve()` uses an in-memory store, and only `fiber-servo up` — the
+one long-lived caller, and the only one for which surviving a restart means
+anything — passes a file-backed one. And every failure in that file is
+survivable: unreadable, corrupt, or filed under the wrong id all mean "start
+empty and say so", because losing a rollout's gradualness must never cost the
+application its availability.

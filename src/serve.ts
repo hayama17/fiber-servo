@@ -31,11 +31,12 @@
  */
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
-import { runControllers } from './controllers.js';
+import { GENERATION_LABEL, runControllers } from './controllers.js';
+import { createMemoryGenerationStore, type GenerationStore } from './generations.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
-import { digest, type ContainerSpec, type DesiredState } from './resources.js';
+import { digest, resourcesOfKind, shortDigest, type ContainerSpec, type DesiredState } from './resources.js';
 import type { ContainerPhase, ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
 // ---- restart backoff --------------------------------------------------------
@@ -229,6 +230,19 @@ export interface ServeOptions {
   restart?: RestartPolicy;
   /** The Compose project this tree applies as. Default: `compose.ts`'s `DEFAULT_PROJECT`. */
   project?: string;
+  /**
+   * Where past Deployment template generations are remembered, so a rollout
+   * interrupted by a restart can still reproduce the generation it was
+   * draining. See `generations.ts`.
+   *
+   * The default remembers nothing across processes, because a library
+   * function should not write to somebody's disk just for being called —
+   * `fiber-servo plan` and the test suite both call `serve` and neither
+   * should leave anything behind. A long-lived `fiber-servo up` passes a
+   * file-backed store (`createGenerationStore`), which is the only case
+   * where surviving a restart means anything.
+   */
+  generations?: GenerationStore;
   now?: () => number;
 }
 
@@ -251,6 +265,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
   const project = options.project ?? DEFAULT_PROJECT;
   const gate = new RestartGate(policy, now);
+  const generations = options.generations ?? createMemoryGenerationStore();
   const runtime: Runtime = options.runtime({ log, onError, project });
   const warnedGiveUp = new Set<string>();
 
@@ -328,8 +343,15 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   async function pass(): Promise<void> {
     const snapshot = observed.snapshot();
 
-    // 1. Controllers: management resources become the containers that should exist.
-    const target = runControllers(desired, snapshot);
+    // 1. Controllers: management resources become the containers that should
+    //    exist. Every Deployment's current template is recorded first, so
+    //    that when it stops being the current one there is still somewhere
+    //    to read it from — the controllers themselves stay pure, taking the
+    //    accumulated map as an ordinary argument.
+    for (const deployment of resourcesOfKind(desired, 'deployment')) {
+      generations.remember(deployment.spec.template);
+    }
+    const target = runControllers(desired, snapshot, generations.all());
 
     // 2. The restart gate: which of those containers are actually admitted
     //    into this pass's model. This is the one thing `runControllers`
@@ -394,6 +416,16 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     //    vs. leave-alone; this loop no longer does.
     await runtime.apply(plan.model);
     lastApplied = plan.model;
+
+    // Forget generations nothing refers to any more: every one currently
+    // declared, plus every one a container is still running under. Without
+    // this the store grows by one entry per template edit, for ever.
+    generations.prune([
+      ...resourcesOfKind(desired, 'deployment').map((d) => shortDigest(d.spec.template)),
+      ...[...snapshot.containers.values()]
+        .map((c) => c.labels[GENERATION_LABEL])
+        .filter((g): g is string => g !== undefined),
+    ]);
   }
 
   /**
