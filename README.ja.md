@@ -4,8 +4,8 @@
 
 **React Fiber を使った、単一ノード向けコンテナオーケストレータの実験。**
 
-JSX で望ましい構成を宣言し、コントローラが実行状態との差を調整します。
-適用には `nerdctl compose`、状態の観測には containerd gRPC を使います。
+JSX で望ましい構成を宣言します。React のコントローラコンポーネントが実行状態を購読し、
+必要なリソースを render します。適用には `nerdctl compose`、観測には containerd gRPC を使います。
 
 ```tsx
 import { Container, Network, ReplicaSet, Service } from 'fiber-servo';

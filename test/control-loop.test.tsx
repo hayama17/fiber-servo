@@ -133,12 +133,8 @@ describe('replicaset', () => {
     await served.stop();
   });
 
-  /**
-   * The headline behaviour of the whole project. Read the assertion on
-   * `commits` carefully: replacing the dead container cost zero React
-   * renders, because the tree still says "three" and that was never untrue.
-   */
-  it('replaces a container that died, without a single React render', async () => {
+  /** Runtime observations now flow through the React ReplicaSet controller. */
+  it('replaces a container that died through a React controller re-render', async () => {
     const { served, runtime, commits } = start(threeReplicas);
     await settle(served);
     const before = commits();
@@ -150,7 +146,7 @@ describe('replicaset', () => {
     expect(served.observed.get('api-1')?.phase).toBe('running');
     expect(runtime.calls.filter((c) => c === 'create api-1 image=api:v1')).toHaveLength(1);
     expect(runtime.calls.filter((c) => c === 'restart api-1 image=api:v1')).toHaveLength(1);
-    expect(commits()).toBe(before);
+    expect(commits()).toBeGreaterThan(before);
 
     await served.stop();
   });

@@ -4,8 +4,9 @@ English | [日本語](README.ja.md)
 
 **An experiment in using React Fiber as a single-node container control plane.**
 
-Declare the desired application in JSX. Controllers reconcile it with runtime
-state, applying through `nerdctl compose` and observing through containerd gRPC.
+Declare the desired application in JSX. React controller components subscribe
+to runtime state and render the resources that should exist; the adapter
+applies commits through `nerdctl compose` and observes through containerd gRPC.
 
 ```tsx
 import { Container, Network, ReplicaSet, Service } from 'fiber-servo';

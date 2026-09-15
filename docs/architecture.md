@@ -1,8 +1,9 @@
 # Architecture
 
-React commits desired resources. Controllers compare them with observed
-containers and produce a Compose application. The runtime adapter applies it
-through `nerdctl compose` and reads container state through containerd gRPC.
+React commits desired resources. Controller components subscribe to observed
+containers and render the runtime resources that should exist. The runtime
+adapter applies the committed snapshot through `nerdctl compose` and reads
+container state through containerd gRPC.
 
 ```text
 JSX → React Fiber → DesiredState → controllers → Compose model → Runtime.apply
@@ -17,14 +18,14 @@ to declare dependent resources after startup.
 
 ## Responsibilities
 
-| Layer           | Responsibility                                                                                  |
-| --------------- | ----------------------------------------------------------------------------------------------- |
-| React renderer  | Resource identity, component state, one `DesiredState` snapshot per commit; no runtime I/O.     |
-| Controllers     | Expand Deployment → ReplicaSet → Container and resolve Service backends. Pure functions.        |
-| Control loop    | Schedule reconciliation, retain rollout templates, apply restart backoff, and skip empty plans. |
-| Runtime adapter | Apply the whole Compose model, inspect containers, and publish observations.                    |
-| nerdctl Compose | Create, start, replace, and remove application resources.                                       |
-| containerd gRPC | Read container identity, task state, and lifecycle events. No mutation RPCs.                    |
+| Layer           | Responsibility                                                                                                                   |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| React renderer  | Resource identity, component state, one `DesiredState` snapshot per commit; no runtime I/O.                                      |
+| Controllers     | React components that subscribe to observations and render runtime resources; pure expansion helpers remain reusable underneath. |
+| Control loop    | Schedule reconciliation, retain rollout templates, apply restart backoff, and skip empty plans.                                  |
+| Runtime adapter | Apply the whole Compose model, inspect containers, and publish observations.                                                     |
+| nerdctl Compose | Create, start, replace, and remove application resources.                                                                        |
+| containerd gRPC | Read container identity, task state, and lifecycle events. No mutation RPCs.                                                     |
 
 See [the adapter guide](containerd.md) for the apply sequence and connection
 options. The namespace and socket are shared by the read and write paths;
@@ -64,9 +65,10 @@ Examples and props are in [API](api.md).
 
 ## Reconciliation and its limits
 
-Each pass recomputes from the current desired and observed state. It does not
-replay React operations. Container comparisons use the recorded spec digest
-and observed phase; an empty plan skips `Runtime.apply`.
+Each React controller render recomputes from the current desired and observed
+state. The root publishes a runtime snapshot rather than replaying operations.
+Container comparisons use the recorded spec digest and observed phase; an
+empty plan skips `Runtime.apply`.
 
 The containerd adapter takes a full snapshot when watching starts and when
 the event stream ends or fails. It retries with resync while disconnected.
