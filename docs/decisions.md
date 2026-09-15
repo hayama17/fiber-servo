@@ -463,8 +463,8 @@ Compose the answer to any difference is the same — remove that one service and
 let `up` recreate it — so "which field changed" stopped being a question
 anyone asks, and with it went `fiber-servo.spec-json` and the percent-encoding
 it needed to survive a label column. What remains is `fiber-servo.spec`, an
-eight-character hash, and the "adopt what we cannot prove we made" rule, which
-is unchanged.
+hash, and the "adopt what we cannot prove we made" rule, which is unchanged.
+(The hash itself was strengthened later; see decision 36.)
 
 ## 27. Backoff lives in the control loop
 
@@ -755,3 +755,37 @@ every one of these is a case where fiber-servo trusted a subprocess to finish.
 The two reconcilers are level-triggered precisely so that a _missed_ answer
 costs a late reconcile — but a _blocked_ one costs everything, because no
 later pass ever runs. Anything this project waits on needs a bound.
+
+## 36. A digest is identity, so it is SHA-256
+
+**Decision.** `digest()` is SHA-256, 64 hex characters, and it is what
+`fiber-servo.spec`, the restart gate and every "is this still the same spec"
+comparison use. Where a digest has to be part of a _name_ — a Deployment
+generation, and so a ReplicaSet and container name — `shortDigest()` takes the
+first 16 characters, and it is a separate function on purpose.
+
+**Why.** The original was 32-bit FNV-1a rendered as eight hex characters, and
+the comment justifying it said a collision "only costs an unnecessary
+rollout". That had the failure backwards. Nothing in this design ever asks
+"which field changed"; it asks "same or different", and answers every
+difference the same way. So a collision does not cause an extra rollout — it
+causes a rollout that **does not happen**: a container keeps running the old
+image, the plan reports nothing pending, and no layer anywhere can notice,
+because the digest was the only question asked.
+
+Thirty-two bits is also not much room. A few tens of thousands of distinct
+specs — across a machine's history, not at one instant — make a collision
+likelier than not, and the specs here are highly similar strings, which is
+exactly where a cheap hash is weakest.
+
+**Consequences.** `digest()` now needs `node:crypto`, which `resources.ts` did
+not previously import; the package was already Node-only. Container names grow
+by eight characters (`web-43bfee23-1` becomes `web-43bfee23d1cb5f62-1`) —
+still readable in `nerdctl ps`, and 64 bits is far past where an accidental
+collision between the handful of generations one Deployment ever has is worth
+thinking about.
+
+**The split is the point.** Keeping `shortDigest` a separate function is what
+stops a readability decision about names from quietly becoming a correctness
+decision about identity. The truncation happens where a human reads it, and
+nowhere else.

@@ -13,6 +13,8 @@ import {
 } from '../src/controllers.js';
 import {
   digest,
+  shortDigest,
+  SHORT_DIGEST_LENGTH,
   type ContainerTemplate,
   type DeploymentSpec,
   type DesiredState,
@@ -56,7 +58,7 @@ function ownedContainer(
     labels: {
       ...template.labels,
       [OWNER_LABEL]: owner,
-      [GENERATION_LABEL]: digest(template),
+      [GENERATION_LABEL]: shortDigest(template),
       [TEMPLATE_LABEL]: encodeTemplate(template),
     },
     image: template.image,
@@ -110,7 +112,7 @@ describe('expandReplicaSet', () => {
     expect(c!.labels).toEqual({
       app: 'web',
       [OWNER_LABEL]: 'web',
-      [GENERATION_LABEL]: digest(spec.template),
+      [GENERATION_LABEL]: shortDigest(spec.template),
       [TEMPLATE_LABEL]: encodeTemplate(spec.template),
     });
   });
@@ -132,7 +134,7 @@ describe('expandReplicaSet', () => {
     const [c] = expandReplicaSet({ name: 'web', replicas: 1, template: rich }, EMPTY);
     const recovered = decodeTemplate(c!.labels?.[TEMPLATE_LABEL]);
     expect(recovered).toEqual(rich);
-    expect(digest(recovered)).toBe(c!.labels?.[GENERATION_LABEL]);
+    expect(shortDigest(recovered)).toBe(c!.labels?.[GENERATION_LABEL]);
   });
 
   it('rejects a negative or non-integer replica count', () => {
@@ -154,7 +156,7 @@ describe('expandReplicaSet', () => {
 
 describe('expandDeployment', () => {
   const deploymentTemplate = { image: 'api:v2' };
-  const newGen = digest(deploymentTemplate);
+  const newGen = shortDigest(deploymentTemplate);
   // A real previous template, not a made-up digest: the generation IS
   // `digest(template)`, and an old generation is only drainable because its
   // containers still carry the template that named it.
@@ -166,7 +168,7 @@ describe('expandDeployment', () => {
     resources: { cpu: 0.5, memory: '512m' },
     readiness: { exec: ['/health'] },
   };
-  const oldGen = digest(oldTemplate);
+  const oldGen = shortDigest(oldTemplate);
 
   /**
    * The three containers generation `oldGen` actually produced -- built by
@@ -272,7 +274,11 @@ describe('expandDeployment', () => {
       return expandDeployment(spec, observed).flatMap((rs) =>
         expandReplicaSet(rs, observed).map((c) => ({
           ...c,
-          labels: { ...c.labels, [OWNER_LABEL]: 'web', [GENERATION_LABEL]: rs.name.slice(-8) },
+          labels: {
+            ...c.labels,
+            [OWNER_LABEL]: 'web',
+            [GENERATION_LABEL]: rs.name.slice(-SHORT_DIGEST_LENGTH),
+          },
         })),
       );
     }
@@ -343,7 +349,7 @@ describe('expandDeployment', () => {
   // new one is up but cannot answer anything.
   describe('readiness-aware progress', () => {
     const probed: ContainerTemplate = { image: 'api:v2', readiness: { exec: ['/health'] } };
-    const probedGen = digest(probed);
+    const probedGen = shortDigest(probed);
     const spec: DeploymentSpec = {
       name: 'web',
       replicas: 3,
@@ -398,7 +404,7 @@ describe('expandDeployment', () => {
 
     it('still counts a merely running container when the template has no probe', () => {
       const unprobed: ContainerTemplate = { image: 'api:v2' };
-      const gen = digest(unprobed);
+      const gen = shortDigest(unprobed);
       const observed = observedOf(
         ownedContainer(`web-${gen}-0`, 'web', unprobed, { phase: 'running' }), // ready is undefined
         ownedContainer(`web-${gen}-1`, 'web', unprobed, { phase: 'running' }),
@@ -540,7 +546,7 @@ describe('runControllers', () => {
     expect(result.containers).toHaveLength(2);
     for (const c of result.containers) {
       expect(c.labels?.[OWNER_LABEL]).toBe('web'); // the Deployment's name, not the generated ReplicaSet's
-      expect(c.labels?.[GENERATION_LABEL]).toBe(digest(template));
+      expect(c.labels?.[GENERATION_LABEL]).toBe(shortDigest(template));
     }
   });
 

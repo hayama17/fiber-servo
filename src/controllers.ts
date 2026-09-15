@@ -38,6 +38,8 @@
 import {
   digest,
   selectorMatches,
+  shortDigest,
+  SHORT_DIGEST_LENGTH,
   type ContainerSpec,
   type ContainerTemplate,
   type DeploymentSpec,
@@ -139,7 +141,7 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
     throw new Error(`fiber-servo: ReplicaSet "${spec.name}" replicas must be a non-negative integer`);
   }
   const labels = {
-    ...ownedLabels(spec.template.labels, spec.name, digest(spec.template)),
+    ...ownedLabels(spec.template.labels, spec.name, shortDigest(spec.template)),
     // The template travels with the replica, so a later pass — or a later
     // process — can reproduce it exactly; see `TEMPLATE_LABEL`. Encoded from
     // `spec.template`, never from the labels being built here, so there is
@@ -157,12 +159,12 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
 // ---- Deployment ---------------------------------------------------------
 
 /**
- * `digest()` always renders as exactly 8 lowercase hex characters (32-bit
- * FNV-1a, `padStart(8, '0')` — see resources.ts), so it can be recovered
- * from the end of `${deployment.name}-${digest}` without re-parsing the
- * deployment name, which may itself contain hyphens.
+ * A generation id is `shortDigest()`, which is always exactly
+ * `SHORT_DIGEST_LENGTH` lowercase hex characters (see resources.ts), so it
+ * can be recovered from the end of `${deployment.name}-${generation}`
+ * without re-parsing the deployment name, which may itself contain hyphens.
  */
-const DIGEST_LENGTH = 8;
+const DIGEST_LENGTH = SHORT_DIGEST_LENGTH;
 
 /**
  * Recover an old generation's `ContainerTemplate` from the Containers it
@@ -174,7 +176,7 @@ const DIGEST_LENGTH = 8;
  * which carry it in `TEMPLATE_LABEL`.
  *
  * The recovered template is checked against the generation it claims to be:
- * `digest(template)` is what named the generation in the first place, so if
+ * `shortDigest(template)` is what named the generation in the first place, so if
  * the two agree the recovery is exact, not approximate. That check is what
  * makes it safe to hand the result back to `expandReplicaSet` as if it were
  * the original template, because it provably is one.
@@ -192,7 +194,7 @@ function recoverTemplate(
   const sorted = [...containers].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   for (const container of sorted) {
     const template = decodeTemplate(container.labels[TEMPLATE_LABEL]);
-    if (template && digest(template) === generation) return template;
+    if (template && shortDigest(template) === generation) return template;
   }
   return undefined;
 }
@@ -227,7 +229,7 @@ function oldestObservedAt(containers: readonly ObservedContainer[]): number {
  * A Deployment becomes one ReplicaSet per template generation: `newRS` for
  * `spec.template` as it reads right now, and one `oldRS` per generation that
  * still has Containers running from an earlier apply. A generation's
- * identity is `digest(template)` (decision 4's naming discipline, extended:
+ * identity is `shortDigest(template)` (decision 4's naming discipline, extended:
  * an unchanged template keeps the same name, and therefore the same
  * ReplicaSet, for free; an edited one gets a new name and therefore a new
  * rollout instead of mutating Containers in place).
@@ -261,7 +263,7 @@ export function expandDeployment(spec: DeploymentSpec, observed: ObservedState):
   if (!Number.isInteger(spec.replicas) || spec.replicas < 0) {
     throw new Error(`fiber-servo: Deployment "${spec.name}" replicas must be a non-negative integer`);
   }
-  const newGeneration = digest(spec.template);
+  const newGeneration = shortDigest(spec.template);
   const maxSurge = spec.strategy?.maxSurge ?? 1;
   const maxUnavailable = spec.strategy?.maxUnavailable ?? 0;
 
@@ -461,7 +463,7 @@ export function runControllers(
           // after `replicaSet.name`, which is `${deployment}-${digest}`, so
           // it is corrected here to the Deployment's own name. The
           // generation label it stamped is already right — it recomputed
-          // `digest(replicaSet.template)`, which for the new generation
+          // `shortDigest(replicaSet.template)`, which for the new generation
           // *is* `spec.template` and for an old one is what named this very
           // ReplicaSet in the first place — but pulling it straight from
           // the name (see `DIGEST_LENGTH`) avoids trusting a second

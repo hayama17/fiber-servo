@@ -22,7 +22,15 @@ export type {
 } from './components.js';
 
 // ---- the vocabulary --------------------------------------------------------
-export { RESOURCE_KINDS, digest, resourcesOfKind, selectorMatches, specValueEquals } from './resources.js';
+export {
+  RESOURCE_KINDS,
+  SHORT_DIGEST_LENGTH,
+  digest,
+  resourcesOfKind,
+  selectorMatches,
+  shortDigest,
+  specValueEquals,
+} from './resources.js';
 export type {
   ContainerSpec,
   ContainerTemplate,

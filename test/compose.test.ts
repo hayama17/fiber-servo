@@ -33,7 +33,7 @@ describe('toComposeService', () => {
     const service = toComposeService(container({ name: 'api', labels: { app: 'api' } }));
     expect(service.labels?.app).toBe('api');
     expect(service.labels?.[MANAGED_LABEL]).toBe('true');
-    expect(service.labels?.[SPEC_LABEL]).toMatch(/^[0-9a-f]{8}$/);
+    expect(service.labels?.[SPEC_LABEL]).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('publishes ports in Compose short syntax, with the protocol only when it is not tcp', () => {

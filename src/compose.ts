@@ -187,7 +187,7 @@ export function toComposeNetwork(spec: NetworkSpec): ComposeNetwork {
  * The whole desired application.
  *
  * Container names are the service names, so the names the controllers chose
- * (`api-0`, `web-43bfee23-1`) are what appear in `nerdctl compose ps` and in
+ * (`api-0`, `web-43bfee23d1cb5f62-1`) are what appear in `nerdctl compose ps` and in
  * the `com.docker.compose.service` label the observer reads back.
  */
 export function toComposeApplication(

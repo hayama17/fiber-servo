@@ -33,7 +33,7 @@ export type ContainerPhase = 'waiting' | 'running' | 'exited' | 'unknown';
  * One container as the runtime currently holds it.
  *
  * `name` is the Compose service name, which is the name fiber-servo's
- * controllers chose (`api-0`, `web-43bfee23-1`). Compose mangles the actual
+ * controllers chose (`api-0`, `web-43bfee23d1cb5f62-1`). Compose mangles the actual
  * container name to `<project>-<service>-<index>` but records the service
  * name in a label, so identity survives the round trip without fiber-servo
  * having to invent a label of its own.

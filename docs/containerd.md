@@ -126,7 +126,7 @@ Every container carries:
 
 Identity needs no label of fiber-servo's invention: Compose mangles the
 container name to `<project>-<service>-<index>` but records the service name,
-which is the name the controllers chose (`api-0`, `web-43bfee23-1`). Two of
+which is the name the controllers chose (`api-0`, `web-43bfee23d1cb5f62-1`). Two of
 the six labels above are ours; the rest were already there.
 
 A container with no `fiber-servo.managed` label is adopted, never removed —
