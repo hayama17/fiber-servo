@@ -1,32 +1,4 @@
-/**
- * The control loop: where the two reconciliations meet, and the only file that
- * needs to understand both.
- *
- * ```text
- *   React commit ─────┐
- *                     ├──> reconcile() ──> Compose model ──> Runtime.apply
- *   runtime event ────┘         ▲                                              │
- *                               └──────────────── observed state ◄─────────────┘
- * ```
- *
- * Both arrows into `reconcile()` mean the same thing — "something might now be
- * out of date" — and neither says what to do about it. That is the whole point
- * of the split: a React commit changes what we want, a runtime event changes
- * what is, and in both cases the answer is to let React recompute the runtime
- * resource tree from scratch. There is no incremental diff to keep in sync,
- * and therefore nothing to get out of sync.
- *
- * The loop is level-triggered, not edge-triggered: it reads the current
- * desired state and the current observed state every tick and acts on the
- * difference. A missed event costs a late reconcile, never a wrong one.
- *
- * What changed with the move to Compose: there is no more action list to
- * execute one at a time. `pass()` builds the whole desired Compose
- * Application Model and hands it to `runtime.apply()` in a single call — the
- * runtime decides create vs. replace vs. leave-alone, not this file. Restart
- * admission is decided by each React Container controller; this loop only
- * schedules the I/O that applies the committed model.
- */
+/** Apply committed React snapshots and runtime observations to one adapter. */
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
@@ -37,12 +9,7 @@ import { resourcesOfKind, type DesiredState } from './resources.js';
 import { resolveRestartPolicy, type RestartPolicy } from './restart.js';
 import type { ObservedStore, Runtime, RuntimeFactory } from './runtime/types.js';
 
-/**
- * How many times the control loop will reconcile an identical Compose model
- * before concluding it is not converging. Generous enough that no honest
- * rollout reaches it, small enough that a bug costs a few operations rather
- * than a pegged CPU.
- */
+/** Stop after repeated identical models; an adapter that never changes state cannot converge. */
 const MAX_IDENTICAL_PASSES = 20;
 
 // ---- serve ------------------------------------------------------------------
@@ -83,29 +50,7 @@ export interface Served {
    */
   stop(): Promise<void>;
 
-  /**
-   * End the control plane and leave the runtime exactly as it is.
-   *
-   * ```text
-   * detach()   control plane stops.       containers and networks stay.
-   * stop()     the application stops.     runtime.down() removes them.
-   * ```
-   *
-   * This is what "the fiber-servo process died" looks like from inside one
-   * process: reconcile requests stop being accepted, controller subscriptions
-   * are dropped, the tree is unmounted, and every piece of controller state —
-   * the restart records, the rollout history, the
-   * last applied model — goes with it. Nothing is asked of the runtime, and
-   * the adapter is left open, because a process that has crashed does not
-   * politely close its socket either.
-   *
-   * It exists because that state is not observable from outside, and a test
-   * that merely stops calling a `serve()` has not detached it: it still holds
-   * a runtime subscription, still reconciles when an event arrives, and can
-   * still apply its own stale idea of desired state on top of whoever
-   * replaced it. Real code wants it too — anything that hands a machine over
-   * to another process, or swaps a control plane without an outage.
-   */
+  /** Stop the control plane and leave runtime resources untouched. */
   detach(): Promise<void>;
 }
 
@@ -140,28 +85,14 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   let repeats = 0;
   let stalled = false;
 
-  /**
-   * Serialise reconciles and coalesce requests. A burst of runtime events
-   * during one pass produces exactly one more pass, not one per event: since
-   * every pass reads current state, a pass that has not started yet is
-   * indistinguishable from one that has not been requested yet.
-   */
+  /** Serialise reconciles and coalesce bursts of events. */
   function request(): Promise<void> {
     if (stopped || stalled) return Promise.resolve();
     if (running !== null) {
       again = true;
       return running;
     }
-    // Start the pass on a microtask rather than calling it here.
-    //
-    // `pass()` runs synchronously until its first await, and the first thing
-    // it awaits is a runtime call — which, for an in-process adapter, notifies
-    // its subscribers synchronously. That notification calls `request()` again
-    // while `running` is still null, because the assignment below has not
-    // happened yet, and a second pass starts on top of the first. Two passes
-    // reading the same stale snapshot then both decide to create the same
-    // container. Deferring by one microtask means `running` is set before any
-    // of that can happen, so the guard above actually guards.
+    // Start on a microtask so synchronous adapter notifications see `running`.
     running = Promise.resolve()
       .then(pass)
       .catch((error: unknown) => onError(error instanceof Error ? error : new Error(String(error))))
@@ -198,16 +129,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     if (wedged(plan)) return;
 
     options.onApply?.(plan);
-    // A pass with nothing pending is not merely quiet to log about — calling
-    // `apply` at all would be pointless work for a real actuator (a whole
-    // `nerdctl compose up` invocation) to prove what this plan already
-    // proves for free: recomputing it is exactly how the runtime itself
-    // would answer "does anything need to change", and this pass just did
-    // that computation already. Skipping it here is also what keeps a
-    // notify-triggered reflow pass (`apply()` notifying observed state
-    // synchronously, which re-triggers `request()` before this pass has
-    // even returned) from being a second, redundant call into the runtime
-    // for the same already-settled state.
+    // Avoid an unnecessary adapter call for an empty plan.
     if (planIsEmpty(plan)) return;
 
     // One log line per pending change, the same way the old action-list
@@ -220,21 +142,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
     lastApplied = plan.model;
   }
 
-  /**
-   * Stop a loop that is not getting anywhere.
-   *
-   * Applying a model changes observed state, which schedules another pass —
-   * which is exactly right while each pass makes progress. But if applying a
-   * model fails to change what the next pass observes (an adapter that
-   * mutates something without reporting the new state, say), the same model
-   * comes back for ever and the loop hammers the runtime as fast as it can.
-   *
-   * A rollout legitimately runs many passes in a row, so "many passes" is not
-   * the signal. *Identical* models are: a pass that would apply exactly what
-   * the last one applied, repeatedly, is by definition not converging.
-   * Report it once and stand down until the desired state changes, rather
-   * than burning the machine on a bug.
-   */
+  /** Stop if an adapter keeps returning the same unfulfilled model. */
   function wedged(plan: Plan): boolean {
     const total = plan.missing.length + plan.changed.length + plan.orphaned.length + plan.restarting.length;
     if (total === 0) {
