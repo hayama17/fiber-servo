@@ -57,7 +57,7 @@ containerdで試す場合は、ソケットにアクセスできる環境で`npm
 
 ## CLI
 
-アプリのファイルは、React要素またはコンポーネントをdefault exportしてください。
+アプリの構成を返すコンポーネントをdefault exportします。
 
 ```console
 npx fiber-servo plan app.tsx --model
