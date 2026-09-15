@@ -1,10 +1,3 @@
-MethodException: 
-Line |
-   2 |  …  'docs/api.md')); $s=$s.Replace(([char]13+[char]10),[char]10); [Conso …
-     |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     | Cannot convert argument "oldChar", with value: "
-", for "Replace" to type "System.Char": "Cannot convert value "
-" to type "System.Char". Error: "String must be exactly one character long.""
 # API
 
 Public exports are available from the package root. See [Architecture](architecture.md)

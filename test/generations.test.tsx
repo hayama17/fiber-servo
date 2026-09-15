@@ -1,10 +1,3 @@
-MethodException: 
-Line |
-   2 |  … ions.test.tsx')); $s=$s.Replace(([char]13+[char]10),[char]10); [Conso …
-     |                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-     | Cannot convert argument "oldChar", with value: "
-", for "Replace" to type "System.Char": "Cannot convert value "
-" to type "System.Char". Error: "String must be exactly one character long.""
 import { describe, expect, it } from 'vitest';
 import { Container, Deployment } from '../src/components.js';
 import { expandDeployment, expandReplicaSet, GENERATION_LABEL, OWNER_LABEL } from '../src/controllers.js';
