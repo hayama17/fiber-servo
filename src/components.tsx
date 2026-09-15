@@ -1,12 +1,8 @@
 /**
- * The user-facing API: five components, each a thin wrapper over one host
- * element, plus `<Ready>` for ordering.
+ * The user-facing API: resource declarations plus React controller components.
  *
- * They are thin on purpose. A component here decides nothing about the
- * runtime — it declares a resource and stops. The interesting behaviour
- * (how many containers there should be, which of them are up, what to do
- * about the difference) lives in the controllers, where it can see observed
- * state.
+ * Controllers read the shared observed store and render runtime resources.
+ * Host elements remain declarative and perform no I/O.
  *
  * Two shapes to learn, and they are the whole mental model:
  *
@@ -31,7 +27,16 @@
  * ReplicaSet counts Containers directly, a Service routes to Containers
  * directly, and one Container becomes exactly one Compose service.
  */
-import { Suspense, createElement, type ReactElement, type ReactNode } from 'react';
+import {
+  Children,
+  Fragment,
+  Suspense,
+  createElement,
+  isValidElement,
+  useSyncExternalStore,
+  type ReactElement,
+  type ReactNode,
+} from 'react';
 import type {
   ContainerSpec,
   DeploymentSpec,
@@ -40,7 +45,8 @@ import type {
   ReplicaSetSpec,
   ServiceSpec,
 } from './resources.js';
-import { useReady, type ReadyCondition } from './hooks.js';
+import { useObserved, useReady, type ReadyCondition } from './hooks.js';
+import { expandReplicaSet } from './controllers.js';
 
 /** The host elements. Typed here once so callers never touch string types. */
 function host<P extends object>(type: string, props: P): ReactElement {
@@ -107,14 +113,25 @@ export interface ReplicaSetProps extends Omit<ReplicaSetSpec, 'template' | 'repl
 /**
  * "Keep `replicas` Containers of this template alive."
  *
- * This is the component that makes the project's central claim concrete. It
- * declares a *count*, not identities, so when a Container dies nothing here
- * changes and React does not re-render: the ReplicaSet controller compares
- * desired 3 against observed 2 and creates one. The JSX is the same either
- * way.
+ * ReplicaSet is a controller component: it subscribes to observed state and
+ * renders the runtime Containers that should exist. A runtime event therefore
+ * flows through React and produces a new commit when the set changes.
  */
-export function ReplicaSet({ children, ...spec }: ReplicaSetProps): ReactElement {
-  return host('replicaset', { ...spec, children });
+export function ReplicaSet({ children, replicas = 1, ...spec }: ReplicaSetProps): ReactElement {
+  const store = useObserved();
+  const observed = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
+  const child = Children.only(children);
+  if (!isValidElement<ContainerProps>(child) || child.type !== Container) {
+    throw new Error('fiber-servo: ReplicaSet needs exactly one <Container> template');
+  }
+  const template = { ...child.props };
+  delete template.name;
+  const containers = expandReplicaSet({ name: spec.name, replicas, template }, observed);
+  return createElement(
+    Fragment,
+    null,
+    containers.map((container) => createElement(Container, { ...container, key: container.name })),
+  ) as unknown as ReactElement;
 }
 
 // ---- Deployment ------------------------------------------------------------

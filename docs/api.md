@@ -182,6 +182,11 @@ as `ObservedContainer.networks`.
 
 ## Controllers, the Compose model, and the planner
 
+`ReplicaSet` is a React controller component: it subscribes to `ObservedStore`
+and renders the resulting `Container` resources. Deployment and Service follow
+the same shape as they move into the React tree. The pure expansion functions
+remain exported for direct use and testing.
+
 All pure functions, callable directly:
 
 ```ts

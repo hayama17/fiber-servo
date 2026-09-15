@@ -5,6 +5,10 @@
  * state it declares can depend on it — "don't declare the web container until
  * the database answers its probe". Reading is the whole of the contract.
  *
+ * Controllers use these hooks to turn observations into runtime resources.
+ * Runtime events are inputs to React; they are never rewritten as fake props
+ * or restart generations.
+ *
  * What used to live here and deliberately does not any more: `useSelfHeal`.
  * It watched for a container dying and answered by incrementing a restart
  * generation, which travelled down as a prop purely so that React would see a
