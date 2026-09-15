@@ -225,3 +225,4 @@ describe('a restart converges freshly rather than resuming', () => {
     expect((await runtime.inspect()).containers.get('solo')?.phase).toBe('exited');
   }, 20_000);
 });
+

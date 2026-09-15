@@ -259,3 +259,4 @@ Adapters read the creation spec digest (`SPEC_LABEL`) and probe configuration
 
 `src/runtime/memory.ts` is the reference implementation and the shortest way to
 see what the contract asks for.
+

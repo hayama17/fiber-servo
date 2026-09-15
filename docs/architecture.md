@@ -6,7 +6,7 @@ adapter applies the committed snapshot through `nerdctl compose` and reads
 container state through containerd gRPC.
 
 ```text
-JSX → React Fiber → DesiredState → controllers → Compose model → Runtime.apply
+JSX → React Fiber + controller components → runtime DesiredState → Compose model → Runtime.apply
                                       ▲                             │
                                       └── ObservedState ◄── containerd gRPC
 ```
@@ -119,3 +119,4 @@ Paths below are relative to `src/`.
 
 For rationale see [Design decisions](decisions.md); for scope and open
 questions see [Project scope](../PLAN.md).
+
