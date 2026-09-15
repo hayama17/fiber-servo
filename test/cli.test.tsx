@@ -133,3 +133,25 @@ describe('cli --watch', () => {
     }
   }, 60_000);
 });
+
+describe('declarative examples', () => {
+  it.each([
+    ['basic', 1, ['web']],
+    ['replicaset', 3, ['api-0', 'api-1', 'api-2']],
+    ['webapp', 6, ['db', 'migrate', 'api']],
+    ['app', 4, ['db', 'web']],
+  ] as const)(
+    'plans %s through the source CLI',
+    async (name, count, expected) => {
+      const { stdout } = await promisify(execFile)(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'plan', `examples/${name}.tsx`, '--model'],
+        { cwd: projectRoot, timeout: 30_000 },
+      );
+      const model = JSON.parse(stdout) as { services: Record<string, unknown> };
+      expect(Object.keys(model.services)).toHaveLength(count);
+      for (const service of expected) expect(model.services).toHaveProperty(service);
+    },
+    30_000,
+  );
+});
