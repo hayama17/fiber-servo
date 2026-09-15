@@ -102,4 +102,3 @@ npx fiber-servo apply app.tsx
 ## ライセンス
 
 MIT
-
