@@ -16,7 +16,7 @@ import {
   type DesiredState,
   type ReplicaSetSpec,
 } from '../src/resources.js';
-import { createMemoryGenerationStore, type Generations } from '../src/generations.js';
+import { createGenerationHistory, type Generations } from '../src/generations.js';
 import type { ObservedContainer, ObservedState } from '../src/runtime/types.js';
 
 // ---- small builders, matching the style of test/observed.test.ts ----------
@@ -62,7 +62,7 @@ function ownedContainer(
 
 /** The generation history a `serve()` pass would have accumulated for these templates. */
 function generationsOf(...templates: ContainerTemplate[]): Generations {
-  const store = createMemoryGenerationStore();
+  const store = createGenerationHistory();
   for (const template of templates) store.remember(template);
   return store.all();
 }

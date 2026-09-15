@@ -792,13 +792,12 @@ nowhere else. (Decision 39 finishes that separation: at first the truncation
 _was_ the generation's identity, which is exactly the slide this paragraph
 warned about.)
 
-## 37. Template history lives beside the application, not on the container
+## 37. A template does not fit in a container label
 
 **Decision.** A container's labels carry only small, fixed-width identifiers —
 who owns it, which generation it belongs to, the digest of its spec, and its
 readiness probe. The mapping from a generation to the `ContainerTemplate` it
-was made from lives in a small JSON file (`src/generations.ts`), written by
-`fiber-servo up` and read back at startup.
+was made from moves off the container.
 
 **Why.** Decision 26 says state belongs on the resource, because state on the
 resource cannot desynchronise from it. That is still the better instinct, and
@@ -814,24 +813,11 @@ than maximum size (4096 bytes)`. A feature that turns a valid spec into an
 unlaunchable one is not a trade-off, and no amount of encoding cleverness
 fixes an unbounded value in a bounded place.
 
-**Consequences, including the one that is a real loss.** The file can go
-missing while the containers it describes are still running — a fresh machine,
-a cleared state directory — which a label could never do. The window is
-narrower than it looks: the store is consulted only for generations _other
-than the one currently declared_, so an application that is not mid-rollout
-never reads it. What it costs is that a rollout interrupted by losing the
-store finishes abruptly rather than gradually, because `expandDeployment`
-refuses to invent a template it cannot verify (`shortDigest(template)` must
-equal the id it is filed under). The failure mode is "the rollout finishes
-sooner", never "a container comes back as something nobody asked for".
-
-Two smaller consequences worth stating. The library does not write to disk by
-default: `serve()` uses an in-memory store, and only `fiber-servo up` — the
-one long-lived caller, and the only one for which surviving a restart means
-anything — passes a file-backed one. And every failure in that file is
-survivable: unreadable, corrupt, or filed under the wrong id all mean "start
-empty and say so", because losing a rollout's gradualness must never cost the
-application its availability.
+**Superseded by decision 40 for where it goes instead.** This decision's
+answer was a JSON file beside the application, which fixed the symptom and
+kept the mistake — it gave one piece of controller bookkeeping a different
+lifetime from the rest. What survives is the measurement above and the rule
+it implies about labels: identity yes, history no.
 
 ## 38. "Level-triggered" is a claim about containers
 
@@ -894,3 +880,56 @@ against the generation it claimed to be. A name can no longer carry an
 identity back, which is correct — it never should have been able to. And a
 truncation collision now costs two generations a confusing pair of names,
 where before it would have merged their histories.
+
+## 40. Controller history does not go into runtime metadata
+
+**Decision.** The templates of past generations live in memory, for the life
+of the process, and are written nowhere. A container's labels carry identity
+only — managed, owner, generation, spec digest. A restart resets controller
+state; fiber-servo does not resume an interrupted rollout, it converges
+freshly on what the tree says now.
+
+**Why.** Decision 37 asked the wrong question. Faced with "a template does not
+fit in a label", it asked _where else to persist it_ and answered with a file.
+But the question worth asking was whether an old generation's template needs
+to be persisted at all — and it does not.
+
+Look at what else the control plane keeps: the restart gate's failure counts,
+a `<Ready>` latch, how far a rollout has got, the last applied model. Every
+one of them is process-local and volatile, and nobody has ever wanted them
+otherwise. A rollout history is exactly the same kind of thing. Persisting one
+of them gave it a lifetime the others do not have, which is the sort of
+asymmetry that is invisible until it is load-bearing, and it bought a new
+failure mode — a file that can disagree with the machine — in exchange for
+gradualness during an event (a restart mid-rollout) that is already
+exceptional.
+
+The rule underneath, which both earlier attempts missed: **a container's
+labels answer "what is this", never "how did we get here".** Identity is
+small, fixed-width, and belongs on the resource. History is unbounded, belongs
+to whoever is doing the reconciling, and dies with them.
+
+**What this promises, and what it does not.** After a restart:
+
+```text
+in the current desired state, missing   -> create
+not in the current desired state        -> remove
+```
+
+An interrupted rollout therefore finishes abruptly rather than gradually: the
+old generation is drained at once, because nothing claims those containers are
+wanted any more. That is the intended behaviour, not a regression. The
+guarantee is **convergence to current desired state, not continuity of a
+plan** — and a control plane that is honestly volatile is easier to reason
+about than one that is durable in one arbitrary respect.
+
+`expandDeployment` still refuses to invent a template for a generation it has
+no record of, so the failure mode remains "the rollout finishes sooner", never
+"a container comes back as something nobody asked for".
+
+**Consequences.** `src/generations.ts` has one implementation and no option to
+persist; a durable variant would have to answer what happens when it disagrees
+with the machine, and this design wants that question not to arise — the only
+durable record of what is running is the machine. `fiber-servo up` writes
+nothing outside the Compose file it must hand to the actuator. And a template
+may now be any size, because it is never encoded into anything with a limit.

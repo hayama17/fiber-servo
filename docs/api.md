@@ -137,6 +137,7 @@ const served = serve(<App />, {
 | `restart`               | `RestartPolicy?`            | Crash backoff. `baseDelayMs` 1000, `factor` 2, `maxDelayMs` 300000, `maxRestarts` ∞, `resetAfterMs` 600000. |
 | `onDesired`             | `(d: DesiredState) => void` | Every snapshot React commits.                                                                               |
 | `onApply`               | `(p: Plan) => void`         | What each pass is about to apply, after the restart gate has filtered it.                                   |
+| `generations`           | `GenerationHistory?`        | In-flight rollout history. Process-local and volatile; supply one only to inspect it.                       |
 | `log`, `onError`, `now` |                             |                                                                                                             |
 
 Returns:

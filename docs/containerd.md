@@ -136,8 +136,10 @@ refuses any label whose key and value together exceed 4096 bytes — measured:
 6015 bytes rejected, two labels of 3000 bytes each accepted, so the cap is per
 pair rather than across the set. A Deployment's whole `ContainerTemplate` was
 briefly carried in a label, which made a perfectly legal spec with a few
-kilobytes of environment impossible to create at all. Template history lives
-beside the application instead; see decision 37.
+kilobytes of environment impossible to create at all. Labels answer "what is
+this", never "how did we get here": the templates of past generations are
+controller state, held in memory for the life of the process and written
+nowhere. See decision 40.
 
 A container with no `fiber-servo.managed` label is adopted, never removed —
 fiber-servo shares a machine, it does not own one. And because the digest and

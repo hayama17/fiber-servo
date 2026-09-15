@@ -144,21 +144,22 @@ left open.
 
 ## What each file is for
 
-| File                  | Job                                                                 |
-| --------------------- | ------------------------------------------------------------------- |
-| `resources.ts`        | The vocabulary. Specs — what should exist. No verbs.                |
-| `components.tsx`      | Six components, each a thin wrapper over one host element.          |
-| `hostConfig.ts`       | React's commit becomes a `DesiredState` snapshot. No ops.           |
-| `reconciler.ts`       | `createRoot`: render a tree, publish snapshots.                     |
-| `hooks.ts`            | The read path from observed state into the tree.                    |
-| `observed.ts`         | What is actually running. Written by adapters, read by controllers. |
-| `controllers.ts`      | Management resources become containers and networks. Pure.          |
-| `compose.ts`          | Containers and networks become a Compose application. Pure.         |
-| `planner.ts`          | What `plan` prints: the model, and how it differs from reality.     |
-| `runtime/types.ts`    | The adapter contract: `apply`, `down`, `inspect`, `subscribe`.      |
-| `runtime/memory.ts`   | The reference adapter: the whole system runs without containerd.    |
-| `runtime/containerd/` | The real adapter: Compose writes, containerd API reads.             |
-| `serve.ts`            | The control loop, plus restart backoff.                             |
+| File                  | Job                                                                       |
+| --------------------- | ------------------------------------------------------------------------- |
+| `resources.ts`        | The vocabulary. Specs — what should exist. No verbs.                      |
+| `components.tsx`      | Six components, each a thin wrapper over one host element.                |
+| `hostConfig.ts`       | React's commit becomes a `DesiredState` snapshot. No ops.                 |
+| `reconciler.ts`       | `createRoot`: render a tree, publish snapshots.                           |
+| `hooks.ts`            | The read path from observed state into the tree.                          |
+| `observed.ts`         | What is actually running. Written by adapters, read by controllers.       |
+| `controllers.ts`      | Management resources become containers and networks. Pure.                |
+| `generations.ts`      | A rollout's in-flight template history. In memory, dies with the process. |
+| `compose.ts`          | Containers and networks become a Compose application. Pure.               |
+| `planner.ts`          | What `plan` prints: the model, and how it differs from reality.           |
+| `runtime/types.ts`    | The adapter contract: `apply`, `down`, `inspect`, `subscribe`.            |
+| `runtime/memory.ts`   | The reference adapter: the whole system runs without containerd.          |
+| `runtime/containerd/` | The real adapter: Compose writes, containerd API reads.                   |
+| `serve.ts`            | The control loop, plus restart backoff.                                   |
 
 ## Ownership is a tree; relationships are a graph
 
@@ -236,12 +237,42 @@ Four places, and the rule is which goes where:
    about it.
 3. **`observed.ts`** — the observation of 2. Because React cannot re-verify the
    host, drift has to come back as an _input_, and this is where it arrives.
-4. **`serve.ts`'s restart gate** — how many times a container has already
-   failed. The one piece of state the controllers cannot hold, because they are
-   pure functions of (desired, observed) and this is neither.
+4. **The control loop's own bookkeeping** — the restart gate's failure counts,
+   the templates of generations a rollout is still draining
+   (`generations.ts`), the last model applied. None of it can live in the
+   controllers, which are pure functions of (desired, observed), and none of
+   it is a fact about the world.
 
 In Kubernetes terms, React plus the controllers are the part of a controller
 that compares desired state against a cache, and `observed.ts` is the informer.
+
+### The control plane is volatile, all of it
+
+Everything in 1 and 4 dies with the process. That is not an omission to fix
+later, it is the shape of the thing: **a container's labels answer "what is
+this", never "how did we get here"** (decision 40). Identity — managed, owner,
+generation, spec digest — is small, fixed-width and belongs on the resource.
+History is unbounded, belongs to whoever is reconciling, and goes when they
+do.
+
+So a restart means:
+
+```text
+controller state          gone
+runtime (2) and its
+observation (3)           still there, and re-read from scratch
+
+  in the current desired state, missing   -> create
+  not in the current desired state        -> remove
+```
+
+The consequence worth stating plainly: **fiber-servo does not resume an
+interrupted rollout.** Restart mid-rollout and the old generation is drained
+at once rather than stepped down, because nothing claims those containers are
+wanted any more. What is guaranteed is convergence to the current desired
+state, not continuity of a plan — and a control plane that is honestly
+volatile is easier to reason about than one durable in some arbitrary
+respect.
 
 ## Dependency ordering
 

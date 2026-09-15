@@ -32,7 +32,7 @@
 import type { ReactNode } from 'react';
 import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
 import { GENERATION_LABEL, runControllers } from './controllers.js';
-import { createMemoryGenerationStore, type GenerationStore } from './generations.js';
+import { createGenerationHistory, type GenerationHistory } from './generations.js';
 import { applyRuntimeEvent, createObservedStore } from './observed.js';
 import { formatPlan, planApply, planIsEmpty, type Plan } from './planner.js';
 import { createRoot, EMPTY_DESIRED, type Root } from './reconciler.js';
@@ -231,18 +231,13 @@ export interface ServeOptions {
   /** The Compose project this tree applies as. Default: `compose.ts`'s `DEFAULT_PROJECT`. */
   project?: string;
   /**
-   * Where past Deployment template generations are remembered, so a rollout
-   * interrupted by a restart can still reproduce the generation it was
-   * draining. See `generations.ts`.
-   *
-   * The default remembers nothing across processes, because a library
-   * function should not write to somebody's disk just for being called —
-   * `fiber-servo plan` and the test suite both call `serve` and neither
-   * should leave anything behind. A long-lived `fiber-servo up` passes a
-   * file-backed store (`createGenerationStore`), which is the only case
-   * where surviving a restart means anything.
+   * Where the templates of past generations are remembered while a rollout is
+   * in progress. Process-local and volatile, like every other piece of
+   * controller state; see `generations.ts` for why it is not persisted and
+   * what a restart therefore means. Supplying one is only useful for
+   * inspecting it in a test.
    */
-  generations?: GenerationStore;
+  generations?: GenerationHistory;
   now?: () => number;
 }
 
@@ -265,7 +260,7 @@ export function serve(element: ReactNode, options: ServeOptions): Served {
   const policy: ResolvedPolicy = { ...DEFAULT_RESTART_POLICY, ...stripUndefined(options.restart ?? {}) };
   const project = options.project ?? DEFAULT_PROJECT;
   const gate = new RestartGate(policy, now);
-  const generations = options.generations ?? createMemoryGenerationStore();
+  const generations = options.generations ?? createGenerationHistory();
   const runtime: Runtime = options.runtime({ log, onError, project });
   const warnedGiveUp = new Set<string>();
 

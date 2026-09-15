@@ -56,8 +56,8 @@ export { containerSatisfies, readyThenable, useContainer, useObserved, useReady 
 export type { ReadyCondition } from './hooks.js';
 
 // ---- generation history -----------------------------------------------------
-export { createGenerationStore, createMemoryGenerationStore, defaultGenerationsPath } from './generations.js';
-export type { GenerationStore, GenerationStoreOptions, Generations } from './generations.js';
+export { createGenerationHistory } from './generations.js';
+export type { GenerationHistory, Generations } from './generations.js';
 
 // ---- observed state ---------------------------------------------------------
 export { applyRuntimeEvent, createObservedStore, isReady } from './observed.js';

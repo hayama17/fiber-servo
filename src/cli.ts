@@ -20,8 +20,7 @@ export { loadElement } from './load.js';
 import { containerd } from './runtime/containerd/index.js';
 import { memory } from './runtime/memory.js';
 import { serve } from './serve.js';
-import { DEFAULT_PROJECT, renderCompose, type ComposeApplication } from './compose.js';
-import { createGenerationStore, defaultGenerationsPath } from './generations.js';
+import { renderCompose, type ComposeApplication } from './compose.js';
 import type { ObservedContainer, ObservedState, RuntimeFactory } from './runtime/types.js';
 
 const USAGE = `usage:
@@ -181,20 +180,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 
   if (command === 'up') {
-    const project = typeof flags['project'] === 'string' ? flags['project'] : DEFAULT_PROJECT;
     const session = createSession(
       {
         runtime: pickRuntime(flags, quiet ? () => {} : stamp),
-        project,
-        // The one place a persisted generation store earns its keep: `up`
-        // is long-lived, so a rollout can outlive the process running it.
-        // `plan` deliberately gets the default in-memory one and writes
-        // nothing at all.
-        generations: createGenerationStore({
-          path: defaultGenerationsPath(project),
-          log: quiet ? () => {} : stamp,
-          onError: (e) => stamp(`!! ${e.message}`),
-        }),
         log: quiet ? () => {} : stamp,
         // No `onApply` here: `serve` already logs a summary of each apply
         // through `log`, and printing from both channels doubles every line.
