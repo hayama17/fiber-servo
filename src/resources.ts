@@ -262,9 +262,14 @@ export function digest(value: unknown): string {
  * How much of a digest is used where it becomes part of a name — a
  * Deployment generation, and therefore a ReplicaSet and container name.
  *
- * 16 hex characters is 64 bits: short enough to read in `nerdctl ps`, and far
- * past the point where an accidental collision between the handful of
- * template generations one Deployment ever has is worth thinking about.
+ * 16 hex characters is 64 bits, over the handful of template generations one
+ * Deployment has in its life. That is a deliberate decision to ignore the
+ * collision probability, not a claim that a collision would not matter: two
+ * generations sharing a name make two containers share a name, which
+ * `runControllers` refuses rather than resolves. What the truncation is safe
+ * *from* is the other failure — it is never used to decide whether two specs
+ * are the same, so it cannot cause a change to reconcile as no change. See
+ * `generationName` in `controllers.ts`.
  */
 export const SHORT_DIGEST_LENGTH = 16;
 

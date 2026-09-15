@@ -780,10 +780,10 @@ exactly where a cheap hash is weakest.
 
 **Consequences.** `digest()` now needs `node:crypto`, which `resources.ts` did
 not previously import; the package was already Node-only. Container names grow
-by eight characters (`web-43bfee23-1` becomes `web-43bfee23d1cb5f62-1`) —
-still readable in `nerdctl ps`, and 64 bits is far past where an accidental
-collision between the handful of generations one Deployment ever has is worth
-thinking about.
+by eight characters (`web-43bfee23-1` becomes `web-43bfee23d1cb5f62-1`) — still
+readable in `nerdctl ps`. Sixty-four bits over the handful of generations one
+Deployment has in its life is a collision probability this project chooses to
+ignore; decision 39 is precise about what would happen if it did not.
 
 **The split is the point.** Keeping `shortDigest` a separate function is what
 stops a readability decision about names from quietly becoming a correctness

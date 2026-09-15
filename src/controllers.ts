@@ -130,11 +130,25 @@ export function expandReplicaSet(spec: ReplicaSetSpec, observed: ObservedState):
  * What a generation is *called*: the Deployment's name and a short prefix of
  * the generation's digest.
  *
- * This is a rendering, not an identity. It becomes a ReplicaSet name and
+ * This is a rendering, not an identity — it becomes a ReplicaSet name and
  * therefore a container name, so it is truncated to stay readable in
- * `nerdctl ps` — and because it is only a rendering, a truncation collision
- * would cost two generations a confusing pair of names and nothing more. The
- * identity they are compared by is the full digest on `GENERATION_LABEL`.
+ * `nerdctl ps`, and nothing compares generations by it. But "rendering" does
+ * not mean "harmless if it collides", and an earlier version of this comment
+ * claimed it did. Two generations that agreed on the short form would produce
+ * the same container names, and `runControllers` refuses that outright:
+ *
+ *   fiber-servo: two resources both produce a container named "web-aaaa-0"
+ *
+ * which fails the pass through `onError` and leaves the tree unconverged
+ * until something changes. So the honest statement is: a full-digest
+ * collision is a *correctness* failure (a changed spec that reconciles as
+ * unchanged, with nothing able to notice), a short-digest collision is a
+ * *name* collision and a loud, non-converging one — and neither is silent
+ * corruption of the other's kind.
+ *
+ * The short form is 16 hex characters, 64 bits, over the handful of template
+ * generations one Deployment has in its life. That probability is being
+ * ignored deliberately, which is a different thing from it not existing.
  */
 function generationName(deployment: string, template: ContainerTemplate): string {
   return `${deployment}-${shortDigest(template)}`;

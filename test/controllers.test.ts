@@ -276,6 +276,29 @@ describe('expandDeployment', () => {
       expect(c!.labels?.[GENERATION_LABEL]).not.toBe(shortDigest(deploymentTemplate));
     });
 
+    // What a short-digest collision actually costs, stated as a test rather
+    // than as a claim in a comment: two generations that share a name share
+    // container names, and that is refused rather than resolved. Loud and
+    // non-converging, where a full-digest collision would be silent and
+    // wrong -- which is why only one of the two is used for comparisons.
+    it('refuses two generations that would produce the same container names', () => {
+      const collide: DesiredState = {
+        resources: [
+          {
+            kind: 'replicaset',
+            name: 'web-samename',
+            spec: { name: 'web-samename', replicas: 1, template: { image: 'a:1' } },
+          },
+          {
+            kind: 'replicaset',
+            name: 'web-samename',
+            spec: { name: 'web-samename', replicas: 1, template: { image: 'b:1' } },
+          },
+        ],
+      };
+      expect(() => runControllers(collide, EMPTY)).toThrow(/both produce a container named "web-samename-0"/);
+    });
+
     it('buckets observed containers by the full identity, not by the name', () => {
       // Two containers that agree on the short form but not the full digest
       // are different generations, and nothing may merge them. Constructed
