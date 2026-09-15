@@ -22,9 +22,9 @@ jobs:
       - run: npm run format:check
       - run: npm test
       - run: npm run build
-      - name: Examples run without a runtime
+      - name: Plan examples without containerd
         run: |
-          npm run example
-          npm run example:replicaset
-          npm run example:webapp
+          npx tsx src/cli.ts plan examples/basic.tsx
+          npx tsx src/cli.ts plan examples/replicaset.tsx
+          npx tsx src/cli.ts plan examples/webapp.tsx
           npm run example:plan

@@ -8,27 +8,28 @@ JSX で望ましい構成を宣言し、コントローラが実行状態との�
 適用には `nerdctl compose`、状態の観測には containerd gRPC を使います。
 
 ```tsx
-import { Container, Network, ReplicaSet, Service, containerd, serve } from 'fiber-servo';
+import { Container, Network, ReplicaSet, Service } from 'fiber-servo';
 
-serve(
-  <>
-    <Network name="backend" />
+export default function App() {
+  return (
+    <>
+      <Network name="backend" />
 
-    <ReplicaSet name="api" replicas={3}>
-      <Container image="api:v1" network="backend" labels={{ app: 'api' }} ports={[8080]} />
-    </ReplicaSet>
+      <ReplicaSet name="api" replicas={3}>
+        <Container image="api:v1" network="backend" labels={{ app: 'api' }} ports={[8080]} />
+      </ReplicaSet>
 
-    <Service
-      name="api"
-      network="backend"
-      selector={{ app: 'api' }}
-      port={80}
-      targetPort={8080}
-      publish={8080}
-    />
-  </>,
-  { runtime: containerd() },
-);
+      <Service
+        name="api"
+        network="backend"
+        selector={{ app: 'api' }}
+        port={80}
+        targetPort={8080}
+        publish={8080}
+      />
+    </>
+  );
+}
 ```
 
 ## インストール
@@ -51,8 +52,14 @@ npm run example:webapp
 npm run example:plan -- --model
 ```
 
-ReplicaSet のサンプルでは、コンテナ停止からの復旧に React の再レンダリングが
-不要であることを確認できます。
+最初の3つは Ctrl-C まで実行し、`example:plan` はモデルを表示して終了します。
+各 example は JSX を export し、起動・ログ・終了処理は CLI が担当します。
+`npm run example:replicaset -- --watch` で保存時の再評価もできます。
+
+containerd での実行は、ソケットへのアクセス権限を持つ環境で
+`npm run example:containerd -- --namespace default` を使います。
+従来の環境変数 `FIBER_SERVO_NAMESPACE` は CLI の `--namespace` に置き換わります。
+React の再レンダリングなしでの復旧は[制御ループのテスト](test/control-loop.test.tsx)で検証します。
 
 ## CLI
 

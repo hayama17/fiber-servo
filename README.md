@@ -8,27 +8,28 @@ Declare the desired application in JSX. Controllers reconcile it with runtime
 state, applying through `nerdctl compose` and observing through containerd gRPC.
 
 ```tsx
-import { Container, Network, ReplicaSet, Service, containerd, serve } from 'fiber-servo';
+import { Container, Network, ReplicaSet, Service } from 'fiber-servo';
 
-serve(
-  <>
-    <Network name="backend" />
+export default function App() {
+  return (
+    <>
+      <Network name="backend" />
 
-    <ReplicaSet name="api" replicas={3}>
-      <Container image="api:v1" network="backend" labels={{ app: 'api' }} ports={[8080]} />
-    </ReplicaSet>
+      <ReplicaSet name="api" replicas={3}>
+        <Container image="api:v1" network="backend" labels={{ app: 'api' }} ports={[8080]} />
+      </ReplicaSet>
 
-    <Service
-      name="api"
-      network="backend"
-      selector={{ app: 'api' }}
-      port={80}
-      targetPort={8080}
-      publish={8080}
-    />
-  </>,
-  { runtime: containerd() },
-);
+      <Service
+        name="api"
+        network="backend"
+        selector={{ app: 'api' }}
+        port={80}
+        targetPort={8080}
+        publish={8080}
+      />
+    </>
+  );
+}
 ```
 
 ## Install
@@ -51,8 +52,14 @@ npm run example:webapp
 npm run example:plan -- --model
 ```
 
-The ReplicaSet example demonstrates recovery from a stopped container without
-requiring a React render.
+The first three commands run until Ctrl-C; `example:plan` prints the model and
+exits. Each example exports JSX; the CLI handles startup, logging, and shutdown.
+Use `npm run example:replicaset -- --watch` to re-evaluate on save.
+
+For containerd, run `npm run example:containerd -- --namespace default` with
+socket access. This replaces the former `FIBER_SERVO_NAMESPACE` environment
+variable with the CLI's namespace option. Recovery without a React render is
+covered in [control-loop tests](test/control-loop.test.tsx).
 
 ## CLI
 

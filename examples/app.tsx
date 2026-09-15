@@ -1,13 +1,4 @@
-/**
- * The whole application, declared once — and the file the CLI examples use.
- *
- *   npx fiber-servo plan examples/app.tsx      # print what would be applied
- *   sudo npx fiber-servo up examples/app.tsx   # run it on containerd
- *
- * Read the shape: nesting is ownership (a Deployment owns a Container
- * template) and props are references (a Container joins a Network by name, a
- * Service selects containers by label).
- */
+// npm run example:plan; npm run example:containerd to run on containerd.
 import { Container, Deployment, Network, Ready, Service } from '../src/index.js';
 
 export default function App() {
