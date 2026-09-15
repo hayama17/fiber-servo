@@ -1,8 +1,11 @@
 # fiber-servo
 
-**React Fiber を、単一ノード向けコンテナオーケストレータの制御プレーンとして使う。**
+[English](README.md) | 日本語
 
-コンテナ・ReplicaSet・Service を JSX で書きます。React が「何が存在すべきか」を決め、コントローラが「そのために何をするか」を決め、`nerdctl compose` が実行し、containerd が「実際に何が動いているか」を答えます。
+**React Fiber を使った、単一ノード向けコンテナオーケストレータの実験。**
+
+JSX で望ましい構成を宣言し、コントローラが実行状態との差を調整します。
+適用には `nerdctl compose`、状態の観測には containerd gRPC を使います。
 
 ```tsx
 import { Container, Network, ReplicaSet, Service, containerd, serve } from 'fiber-servo';
@@ -28,186 +31,78 @@ serve(
 );
 ```
 
-> **位置づけ: 実験プロジェクトです。** 単一ノード、API サーバなし、クラスタリングなし。意図的に小さく保っています——React Fiber が実際に何を担っているかを、読んで確かめられる程度に。
-
-## どこに位置するか
-
-```text
-Compose        アプリケーションを記述する。コントローラを持たない:
-               レプリカ数を数えることも、世代をロールアウトすることも、
-               落ちたコンテナを戻すこともできない。
-
-fiber-servo    そのコントローラ群と、それを宣言するための React ツリー。
-               アプリケーションは Compose に渡す。
-
-Kubernetes     それらすべてに加えて、クラスタとそれに伴う一切。
-```
-
-したがって fiber-servo はコンテナを作りません。**Compose アプリケーションモデル** を組み立て、`nerdctl compose` に適用させます。`createContainer` も `startTask` も、spec から組み立てたコマンドラインも、このプロジェクトのどこにもありません——イメージの解決、ネットワークの作成、プロセスの実行は Compose の仕事であり、すでに解かれた問題です。
-
-## 中心にある考え
-
-リコンサイラが2つあり、それらを混ぜないことが設計のすべてです。
-
-```text
-React は管理リソースをリコンサイルする。        「これを3つ動かしたい」
-コントローラは実行時リソースをリコンサイルする。  「2つしかない。もう1つ作る」
-```
-
-両者は反応する対象が違います。
-
-```text
-React のリコンサイル      = 望ましい構成が変わった
-コントローラのリコンサイル = 現実が望ましい構成からずれた
-```
-
-なぜこれが重要か。`<ReplicaSet replicas={3}>` の下でコンテナが1つ落ちたとします。
-
-```text
-desired = 3   <- 変わっていない。JSX は今も 3 と言っており、それは正しい。
-actual  = 2   <- 変わった。
-```
-
-React には再レンダリングすべきものが何もありません。気づくべき正しい場所は「3 と 2 を比べるコントローラ」であり、実際そうなっています——落ちたコンテナは **React のレンダリング 0 回** で置き換えられます。`examples/replicaset.tsx` はそのカウンタを表示するので、動かないことを目で確認できます。
-
-代替案——失敗を prop の変化としてツリーに戻し `commitUpdate` を発火させるやり方——は、このプロジェクトの以前のバージョンがやっていたことで、これは嘘です。観測を意図であるかのように符号化しているからです。それを取り除くことが、このアーキテクチャの目的です。
-
 ## インストール
 
 ```console
 npm install fiber-servo react
 ```
 
-Node 20 以上。containerd ランタイムを使う場合は `nerdctl` が `PATH` にあり、containerd と通信できる権限（通常は `sudo`）が必要です。
+Node 20 以上。containerd ランタイムには `nerdctl` と containerd のソケットに
+アクセスできる権限が必要です。[設定と制約](docs/containerd.md)を参照してください。
 
 ## containerd なしで試す
 
-ランタイム境界が宣言的なので、制御プレーン全体——コントローラ、ロールアウト、バックオフ、Service のエンドポイント解決まで——がインメモリのアダプタ上でそのまま動きます。
+リポジトリを clone して `npm install` 後、メモリ上でサンプルを実行できます。
 
 ```console
-npm run example            # ネットワーク1つとコンテナ1つ
-npm run example:replicaset # コンテナを落とし、コントローラが戻すのを見る
-npm run example:webapp     # データベース、ロールアウトされる API、その前段の Service
+npm run example
+npm run example:replicaset
+npm run example:webapp
+npm run example:plan -- --model
 ```
 
-`fiber-servo plan` は自分のファイルに対して同じことをします。適用されるはずの Compose モデルを表示し、何も変更しません。
-
-```console
-npx fiber-servo plan examples/app.tsx
-```
+ReplicaSet のサンプルでは、コンテナ停止からの復旧に React の再レンダリングが
+不要であることを確認できます。
 
 ## CLI
 
+アプリのファイルは React 要素かコンポーネントを default export します。
+
 ```console
-fiber-servo plan  <app.tsx> [--model]           何が作られるかを表示する。--model は Compose ファイル自体
-fiber-servo up    <app.tsx> [--watch]           Ctrl-C まで containerd 上で動かす
-fiber-servo apply <app.tsx>                     動作中のセッションを再評価する
+npx fiber-servo plan app.tsx --model
+npx fiber-servo up app.tsx
+npx fiber-servo apply app.tsx
 ```
 
-`app.tsx` は要素かコンポーネントを default export します。ファイルが真実の源であり、`apply` を投げる先の API サーバはありません。`--watch` は保存のたびに再評価し、`apply` は必要なときに再評価します。
+- `plan`: メモリランタイムで構成を展開します。`--model` は Compose モデルを
+  表示します。実機との差分ではなく、アプリのコード自体は実行されます。
+- `up`: Ctrl-C まで実行します。`--watch` を付けるとエントリファイルの保存時に
+  再評価します。通常終了時にはアプリのコンテナとネットワークを削除します。
+- `apply`: 実行中のセッションに再評価を依頼します。保存だけでは適用しません。
+  成功は readiness 完了を意味せず、失敗時のロールバックはありません。
 
 ## モデル
 
-コンポーネントは6つ。読むときの規則は2つです。
+ネストは所有関係、props は参照を表します。Network は他のリソースと並べて宣言し、
+Container から `network="backend"` で参照します。
 
-**ネストは所有を意味する。**
+| コンポーネント | 役割                                       |
+| -------------- | ------------------------------------------ |
+| `<Network>`    | ローカルのブリッジネットワーク。           |
+| `<Container>`  | Compose サービスに対応する実行単位。       |
+| `<ReplicaSet>` | Container テンプレートを指定数維持。       |
+| `<Deployment>` | ReplicaSet を通じた段階的ロールアウト。    |
+| `<Service>`    | ラベルで選択したコンテナ群へのプロキシ。   |
+| `<Ready>`      | 依存先の起動・readiness を待って子を宣言。 |
 
-```text
-Deployment
-  └─ ReplicaSet     コントローラが作る。自分では書かない
-      └─ Container
-```
+## 制約
 
-**props は参照である。**
-
-```tsx
-<Container network="backend" />       {/* 名前で Network に参加 */}
-<Service selector={{ app: 'api' }} /> {/* ラベルでコンテナを選ぶ */}
-```
-
-つまりこう書くのが正しく、
-
-```tsx
-<Network name="backend" />
-<ReplicaSet name="api" replicas={3}>
-  <Container image="api:v1" network="backend" />
-</ReplicaSet>
-```
-
-ReplicaSet を `<Network>` の内側に入れるのは誤りです。Network は、そこに接続するコンテナを所有していません。
-
-| コンポーネント | 何であるか                                             |
-| -------------- | ------------------------------------------------------ |
-| `<Network>`    | ローカルのブリッジネットワーク。                       |
-| `<Container>`  | 1つのプロセスとルートファイルシステム。すべての単位。  |
-| `<ReplicaSet>` | 「このテンプレートのコンテナを N 個生かしておく」。    |
-| `<Deployment>` | ReplicaSet に対するロールアウト方針。                  |
-| `<Service>`    | セレクタに一致するコンテナ群の前段にある安定した窓口。 |
-| `<Ready>`      | 順序づけ。あるコンテナが起動するまで内側を宣言しない。 |
-
-Pod はありません。以前のバージョンには Pod があり、infra コンテナとその network namespace を共有するメンバーという CRI 流のエミュレーションで実現していました——containerd も Compose も持たないものを手で作って維持し、その対価として得られるのはサイドカーだけで、ここでは誰も使っていませんでした。コンテナ1つが Compose サービス1つであり、モデルはその分だけ小さくなりました（decision 32）。
-
-### 不変性
-
-```text
-コンテナの spec がどこか1つでも違う  → コンテナを置き換える
-コンテナが exited と観測された       → コンテナを置き換える
-ネットワークの spec が違う           → Compose が作り直す
-```
-
-クラッシュとイメージ変更は同じ経路で処理されます。そしてその場での更新はもうありません。Compose にはライブ更新のプリミティブがなく、アクチュエータが所有しているものを横から書き換えるのは、この設計が避けようとしている境界侵犯そのものだからです。メモリ上限を上げるとプロセスは再起動します（decision 34）。
-
-ランタイムアダプタより上では、`stop`・`delete`・`start` と言う場所はどこにもありません。アダプタは望ましいアプリケーション全体を渡され、変更されたサービスを `compose up --no-recreate` が作り直す前に退去させる必要がある、という判断はそこで行われます。
-
-### Service
-
-Service は宛先の一覧ではなく **セレクタ** を取ります。
-
-```tsx
-<Service name="api" selector={{ app: 'api' }} port={80} targetPort={8080} publish={8080} />
-```
-
-バックエンドの集合は観測状態から解決されます。だからレプリカが入れ替わっても成立します。これは「なぜ各レプリカでホストポートを公開しないのか」への答えでもあります。3つのレプリカが同時に 8080 を持つことはできませんが、その前に立つ Service 1つなら持てます。制御プレーンとデータプレーンは分かれていて、今のデータプレーンは小さなプロキシコンテナです。nftables に置き換えるとしても、変わるのは関数1つです。
-
-### 順序づけ
-
-```tsx
-<Container name="db" image="postgres:16"
-           readiness={{ exec: ['pg_isready', '-U', 'postgres'] }} />
-
-<Ready on="db" until="ready">
-  <Container name="migrate" image="migrate:v1" />
-</Ready>
-```
-
-`db` が ready を報告するまで、`<Ready>` の内側は宣言されません。これはラッチです。依存先が後から落ちても、依存している側を取り消したりはしません。
-
-## 全体の流れ
-
-```text
-JSX → React Fiber → DesiredState → controllers → Compose モデル → nerdctl compose
-                                        ▲                              │
-                                        │                              ▼
-                                        └──── observed state ◄──── containerd gRPC
-```
-
-ループはレベルトリガです。毎回、現在の望ましい状態と現在の観測状態を読み、差分を最初から計算し直します。イベントを取りこぼしても、遅れたリコンサイルにはなっても、誤ったリコンサイルにはなりません——ただしこれは fiber-servo が観測しているコンテナについての話です。ネットワークは Compose のものであり観測していないので、手で削除されたようなドリフトは自己修復しません。[`docs/architecture.md`](docs/architecture.md) を参照してください。
-
-書き込みは Compose を通って下り、読み取りはその下の containerd から返ってきます。これは階層の侵犯ではありません。両者は別の問いに答えているからです。Compose が答えるのは「アプリケーションは適用されたか」であり、containerd が答えるのは「このプロセスは今生きているか、終了コードは何か」——制御ループが必要とする入力であり、どんな CLI 呼び出しでもストリームとしては提供できないものです。
-
-[`docs/architecture.md`](docs/architecture.md) が全体を丁寧に説明し、[`docs/decisions.md`](docs/decisions.md) が各判断の理由を1件ずつ記録しています。
-
-## 非目標
-
-マルチノードのスケジューリング、クラスタメンバーシップ、分散合意、API サーバによる永続化、オーバーレイネットワーク、NetworkPolicy、Kubernetes API 互換。そして今は、Compose がすでに語彙を持っているものを自前で作ること。[`PLAN.md`](PLAN.md) を参照してください。
+- 単一ノード・単一ライターを想定。クラスタや永続的な API サーバはありません。
+- CPU・メモリを含め、Container の spec 変更は再作成になります。
+- Service は接続先の変更時にプロキシを再作成し、通信が途切れる場合があります。
+  実験の小ささを優先し、この挙動を許容します。
+- 外部からのネットワーク変更は検出・自動復旧しません。
+- 制御プロセスを再起動するとロールアウト履歴は失われ、旧世代を段階的に
+  縮小することなく現在の構成へ収束します。
 
 ## ドキュメント
 
-- [`PLAN.md`](PLAN.md) — アーキテクチャ計画と残っている作業
-- [`docs/architecture.md`](docs/architecture.md) — 各部品のつながり
-- [`docs/decisions.md`](docs/decisions.md) — 判断の理由、1件ずつ
-- [`docs/api.md`](docs/api.md) — 公開 API
-- [`docs/containerd.md`](docs/containerd.md) — containerd アダプタ
+- [API](docs/api.md) — props、フック、ライフサイクル。
+- [Architecture](docs/architecture.md) — 責務、状態、復旧の範囲。
+- [containerd](docs/containerd.md) — 設定と実行時の挙動。
+- [Design decisions](docs/decisions.md) — 判断理由と変更履歴。
+- [Project scope](PLAN.md) — 対象外と未決事項。
+- [Contributing](CONTRIBUTING.md) — 開発と検証。
 
 ## ライセンス
 
