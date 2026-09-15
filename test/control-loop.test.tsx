@@ -2,7 +2,7 @@
  * End-to-end tests for the control loop: JSX in, runtime calls out.
  *
  * These run against `createMemoryRuntime`, so they exercise the real
- * controllers and the real restart gate — everything except containerd and
+ * controllers and the real restart admission — everything except containerd and
  * everything except an actual `nerdctl compose` process. That is a property
  * of the architecture rather than a testing trick: the runtime boundary is
  * declarative, so any adapter will do.
@@ -352,7 +352,7 @@ describe('dependency ordering', () => {
 describe('restart backoff gate', () => {
   /**
    * Excluding a container from the Compose model reads to `Runtime.apply` as
-   * "remove it" (see `RestartGate`'s doc comment in `serve.ts`), so the very
+   * "remove it" (see the restart admission hook), so the very
    * observation that justified a hold — `exited` — is gone by the next
    * pass: the container is simply `absent`. This test is the one the
    * original bug would have sailed through undetected: if the gate forgot a

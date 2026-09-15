@@ -2,10 +2,9 @@
  * The React half of the control plane.
  *
  * `createRoot` renders a tree and publishes a `DesiredState` snapshot after
- * every commit. That is the entirety of React's job here. It never learns
- * whether a container actually started, and it is never asked to re-render
- * because one stopped — that is observed state, and it reaches the control
- * loop by a different path (see `observed.ts`).
+ * every commit. Controller components can read observed state through
+ * `useSyncExternalStore`, so a runtime event may cause React to publish a
+ * different runtime tree. React still performs no runtime I/O.
  *
  * The tree can still *read* observed state, through `useReady` and friends, to
  * decide what it wants next: "don't declare the web container until the
@@ -17,7 +16,8 @@
 import { createElement, type ReactNode } from 'react';
 import Reconciler from 'react-reconciler';
 import { ConcurrentRoot } from 'react-reconciler/constants.js';
-import { ObservedContext } from './hooks.js';
+import { ObservedContext, RestartContext } from './hooks.js';
+import { DEFAULT_RESTART_POLICY, type RestartContextValue } from './restart.js';
 import { createObservedStore } from './observed.js';
 import { createRootContainer, typedHostConfig, type RootContainer } from './hostConfig.js';
 import type { DesiredState } from './resources.js';
@@ -60,10 +60,13 @@ export interface CreateRootOptions {
   /** Observed state to read from. A fresh, empty store is created when omitted. */
   observed?: ObservedStore;
   onUncaughtError?: (error: unknown) => void;
+  /** Restart admission settings used by Container controller components. */
+  restart?: RestartContextValue;
 }
 
 export function createRoot(options: CreateRootOptions = {}): Root {
   const observed = options.observed ?? createObservedStore();
+  const restart = options.restart ?? { policy: DEFAULT_RESTART_POLICY, now: Date.now };
   let latest: DesiredState = EMPTY_DESIRED;
   const container: RootContainer = createRootContainer((desired) => {
     latest = desired;
@@ -106,7 +109,14 @@ export function createRoot(options: CreateRootOptions = {}): Root {
   }
 
   function update(element: ReactNode): void {
-    const tree = element === null ? null : createElement(ObservedContext, { value: observed }, element);
+    const tree =
+      element === null
+        ? null
+        : createElement(
+            ObservedContext,
+            { value: observed },
+            createElement(RestartContext, { value: restart }, element),
+          );
     reconciler.updateContainerSync(tree, fiberRoot, null, null);
     flush();
   }

@@ -11,10 +11,10 @@ JSX → React Fiber + controller components → runtime DesiredState → Compose
                                       └── ObservedState ◄── containerd gRPC
 ```
 
-A container dying does not change `replicas={3}`. The control loop restores
-the desired count without requiring a React render. Components that explicitly
-subscribe through hooks can still render on observations; `<Ready>` uses this
-to declare dependent resources after startup.
+A container dying does not change `replicas={3}`. The Container controller
+reads the observed phase and React re-renders the admitted runtime tree. The
+control loop then applies that committed snapshot. `<Ready>` uses the same
+observation path to declare dependent resources after startup.
 
 ## Responsibilities
 
@@ -85,12 +85,12 @@ network-only declaration does not create a network by itself.
 
 ## State and restart behavior
 
-| State                                                   | Lifetime                                    |
-| ------------------------------------------------------- | ------------------------------------------- |
-| React tree and Ready latches                            | Until unmount or process exit.              |
-| Restart counters, rollout templates, last applied model | In memory for one control loop.             |
-| Containers and their labels                             | In the runtime; read again after restart.   |
-| Observed store                                          | An in-memory view rebuilt from the runtime. |
+| State                                                   | Lifetime                                       |
+| ------------------------------------------------------- | ---------------------------------------------- |
+| React tree and Ready latches                            | Until unmount or process exit.                 |
+| Restart counters, rollout templates, last applied model | In memory for one React/control-loop lifetime. |
+| Containers and their labels                             | In the runtime; read again after restart.      |
+| Observed store                                          | An in-memory view rebuilt from the runtime.    |
 
 Labels record spec digest, ownership, generation, and readiness configuration.
 They do not store old rollout templates. Restarting fiber-servo resets backoff
@@ -112,7 +112,8 @@ Paths below are relative to `src/`.
 | `hooks.ts`, `observed.ts`                       | Observed store and subscriptions.                       |
 | `controllers.ts`, `generations.ts`              | Resource expansion and retained templates.              |
 | `compose.ts`, `planner.ts`                      | Compose model and informational change plan.            |
-| `serve.ts`                                      | Reconciliation and restart backoff.                     |
+| `serve.ts`                                      | Reconciliation and runtime I/O scheduling.              |
+| `restart.ts`, `hooks.ts`                        | Restart policy and per-Container admission state.       |
 | `runtime/types.ts`, `runtime/memory.ts`         | Adapter contract and in-memory implementation.          |
 | `runtime/containerd/`                           | Compose execution, gRPC observations, readiness probes. |
 | `cli.ts`, `session.ts`, `control.ts`, `load.ts` | CLI, serialized apply, local endpoint, app loading.     |
