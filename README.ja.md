@@ -59,7 +59,7 @@ npm run example:plan -- --model
 containerd での実行は、ソケットへのアクセス権限を持つ環境で
 `npm run example:containerd -- --namespace default` を使います。
 従来の環境変数 `FIBER_SERVO_NAMESPACE` は CLI の `--namespace` に置き換わります。
-React の再レンダリングなしでの復旧は[制御ループのテスト](test/control-loop.test.tsx)で検証します。
+ランタイム障害からの復旧はReactのコントローラ経由で行い、[制御ループのテスト](test/control-loop.test.tsx)で検証します。
 
 ## CLI
 
