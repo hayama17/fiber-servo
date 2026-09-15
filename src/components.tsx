@@ -33,6 +33,7 @@ import {
   Suspense,
   createElement,
   isValidElement,
+  useRef,
   useSyncExternalStore,
   type ReactElement,
   type ReactNode,
@@ -45,8 +46,17 @@ import type {
   ReplicaSetSpec,
   ServiceSpec,
 } from './resources.js';
+import { digest } from './resources.js';
 import { useObserved, useReady, type ReadyCondition } from './hooks.js';
-import { expandReplicaSet } from './controllers.js';
+import {
+  expandDeployment,
+  expandReplicaSet,
+  GENERATION_LABEL,
+  OWNER_LABEL,
+  serviceEndpoints,
+  serviceProxyContainer,
+} from './controllers.js';
+import { createGenerationHistory, type GenerationHistory } from './generations.js';
 
 /** The host elements. Typed here once so callers never touch string types. */
 function host<P extends object>(type: string, props: P): ReactElement {
@@ -149,7 +159,37 @@ export interface DeploymentProps extends Omit<DeploymentSpec, 'template' | 'repl
  * `strategy`'s bounds.
  */
 export function Deployment({ children, ...spec }: DeploymentProps): ReactElement {
-  return host('deployment', { ...spec, children });
+  const store = useObserved();
+  const observed = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
+  const historyRef = useRef<GenerationHistory | undefined>(undefined);
+  if (!historyRef.current) historyRef.current = createGenerationHistory();
+  const child = Children.only(children);
+  if (!isValidElement<ContainerProps>(child) || child.type !== Container) {
+    throw new Error('fiber-servo: Deployment needs exactly one <Container> template');
+  }
+  const template = { ...child.props };
+  delete template.name;
+  const deployment = {
+    ...spec,
+    replicas: spec.replicas ?? 1,
+    template,
+  };
+  historyRef.current.remember(template);
+  const containers = expandDeployment(deployment, observed, historyRef.current.all()).flatMap((replicaSet) =>
+    expandReplicaSet(replicaSet, observed).map((container) => ({
+      ...container,
+      labels: {
+        ...container.labels,
+        [OWNER_LABEL]: spec.name,
+        [GENERATION_LABEL]: digest(replicaSet.template),
+      },
+    })),
+  );
+  return createElement(
+    Fragment,
+    null,
+    containers.map((container) => createElement(Container, { ...container, key: container.name })),
+  ) as unknown as ReactElement;
 }
 
 // ---- Service ---------------------------------------------------------------
@@ -171,8 +211,11 @@ export interface ServiceProps extends ServiceSpec {
  * can.
  */
 export function Service(props: ServiceProps): ReactElement {
+  const store = useObserved();
+  const observed = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
   const { children: _children, ...spec } = props;
-  return host('service', spec);
+  const proxy = serviceProxyContainer(spec, serviceEndpoints(spec, observed));
+  return proxy ? createElement(Container, proxy) : createElement(Fragment, null);
 }
 
 // ---- ordering --------------------------------------------------------------
